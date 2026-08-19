@@ -1,0 +1,115 @@
+name: Release sentrith binaries
+
+on:
+  push:
+    tags:
+      - "sentrith-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing or new release tag (for example sentrith-v1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset: sentrith-linux-x86_64
+            exe: sentrith
+          - runner: ubuntu-24.04-arm
+            asset: sentrith-linux-aarch64
+            exe: sentrith
+          - runner: macos-15-intel
+            asset: sentrith-macos-x86_64
+            exe: sentrith
+          - runner: macos-14
+            asset: sentrith-macos-aarch64
+            exe: sentrith
+          - runner: windows-latest
+            asset: sentrith-windows-x86_64.exe
+            exe: sentrith.exe
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Rust versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Test
+        run: cargo test --manifest-path tools/sentrith/Cargo.toml
+
+      - name: Build release
+        run: cargo build --release --manifest-path tools/sentrith/Cargo.toml
+
+      - name: Stage binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "tools/sentrith/target/release/${{ matrix.exe }}" "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
+
+      - name: Stage binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "tools/sentrith/target/release/${{ matrix.exe }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "value=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$REF_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update release and upload binaries
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --generate-notes --title "$TAG"
+          fi

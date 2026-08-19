@@ -1,0 +1,43 @@
+name: sentrith CI
+
+on:
+  push:
+    paths:
+      - "tools/sentrith/**"
+      - ".github/workflows/sentrith-ci.yml"
+  pull_request:
+    paths:
+      - "tools/sentrith/**"
+      - ".github/workflows/sentrith-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-14
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Rust versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Test
+        run: cargo test --manifest-path tools/sentrith/Cargo.toml
+
+      - name: Release build
+        run: cargo build --release --manifest-path tools/sentrith/Cargo.toml

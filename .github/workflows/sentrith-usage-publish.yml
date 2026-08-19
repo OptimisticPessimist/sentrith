@@ -1,0 +1,64 @@
+name: Publish AI usage benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent:
+        description: "Agent name, e.g. codex"
+        required: true
+        type: string
+      model:
+        description: "Model name"
+        required: true
+        type: string
+      task_mix:
+        description: "Public-safe task mix label"
+        required: true
+        default: "mixed engineering tasks"
+        type: string
+      date:
+        description: "Measurement date YYYY-MM-DD"
+        required: true
+        type: string
+      min_samples:
+        description: "Minimum samples per phase"
+        required: true
+        default: "5"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build sentrith
+        run: cargo build --release --manifest-path tools/sentrith/Cargo.toml
+
+      - name: Publish benchmark into READMEs
+        run: |
+          tools/sentrith/target/release/sentrith usage publish \
+            --file docs/metrics/public-usage.csv \
+            --agent "${{ inputs.agent }}" \
+            --model "${{ inputs.model }}" \
+            --task-mix "${{ inputs.task_mix }}" \
+            --date "${{ inputs.date }}" \
+            --min-samples "${{ inputs.min_samples }}"
+
+      - name: Commit README benchmark
+        shell: bash
+        run: |
+          if git diff --quiet -- README.md README.ja.md; then
+            echo "No README benchmark changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md README.ja.md
+          git commit -m "docs: publish measured AI usage benchmark"
+          git push

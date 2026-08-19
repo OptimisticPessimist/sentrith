@@ -1,0 +1,7 @@
+# Local AI usage benchmark data
+.ai-usage/
+
+tools/sentrith/target/
+bin/sentrith
+bin/sentrith.exe
+.sentrith-private/

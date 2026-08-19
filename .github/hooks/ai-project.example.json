@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "./bin/sentrith preflight",
+        "powershell": ".\\bin\\sentrith.exe preflight",
+        "cwd": ".",
+        "timeoutSec": 5
+      }
+    ],
+    "sessionEnd": [
+      {
+        "type": "command",
+        "bash": "./bin/sentrith closeout-check",
+        "powershell": ".\\bin\\sentrith.exe closeout-check",
+        "cwd": ".",
+        "timeoutSec": 5
+      },
+      {
+        "type": "command",
+        "bash": "./bin/sentrith guard",
+        "powershell": ".\\bin\\sentrith.exe guard",
+        "cwd": ".",
+        "timeoutSec": 5
+      },
+      {
+        "type": "command",
+        "bash": "./bin/sentrith review-hint",
+        "powershell": ".\\bin\\sentrith.exe review-hint",
+        "cwd": ".",
+        "timeoutSec": 5
+      },
+      {
+        "type": "command",
+        "bash": "./bin/sentrith diff-budget",
+        "powershell": ".\\bin\\sentrith.exe diff-budget",
+        "cwd": ".",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

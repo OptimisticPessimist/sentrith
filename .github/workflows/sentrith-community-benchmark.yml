@@ -1,0 +1,31 @@
+name: Sentrith Community Benchmark
+
+on:
+  pull_request:
+    paths:
+      - "docs/metrics/contributions/**"
+      - "tools/sentrith/**"
+  workflow_dispatch:
+
+jobs:
+  validate-and-aggregate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Sentrith
+        run: cargo build --manifest-path tools/sentrith/Cargo.toml
+
+      - name: Aggregate qualified community contributions
+        run: ./tools/sentrith/target/debug/sentrith usage aggregate --dir docs/metrics/contributions
+
+      - name: Verify contribution files contain no obvious private fields
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RniE '"(prompt|task|repository|repo|organization|customer|path|source_code|transcript|session_id|git_remote)"[[:space:]]*:' docs/metrics/contributions --include='*.json'; then
+            echo "Contribution contains a forbidden raw/private field."
+            exit 1
+          fi

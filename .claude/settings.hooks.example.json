@@ -1,0 +1,65 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/sentrith preflight"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/sentrith closeout-check"
+          },
+          {
+            "type": "command",
+            "command": "./bin/sentrith guard"
+          },
+          {
+            "type": "command",
+            "command": "./bin/sentrith review-hint"
+          },
+          {
+            "type": "command",
+            "command": "./bin/sentrith diff-budget"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/sentrith usage hook claude --phase standard",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/sentrith usage hook claude --phase standard",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "./bin/sentrith usage claude-status",
+    "padding": 1
+  }
+}

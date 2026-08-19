@@ -1,0 +1,41 @@
+name: Build sentrith Windows ARM64 (optional)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # windows-11-arm is a GitHub-hosted ARM64 runner label, but availability
+    # depends on repository/account type and it remains a preview surface.
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Rust versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Test
+        run: cargo test --manifest-path tools/sentrith/Cargo.toml
+
+      - name: Build release
+        run: cargo build --release --manifest-path tools/sentrith/Cargo.toml
+
+      - name: Stage binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "tools/sentrith/target/release/sentrith.exe" "dist/sentrith-windows-aarch64.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentrith-windows-aarch64.exe
+          path: dist/sentrith-windows-aarch64.exe
+          if-no-files-found: error

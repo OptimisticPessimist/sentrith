@@ -1,0 +1,17 @@
+[package]
+name = "sentrith"
+version = "1.0.0"
+edition = "2021"
+description = "Zero-runtime-dependency local guard and usage CLI for Sentrith"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "sentrith"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,69 @@
+{
+  "description": "Optional deterministic AI project checks. No model calls.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/sentrith preflight",
+            "statusMessage": "Checking AI project memory",
+            "additionalContextLimit": 300
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/sentrith closeout-check",
+            "timeout": 5,
+            "additionalContextLimit": 300
+          },
+          {
+            "type": "command",
+            "command": "./bin/sentrith guard",
+            "timeout": 5,
+            "additionalContextLimit": 300
+          },
+          {
+            "type": "command",
+            "command": "./bin/sentrith review-hint",
+            "timeout": 5,
+            "additionalContextLimit": 300
+          },
+          {
+            "type": "command",
+            "command": "./bin/sentrith diff-budget",
+            "timeout": 5,
+            "additionalContextLimit": 300
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/sentrith usage hook codex --phase standard",
+            "timeout": 5,
+            "additionalContextLimit": 300
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./bin/sentrith usage hook codex --phase standard",
+            "timeout": 5,
+            "additionalContextLimit": 300
+          }
+        ]
+      }
+    ]
+  }
+}
