@@ -905,11 +905,63 @@ fn hooks_status(opts: &BTreeMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn copy_file_permissions(original: &Path, replacement: &Path) -> Result<(), String> {
     let permissions = fs::metadata(original)
         .map_err(|e| e.to_string())?
         .permissions();
     fs::set_permissions(replacement, permissions).map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> Result<(), String> {
+    fs::rename(replacement, destination).map_err(|e| e.to_string())
+}
+
+#[cfg(windows)]
+fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLastError() -> u32;
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    let replaced: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let replacement: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ok = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(format!("ReplaceFileW failed with OS error {}", unsafe {
+            GetLastError()
+        }))
+    } else {
+        Ok(())
+    }
 }
 
 fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
@@ -1010,10 +1062,15 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
         }
         let tmp = settings_path.with_extension("json.sentrith-tmp");
         fs::write(&tmp, &rendered).map_err(|e| e.to_string())?;
+        #[cfg(not(windows))]
         if existed {
             copy_file_permissions(&settings_path, &tmp)?;
         }
-        fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
+        if existed {
+            replace_file_preserving_security(&tmp, &settings_path)?;
+        } else {
+            fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
+        }
         touched += 1;
 
         println!(
@@ -1973,6 +2030,22 @@ fn read_stdin_all() -> Result<String, String> {
     Ok(s)
 }
 
+const USAGE_LOCK_STALE_AFTER_SECS: u64 = 15;
+
+fn stale_usage_lock(lock_path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(lock_path) else {
+        return false;
+    };
+    let created = text
+        .lines()
+        .find_map(|line| line.strip_prefix("created=")?.parse::<u64>().ok());
+    let Some(created) = created else {
+        return false;
+    };
+    let now = now_unix().parse::<u64>().unwrap_or(created);
+    now.saturating_sub(created) >= USAGE_LOCK_STALE_AFTER_SECS
+}
+
 fn with_usage_file_lock<T, F>(path: &Path, operation: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String>,
@@ -1986,11 +2059,20 @@ where
     let mut guard = None;
     for _ in 0..500 {
         match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
-            Ok(file) => {
+            Ok(mut file) => {
+                let owner = format!("pid={}\ncreated={}\n", std::process::id(), now_unix());
+                if let Err(e) = file.write_all(owner.as_bytes()) {
+                    let _ = fs::remove_file(&lock_path);
+                    return Err(e.to_string());
+                }
                 guard = Some(file);
                 break;
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if stale_usage_lock(&lock_path) {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(e) => return Err(e.to_string()),
@@ -2053,7 +2135,9 @@ fn migrate_usage_file_if_needed(path: &Path) -> Result<(), String> {
     }
     let tmp = path.with_extension(format!("csv.migrate.{}.tmp", std::process::id()));
     fs::write(&tmp, out).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    #[cfg(not(windows))]
+    copy_file_permissions(path, &tmp)?;
+    replace_file_preserving_security(&tmp, path)?;
     Ok(())
 }
 
@@ -3623,6 +3707,17 @@ mod tests {
     }
 
     #[test]
+    fn stale_usage_lock_is_reclaimed() {
+        let path = temp_path("usage.csv");
+        let lock = path.with_extension("csv.lock");
+        fs::write(&lock, "pid=999999\ncreated=0\n").unwrap();
+
+        with_usage_file_lock(&path, || Ok(())).unwrap();
+
+        assert!(!lock.exists());
+    }
+
+    #[test]
     fn concurrent_first_appends_preserve_migrated_rows() {
         let path = temp_path("usage.csv");
         fs::write(&path, USAGE_HEADER_V1).unwrap();
@@ -3820,6 +3915,39 @@ mod tests {
         assert!(json_parse(r#"{"k":"\ud83d"}"#).is_err());
         assert!(json_parse(r#"{"k":"\ude00"}"#).is_err());
         assert!(json_parse(r#"{"k":"\ud83dx"}"#).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_migration_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("usage.csv");
+        fs::write(&path, USAGE_HEADER_V1).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        ensure_usage_file(&path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_preserves_readonly_attribute() {
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        fs::write(&original, "{}").unwrap();
+        let mut permissions = fs::metadata(&original).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&original, permissions).unwrap();
+        fs::write(&replacement, "{}").unwrap();
+
+        replace_file_preserving_security(&replacement, &original).unwrap();
+
+        assert!(fs::metadata(&original).unwrap().permissions().readonly());
     }
 
     #[cfg(unix)]
