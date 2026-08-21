@@ -2200,11 +2200,47 @@ fn inspect_stash(stash: &Path) -> Result<StashState, String> {
     }
 }
 
+fn remove_empty_stash_parents(stash: &Path, entries: &[String]) -> Result<(), String> {
+    let mut parents = BTreeSet::new();
+    for entry in entries {
+        let mut parent = Path::new(entry).parent();
+        while let Some(relative) = parent {
+            if relative.as_os_str().is_empty() || relative == Path::new(".") {
+                break;
+            }
+            parents.insert(relative.to_path_buf());
+            parent = relative.parent();
+        }
+    }
+
+    let mut parents: Vec<PathBuf> = parents.into_iter().collect();
+    parents.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for relative in parents {
+        let path = stash.join(relative);
+        match fs::remove_dir(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // An unexpected file keeps the directory in place. The root
+            // removal below will fail too, so the marker and stash remain.
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(e) => {
+                return Err(format!(
+                    "could not remove empty baseline stash parent {}: {e}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn finish_baseline_stop_cleanup(
     stash: &Path,
     manifest: &Path,
     marker: &Path,
+    entries: &[String],
 ) -> Result<(), String> {
+    remove_empty_stash_parents(stash, entries)?;
     match fs::remove_file(manifest) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -2254,7 +2290,7 @@ fn baseline_stop() -> Result<(), String> {
     let entries = match inspect_stash(&stash)? {
         StashState::Listed(paths) => paths,
         StashState::Empty => {
-            finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path())?;
+            finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path(), &[])?;
             println!("SENTRITH-BASELINE: stopped; the stash was empty. Phase is standard again.");
             return Ok(());
         }
@@ -2304,7 +2340,7 @@ fn baseline_stop() -> Result<(), String> {
         return Err(msg);
     }
 
-    finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path())?;
+    finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path(), &entries)?;
     println!("SENTRITH-BASELINE: stopped. Restored {restored} path(s); phase is standard again.");
     println!("Start a NEW agent session so the contract is loaded before your next task.");
     Ok(())
@@ -3899,6 +3935,36 @@ mod tests {
     }
 
     #[test]
+    fn baseline_cleanup_removes_empty_parent_directories() {
+        let marker = temp_path("phase");
+        fs::write(&marker, "baseline\n").unwrap();
+        let stash = temp_path("stash");
+        fs::create_dir_all(stash.join(".github")).unwrap();
+        fs::create_dir_all(stash.join(".claude")).unwrap();
+        let manifest = stash.join("STASHED.txt");
+        fs::write(
+            &manifest,
+            ".github/copilot-instructions.md\n.claude/skills\n",
+        )
+        .unwrap();
+
+        let entries = vec![
+            ".github/copilot-instructions.md".to_string(),
+            ".claude/skills".to_string(),
+        ];
+        finish_baseline_stop_cleanup(&stash, &manifest, &marker, &entries).unwrap();
+
+        assert!(
+            !stash.exists(),
+            "empty parent directories must not block cleanup"
+        );
+        assert!(
+            !marker.exists(),
+            "successful cleanup returns to standard phase"
+        );
+    }
+
+    #[test]
     fn baseline_cleanup_keeps_marker_when_stash_removal_fails() {
         let marker = temp_path("phase");
         fs::write(&marker, "baseline\n").unwrap();
@@ -3908,7 +3974,7 @@ mod tests {
         fs::write(&manifest, "AGENTS.md\n").unwrap();
         fs::write(stash.join("unexpected"), "keep me").unwrap();
 
-        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker).unwrap_err();
+        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[]).unwrap_err();
         assert!(error.contains("baseline stash"));
         assert!(marker.exists(), "the phase marker must remain active");
         assert!(stash.exists(), "the stash must remain recoverable");
@@ -3924,7 +3990,7 @@ mod tests {
         let manifest = stash.join("STASHED.txt");
         fs::write(&manifest, "AGENTS.md\n").unwrap();
 
-        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker).unwrap_err();
+        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[]).unwrap_err();
         assert!(error.contains("phase marker"));
         assert!(marker.is_dir());
         assert!(stash.exists(), "an empty stash keeps baseline_active true");
