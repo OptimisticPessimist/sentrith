@@ -695,11 +695,21 @@ fn diff_budget() -> Result<(), String> {
 // hooks install
 // ---------------------------------------------------------------------------
 
-/// Sentrith owns the hook entries whose command mentions the binary. Everything
-/// else in the user's settings file is left untouched.
+/// Sentrith owns hooks whose command starts with one of the executable forms it
+/// installs. Matching only the command token keeps an unrelated path such as
+/// /workspace/sentrith/scripts/run-linter in the user's settings.
 fn is_sentrith_command(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
-    lower.contains("sentrith")
+    let Some(token) = cmd.split_whitespace().next() else {
+        return false;
+    };
+    let token = token.trim_matches(|c: char| matches!(c, '"' | '\'' | ';' | '&' | '|'));
+    let normalized = token.replace('\\', "/").to_ascii_lowercase();
+    normalized == "sentrith"
+        || normalized == "sentrith.exe"
+        || normalized == "bin/sentrith"
+        || normalized == "bin/sentrith.exe"
+        || normalized.ends_with("/bin/sentrith")
+        || normalized.ends_with("/bin/sentrith.exe")
 }
 
 /// Rewrite the example's `./bin/sentrith` invocation for the current platform.
@@ -1187,14 +1197,11 @@ fn usage_report(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let by_phase = tasks_by_phase(&refs);
     if opts.contains_key("compare") {
-        let pick = |phase: &str| -> Vec<&BTreeMap<String, String>> {
-            rows.iter()
-                .filter(|r| r.get("phase").map(String::as_str) == Some(phase))
-                .collect()
-        };
-        let b = phase_summary(&group_tasks(&pick("baseline")));
-        let s = phase_summary(&group_tasks(&pick("standard")));
+        let b = phase_summary(by_phase.get("baseline").map(Vec::as_slice).unwrap_or(&[]));
+        let s = phase_summary(by_phase.get("standard").map(Vec::as_slice).unwrap_or(&[]));
         print_summary("baseline", &b);
         print_summary("standard", &s);
         println!("\n[standard vs baseline]");
@@ -1212,16 +1219,17 @@ fn usage_report(args: &[String]) -> Result<(), String> {
         }
         println!("\nValues are per task; turns of the same task are summed first.");
     } else {
-        let mut groups: BTreeMap<(String, String), Vec<&BTreeMap<String, String>>> = BTreeMap::new();
-        for r in &rows {
+        let mut groups: BTreeMap<(String, String), Vec<Vec<&BTreeMap<String, String>>>> = BTreeMap::new();
+        for task in group_tasks(&refs) {
+            let r = task.last().copied();
             let key = (
-                r.get("agent").cloned().unwrap_or_default(),
-                r.get("phase").cloned().unwrap_or_default(),
+                r.and_then(|r| r.get("agent")).cloned().unwrap_or_default(),
+                r.and_then(|r| r.get("phase")).cloned().unwrap_or_default(),
             );
-            groups.entry(key).or_default().push(r);
+            groups.entry(key).or_default().push(task);
         }
-        for ((agent, phase), rs) in groups {
-            let summary = phase_summary(&group_tasks(&rs));
+        for ((agent, phase), tasks) in groups {
+            let summary = phase_summary(&tasks);
             print_summary(&format!("{agent} / {phase}"), &summary);
         }
         println!("\nValues are per task. Success breakdown: sentrith usage report --tasks");
@@ -1244,6 +1252,24 @@ fn phase_summary(tasks: &[Vec<&BTreeMap<String, String>>]) -> BTreeMap<&'static 
     out.insert("success_rate", decided_success_rate(tasks));
     out.insert("tasks", Some(tasks.len() as f64));
     out
+}
+
+/// Group all rows into tasks before assigning a task to its closing phase.
+/// A baseline task may close after baseline stop, so filtering rows by phase
+/// before calling group_tasks would split one task into two partial tasks.
+fn tasks_by_phase<'a>(
+    rows: &[&'a BTreeMap<String, String>],
+) -> BTreeMap<String, Vec<Vec<&'a BTreeMap<String, String>>>> {
+    let mut by_phase: BTreeMap<String, Vec<Vec<&'a BTreeMap<String, String>>>> = BTreeMap::new();
+    for task in group_tasks(rows) {
+        let phase = task
+            .last()
+            .and_then(|r| r.get("phase"))
+            .cloned()
+            .unwrap_or_default();
+        by_phase.entry(phase).or_default().push(task);
+    }
+    by_phase
 }
 
 /// Group turn rows into tasks: rows without a session id stand alone;
@@ -1293,12 +1319,7 @@ fn usage_report_tasks(file: &Path, opts: &BTreeMap<String, String>) -> Result<()
         return Ok(());
     }
     let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
-    let tasks = group_tasks(&refs);
-    let mut by_phase: BTreeMap<String, Vec<&Vec<&BTreeMap<String, String>>>> = BTreeMap::new();
-    for t in &tasks {
-        let phase = t.last().copied().and_then(|r| r.get("phase")).cloned().unwrap_or_default();
-        by_phase.entry(phase).or_default().push(t);
-    }
+    let by_phase = tasks_by_phase(&refs);
     for (phase, group) in by_phase {
         let mut yes = 0usize;
         let mut no = 0usize;
@@ -1399,17 +1420,18 @@ fn usage_status(args: &[String]) -> Result<(), String> {
 
     let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str), None)?;
     let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
-    let tasks = group_tasks(&refs);
+    let by_phase = tasks_by_phase(&refs);
     let mut counts: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
-    for t in &tasks {
-        let phase = t.last().copied().and_then(|r| r.get("phase")).cloned().unwrap_or_default();
-        let e = counts.entry(phase).or_insert((0, 0, 0, 0));
-        e.0 += 1;
-        match t.last().copied().and_then(|r| r.get("success")).map(String::as_str).unwrap_or("") {
-            "yes" => e.1 += 1,
-            "no" => e.2 += 1,
-            _ => e.3 += 1,
+    for (phase, tasks) in by_phase {
+        let mut e = (tasks.len(), 0, 0, 0);
+        for t in tasks {
+            match t.last().and_then(|r| r.get("success")).map(String::as_str).unwrap_or("") {
+                "yes" => e.1 += 1,
+                "no" => e.2 += 1,
+                _ => e.3 += 1,
+            }
         }
+        counts.insert(phase, e);
     }
     println!("turns recorded: {}", rows.len());
     for (phase, (n, yes, no, unknown)) in &counts {
@@ -1664,14 +1686,12 @@ fn mean(values: &[f64]) -> Option<f64> {
     }
 }
 
-fn publish_stats(rows: &[&BTreeMap<String, String>]) -> PublishStats {
-    // Hook capture writes one row per turn; task-level statistics must be
-    // computed over tasks, not turns, or every metric is divided by the number
-    // of turns that happened to precede the commit.
-    let tasks = group_tasks(rows);
+fn publish_stats_for_tasks(tasks: &[Vec<&BTreeMap<String, String>>]) -> PublishStats {
     let successes = tasks.iter().filter(|t| task_success(t) == "yes").count();
-    let success_rate = decided_success_rate(&tasks);
-    let total_credits = sum_field(rows, "credits");
+    let success_rate = decided_success_rate(tasks);
+    let all_rows: Vec<&BTreeMap<String, String>> =
+        tasks.iter().flat_map(|task| task.iter().copied()).collect();
+    let total_credits = sum_field(&all_rows, "credits");
     let credits_per_success = match (total_credits, successes) {
         (Some(c), n) if n > 0 => Some(c / n as f64),
         _ => None,
@@ -1681,16 +1701,23 @@ fn publish_stats(rows: &[&BTreeMap<String, String>]) -> PublishStats {
         tasks: tasks.len(),
         successes,
         success_rate,
-        credits_avg: mean(&per_task_values(&tasks, "credits")),
-        tool_calls_avg: mean(&per_task_values(&tasks, "tool_calls")),
-        rework_avg: mean(&per_task_values(&tasks, "rework_count")),
-        input_avg: mean(&per_task_values(&tasks, "input_tokens")),
-        cached_input_avg: mean(&per_task_values(&tasks, "cached_input_tokens")),
-        output_avg: mean(&per_task_values(&tasks, "output_tokens")),
-        duration_avg: mean(&per_task_values(&tasks, "duration_seconds")),
+        credits_avg: mean(&per_task_values(tasks, "credits")),
+        tool_calls_avg: mean(&per_task_values(tasks, "tool_calls")),
+        rework_avg: mean(&per_task_values(tasks, "rework_count")),
+        input_avg: mean(&per_task_values(tasks, "input_tokens")),
+        cached_input_avg: mean(&per_task_values(tasks, "cached_input_tokens")),
+        output_avg: mean(&per_task_values(tasks, "output_tokens")),
+        duration_avg: mean(&per_task_values(tasks, "duration_seconds")),
         total_credits,
         credits_per_success,
     }
+}
+
+fn publish_stats(rows: &[&BTreeMap<String, String>]) -> PublishStats {
+    // Hook capture writes one row per turn; task-level statistics must be
+    // computed over tasks, not turns, or every metric is divided by the number
+    // of turns that happened to precede the commit.
+    publish_stats_for_tasks(&group_tasks(rows))
 }
 
 fn change_text(base: Option<f64>, standard: Option<f64>, suffix: &str) -> String {
@@ -1740,14 +1767,16 @@ fn usage_publish(args: &[String]) -> Result<(), String> {
     let dry_run = opts.contains_key("dry-run");
 
     let rows = load_usage_rows(&file, Some(agent), model)?;
-    let baseline_rows: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str) == Some("baseline")).collect();
-    let standard_rows: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str) == Some("standard")).collect();
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let by_phase = tasks_by_phase(&refs);
+    let baseline_tasks = by_phase.get("baseline").map(Vec::as_slice).unwrap_or(&[]);
+    let standard_tasks = by_phase.get("standard").map(Vec::as_slice).unwrap_or(&[]);
 
     // Qualify on the same task counts the table publishes. Counting raw turns
     // would let five turns of one task pass a five-sample threshold and publish
     // a one-task benchmark with no small-sample warning.
-    let b = publish_stats(&baseline_rows);
-    let s = publish_stats(&standard_rows);
+    let b = publish_stats_for_tasks(baseline_tasks);
+    let s = publish_stats_for_tasks(standard_tasks);
 
     if !force && (b.tasks < min_samples || s.tasks < min_samples) {
         return Err(format!(
@@ -2171,6 +2200,51 @@ fn inspect_stash(stash: &Path) -> Result<StashState, String> {
     }
 }
 
+fn finish_baseline_stop_cleanup(
+    stash: &Path,
+    manifest: &Path,
+    marker: &Path,
+) -> Result<(), String> {
+    match fs::remove_file(manifest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "restored files, but could not remove the baseline manifest {}: {e}; the marker and stash were kept",
+                manifest.display()
+            ));
+        }
+    }
+
+    match fs::remove_dir(stash) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "restored files, but could not remove the baseline stash {}: {e}; the phase marker was kept",
+                stash.display()
+            ));
+        }
+    }
+
+    match fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(marker_error) => {
+            match fs::create_dir_all(stash) {
+                Ok(()) => Err(format!(
+                    "restored files, but could not remove the phase marker {}: {marker_error}; an empty stash was kept so baseline remains active",
+                    marker.display()
+                )),
+                Err(stash_error) => Err(format!(
+                    "baseline cleanup is incomplete: could not remove phase marker {} ({marker_error}) or recreate the stash ({stash_error})",
+                    marker.display()
+                )),
+            }
+        }
+    }
+}
+
 fn baseline_stop() -> Result<(), String> {
     let stash = baseline_stash_dir();
     if !stash.exists() {
@@ -2180,9 +2254,7 @@ fn baseline_stop() -> Result<(), String> {
     let entries = match inspect_stash(&stash)? {
         StashState::Listed(paths) => paths,
         StashState::Empty => {
-            let _ = fs::remove_file(&manifest);
-            let _ = fs::remove_dir_all(&stash);
-            let _ = fs::remove_file(phase_marker_path());
+            finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path())?;
             println!("SENTRITH-BASELINE: stopped; the stash was empty. Phase is standard again.");
             return Ok(());
         }
@@ -2232,9 +2304,7 @@ fn baseline_stop() -> Result<(), String> {
         return Err(msg);
     }
 
-    let _ = fs::remove_file(phase_marker_path());
-    let _ = fs::remove_file(&manifest);
-    let _ = fs::remove_dir_all(&stash);
+    finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path())?;
     println!("SENTRITH-BASELINE: stopped. Restored {restored} path(s); phase is standard again.");
     println!("Start a NEW agent session so the contract is loaded before your next task.");
     Ok(())
@@ -3074,13 +3144,21 @@ fn metric_sum(rows: &[&BTreeMap<String,String>], metric: &str) -> Option<f64> {
 
 /// Usage per successful *task*. Counting successful rows would divide by the
 /// number of turns, not the number of tasks.
+fn metric_per_success_for_tasks(
+    tasks: &[Vec<&BTreeMap<String, String>>],
+    metric: &str,
+) -> Option<f64> {
+    let successes = tasks.iter().filter(|t| task_success(t) == "yes").count();
+    if successes == 0 {
+        return None;
+    }
+    let rows: Vec<&BTreeMap<String, String>> =
+        tasks.iter().flat_map(|task| task.iter().copied()).collect();
+    metric_sum(&rows, metric).map(|v| v / successes as f64)
+}
+
 fn metric_per_success(rows: &[&BTreeMap<String,String>], metric: &str) -> Option<f64> {
-    let successes = group_tasks(rows)
-        .iter()
-        .filter(|t| task_success(t) == "yes")
-        .count();
-    if successes == 0 { return None; }
-    metric_sum(rows, metric).map(|v| v / successes as f64)
+    metric_per_success_for_tasks(&group_tasks(rows), metric)
 }
 
 fn json_escape(s: &str) -> String {
@@ -3093,16 +3171,18 @@ fn usage_contribute(args: &[String]) -> Result<(), String> {
     let model = opts.get("model").map(String::as_str);
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
     let rows = load_usage_rows(&file, Some(agent), model)?;
-    let baseline: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str)==Some("baseline")).collect();
-    let standard: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str)==Some("standard")).collect();
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let by_phase = tasks_by_phase(&refs);
+    let baseline_tasks = by_phase.get("baseline").map(Vec::as_slice).unwrap_or(&[]);
+    let standard_tasks = by_phase.get("standard").map(Vec::as_slice).unwrap_or(&[]);
 
     // Qualification counts tasks, not captured turns.
-    let baseline_tasks = group_tasks(&baseline).len();
-    let standard_tasks = group_tasks(&standard).len();
+    let baseline_task_count = baseline_tasks.len();
+    let standard_task_count = standard_tasks.len();
 
     let min_samples: usize = opts.get("min-samples").and_then(|x| x.parse().ok()).unwrap_or(10);
-    if !opts.contains_key("force") && (baseline_tasks < min_samples || standard_tasks < min_samples) {
-        return Err(format!("contribution needs at least {min_samples}+{min_samples} baseline/standard tasks; got {baseline_tasks}+{standard_tasks}. Use --force only for experimental data."));
+    if !opts.contains_key("force") && (baseline_task_count < min_samples || standard_task_count < min_samples) {
+        return Err(format!("contribution needs at least {min_samples}+{min_samples} baseline/standard tasks; got {baseline_task_count}+{standard_task_count}. Use --force only for experimental data."));
     }
 
     let requested = opts.get("metric").map(String::as_str).unwrap_or("auto");
@@ -3113,18 +3193,20 @@ fn usage_contribute(args: &[String]) -> Result<(), String> {
     };
     let mut chosen = None;
     for m in candidates {
-        if metric_per_success(&baseline, m).is_some() && metric_per_success(&standard, m).is_some() {
+        if metric_per_success_for_tasks(baseline_tasks, m).is_some()
+            && metric_per_success_for_tasks(standard_tasks, m).is_some()
+        {
             chosen = Some(m);
             break;
         }
     }
     let metric = chosen.ok_or("no comparable usage metric found in both baseline and standard")?;
-    let bps = metric_per_success(&baseline, metric).unwrap();
-    let sps = metric_per_success(&standard, metric).unwrap();
+    let bps = metric_per_success_for_tasks(baseline_tasks, metric).unwrap();
+    let sps = metric_per_success_for_tasks(standard_tasks, metric).unwrap();
     let change = if bps != 0.0 { (sps-bps)/bps*100.0 } else { 0.0 };
-    let bsr = decided_success_rate(&group_tasks(&baseline)).unwrap_or(0.0);
-    let ssr = decided_success_rate(&group_tasks(&standard)).unwrap_or(0.0);
-    let quality = if baseline_tasks >= 10 && standard_tasks >= 10 { "qualified" } else { "experimental" };
+    let bsr = decided_success_rate(baseline_tasks).unwrap_or(0.0);
+    let ssr = decided_success_rate(standard_tasks).unwrap_or(0.0);
+    let quality = if baseline_task_count >= 10 && standard_task_count >= 10 { "qualified" } else { "experimental" };
     let model_name = model.unwrap_or("mixed/unspecified");
     let id = format!("{}-{}-{}", agent, now_unix(), std::process::id());
     let out = opts.get("out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("docs/metrics/contributions/{id}.json")));
@@ -3155,8 +3237,8 @@ r#"{{
         json_escape(model_name),
         quality,
         metric,
-        baseline_tasks,
-        standard_tasks,
+        baseline_task_count,
+        standard_task_count,
         bsr,
         ssr,
         bps,
@@ -3482,6 +3564,26 @@ mod tests {
     }
 
     #[test]
+    fn tasks_are_grouped_before_phase_partitioning() {
+        let mut baseline_turn = turn("s1", "", "unknown", "10");
+        baseline_turn.insert("phase".into(), "baseline".into());
+        let standard_turn = turn("s1", "aaa", "yes", "20");
+        let owned = vec![baseline_turn, standard_turn];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+
+        let by_phase = tasks_by_phase(&rows);
+        assert!(by_phase.get("baseline").is_none());
+        let standard = by_phase.get("standard").unwrap();
+        assert_eq!(standard.len(), 1);
+        assert_eq!(standard[0].len(), 2);
+        assert_eq!(
+            publish_stats_for_tasks(standard).input_avg,
+            Some(30.0),
+            "a task crossing baseline stop stays one task"
+        );
+    }
+
+    #[test]
     fn phase_precedence_flag_then_marker_then_env_then_default() {
         assert_eq!(
             resolve_phase_value(Some("other"), Some("baseline"), Some("standard")),
@@ -3585,6 +3687,23 @@ mod tests {
         }
         assert_eq!(first.matches("my-linter").count(), 1);
         assert_eq!(first.matches("sentrith guard").count(), 1);
+    }
+
+    #[test]
+    fn hook_matching_does_not_remove_foreign_paths_containing_sentrith() {
+        assert!(is_sentrith_command("./bin/sentrith guard"));
+        assert!(is_sentrith_command("bin\\sentrith.exe guard"));
+        assert!(!is_sentrith_command("/workspace/sentrith/scripts/run-linter"));
+        assert!(!is_sentrith_command("echo sentrith"));
+
+        let mut hooks = json_parse(
+            r#"{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"/workspace/sentrith/scripts/run-linter"},{"type":"command","command":"./bin/sentrith guard"}]}]}"#,
+        )
+        .unwrap();
+        strip_sentrith_hooks(&mut hooks);
+        let rendered = json_to_string(&hooks);
+        assert!(rendered.contains("/workspace/sentrith/scripts/run-linter"));
+        assert!(!rendered.contains("./bin/sentrith guard"));
     }
 
     #[test]
@@ -3777,6 +3896,38 @@ mod tests {
         assert!(files.contains("src/a.rs"));
         assert!(files.contains("src/b.rs"));
         assert!(!files.contains("bin/blob"), "binary rows have no numeric counts");
+    }
+
+    #[test]
+    fn baseline_cleanup_keeps_marker_when_stash_removal_fails() {
+        let marker = temp_path("phase");
+        fs::write(&marker, "baseline\n").unwrap();
+        let stash = temp_path("stash");
+        fs::create_dir(&stash).unwrap();
+        let manifest = stash.join("STASHED.txt");
+        fs::write(&manifest, "AGENTS.md\n").unwrap();
+        fs::write(stash.join("unexpected"), "keep me").unwrap();
+
+        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker).unwrap_err();
+        assert!(error.contains("baseline stash"));
+        assert!(marker.exists(), "the phase marker must remain active");
+        assert!(stash.exists(), "the stash must remain recoverable");
+        assert!(!manifest.exists());
+    }
+
+    #[test]
+    fn baseline_cleanup_keeps_active_state_when_marker_removal_fails() {
+        let marker = temp_path("phase-dir");
+        fs::create_dir(&marker).unwrap();
+        let stash = temp_path("stash");
+        fs::create_dir(&stash).unwrap();
+        let manifest = stash.join("STASHED.txt");
+        fs::write(&manifest, "AGENTS.md\n").unwrap();
+
+        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker).unwrap_err();
+        assert!(error.contains("phase marker"));
+        assert!(marker.is_dir());
+        assert!(stash.exists(), "an empty stash keeps baseline_active true");
     }
 
     #[test]
