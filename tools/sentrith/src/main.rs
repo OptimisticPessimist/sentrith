@@ -239,6 +239,18 @@ impl<'a> JsonParser<'a> {
         Ok(Json::Num(String::from_utf8_lossy(&self.b[start..self.i]).to_string()))
     }
 
+    /// Read exactly four hex digits of a `\u` escape.
+    fn hex4(&mut self) -> Result<u32, String> {
+        let hex = self.b.get(self.i..self.i + 4).ok_or("truncated \\u escape")?;
+        if !hex.iter().all(|c| c.is_ascii_hexdigit()) {
+            return Err("invalid \\u escape".into());
+        }
+        let code = u32::from_str_radix(&String::from_utf8_lossy(hex), 16)
+            .map_err(|_| "invalid \\u escape".to_string())?;
+        self.i += 4;
+        Ok(code)
+    }
+
     fn string(&mut self) -> Result<String, String> {
         self.expect(b'"')?;
         let mut out = String::new();
@@ -260,16 +272,30 @@ impl<'a> JsonParser<'a> {
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
                         b'u' => {
-                            let hex = self
-                                .b
-                                .get(self.i..self.i + 4)
-                                .ok_or("truncated \\u escape")?;
-                            let code = u32::from_str_radix(&String::from_utf8_lossy(hex), 16)
-                                .map_err(|_| "invalid \\u escape".to_string())?;
-                            self.i += 4;
-                            // Surrogate pairs are re-encoded via the replacement
-                            // character rather than being silently dropped.
-                            out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                            let code = self.hex4()?;
+                            let ch = if (0xD800..=0xDBFF).contains(&code) {
+                                // High surrogate: a non-BMP character such as an
+                                // emoji is encoded as a pair. Decoding the halves
+                                // separately would rewrite the user's setting as
+                                // two replacement characters.
+                                if !self.b[self.i..].starts_with(b"\\u") {
+                                    return Err("unpaired high surrogate in JSON string".into());
+                                }
+                                self.i += 2;
+                                let low = self.hex4()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err("invalid low surrogate in JSON string".into());
+                                }
+                                let combined =
+                                    0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                                char::from_u32(combined)
+                                    .ok_or("invalid surrogate pair in JSON string")?
+                            } else if (0xDC00..=0xDFFF).contains(&code) {
+                                return Err("unpaired low surrogate in JSON string".into());
+                            } else {
+                                char::from_u32(code).ok_or("invalid \\u escape")?
+                            };
+                            out.push(ch);
                         }
                         _ => return Err("invalid escape".into()),
                     }
@@ -1231,11 +1257,11 @@ fn summarize(rows: &[UsageRow]) -> BTreeMap<&'static str, Option<f64>> {
 /// Group turn rows into tasks: rows without a session id stand alone;
 /// within a session, a change of `head_sha` closes the current task at the
 /// row that observed the new commit.
-fn group_tasks(rows: &[BTreeMap<String, String>]) -> Vec<Vec<&BTreeMap<String, String>>> {
-    let mut tasks: Vec<Vec<&BTreeMap<String, String>>> = Vec::new();
-    let mut open: BTreeMap<String, Vec<&BTreeMap<String, String>>> = BTreeMap::new();
+fn group_tasks<'a>(rows: &[&'a BTreeMap<String, String>]) -> Vec<Vec<&'a BTreeMap<String, String>>> {
+    let mut tasks: Vec<Vec<&'a BTreeMap<String, String>>> = Vec::new();
+    let mut open: BTreeMap<String, Vec<&'a BTreeMap<String, String>>> = BTreeMap::new();
     let mut last_sha: BTreeMap<String, String> = BTreeMap::new();
-    for row in rows {
+    for row in rows.iter().copied() {
         let sid = row.get("session_id").cloned().unwrap_or_default();
         if sid.is_empty() {
             tasks.push(vec![row]);
@@ -1267,7 +1293,8 @@ fn usage_report_tasks(file: &Path, opts: &BTreeMap<String, String>) -> Result<()
         println!("SENTRITH-USAGE: no matching rows");
         return Ok(());
     }
-    let tasks = group_tasks(&rows);
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let tasks = group_tasks(&refs);
     let mut by_phase: BTreeMap<String, Vec<&Vec<&BTreeMap<String, String>>>> = BTreeMap::new();
     for t in &tasks {
         let phase = t.last().copied().and_then(|r| r.get("phase")).cloned().unwrap_or_default();
@@ -1372,7 +1399,8 @@ fn usage_status(args: &[String]) -> Result<(), String> {
     }
 
     let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str), None)?;
-    let tasks = group_tasks(&rows);
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let tasks = group_tasks(&refs);
     let mut counts: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
     for t in &tasks {
         let phase = t.last().copied().and_then(|r| r.get("phase")).cloned().unwrap_or_default();
@@ -1608,20 +1636,46 @@ fn sum_field(rows: &[&BTreeMap<String, String>], key: &str) -> Option<f64> {
     if vals.is_empty() { None } else { Some(vals.iter().sum::<f64>()) }
 }
 
-/// Success rate over decided rows only (`yes` / (`yes` + `no`)).
-/// `unknown`/blank rows are undecidable evidence, not failures.
-fn decided_success_rate(rows: &[&BTreeMap<String, String>]) -> Option<f64> {
-    let yes = rows.iter().filter(|r| r.get("success").map(String::as_str) == Some("yes")).count();
-    let no = rows.iter().filter(|r| r.get("success").map(String::as_str) == Some("no")).count();
+/// A task's outcome is the outcome of the turn that closed it.
+fn task_success(task: &[&BTreeMap<String, String>]) -> &'static str {
+    match task.last().and_then(|r| r.get("success")).map(String::as_str) {
+        Some("yes") => "yes",
+        Some("no") => "no",
+        _ => "unknown",
+    }
+}
+
+/// Success rate over decided tasks only (`yes` / (`yes` + `no`)).
+/// `unknown`/blank tasks are undecidable evidence, not failures.
+fn decided_success_rate(tasks: &[Vec<&BTreeMap<String, String>>]) -> Option<f64> {
+    let yes = tasks.iter().filter(|t| task_success(t) == "yes").count();
+    let no = tasks.iter().filter(|t| task_success(t) == "no").count();
     if yes + no == 0 { None } else { Some(yes as f64 / (yes + no) as f64 * 100.0) }
 }
 
+/// Per-task totals for one column: turns of the same task are summed first, so
+/// averaging afterwards yields a value per task rather than per turn.
+/// A manual record has no session id and forms its own task, so single-row
+/// behavior is unchanged.
+fn per_task_values(tasks: &[Vec<&BTreeMap<String, String>>], key: &str) -> Vec<f64> {
+    tasks.iter().filter_map(|t| sum_field(t, key)).collect()
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
 fn publish_stats(rows: &[&BTreeMap<String, String>]) -> PublishStats {
-    let successes = rows.iter()
-        .filter(|r| r.get("success").map(String::as_str) == Some("yes"))
-        .count();
-    let tasks = rows.len();
-    let success_rate = decided_success_rate(rows);
+    // Hook capture writes one row per turn; task-level statistics must be
+    // computed over tasks, not turns, or every metric is divided by the number
+    // of turns that happened to precede the commit.
+    let tasks = group_tasks(rows);
+    let successes = tasks.iter().filter(|t| task_success(t) == "yes").count();
+    let success_rate = decided_success_rate(&tasks);
     let total_credits = sum_field(rows, "credits");
     let credits_per_success = match (total_credits, successes) {
         (Some(c), n) if n > 0 => Some(c / n as f64),
@@ -1629,16 +1683,16 @@ fn publish_stats(rows: &[&BTreeMap<String, String>]) -> PublishStats {
     };
 
     PublishStats {
-        tasks,
+        tasks: tasks.len(),
         successes,
         success_rate,
-        credits_avg: avg_field(rows, "credits"),
-        tool_calls_avg: avg_field(rows, "tool_calls"),
-        rework_avg: avg_field(rows, "rework_count"),
-        input_avg: avg_field(rows, "input_tokens"),
-        cached_input_avg: avg_field(rows, "cached_input_tokens"),
-        output_avg: avg_field(rows, "output_tokens"),
-        duration_avg: avg_field(rows, "duration_seconds"),
+        credits_avg: mean(&per_task_values(&tasks, "credits")),
+        tool_calls_avg: mean(&per_task_values(&tasks, "tool_calls")),
+        rework_avg: mean(&per_task_values(&tasks, "rework_count")),
+        input_avg: mean(&per_task_values(&tasks, "input_tokens")),
+        cached_input_avg: mean(&per_task_values(&tasks, "cached_input_tokens")),
+        output_avg: mean(&per_task_values(&tasks, "output_tokens")),
+        duration_avg: mean(&per_task_values(&tasks, "duration_seconds")),
         total_credits,
         credits_per_success,
     }
@@ -2902,8 +2956,13 @@ fn metric_sum(rows: &[&BTreeMap<String,String>], metric: &str) -> Option<f64> {
     }
 }
 
+/// Usage per successful *task*. Counting successful rows would divide by the
+/// number of turns, not the number of tasks.
 fn metric_per_success(rows: &[&BTreeMap<String,String>], metric: &str) -> Option<f64> {
-    let successes = rows.iter().filter(|r| r.get("success").map(String::as_str) == Some("yes")).count();
+    let successes = group_tasks(rows)
+        .iter()
+        .filter(|t| task_success(t) == "yes")
+        .count();
     if successes == 0 { return None; }
     metric_sum(rows, metric).map(|v| v / successes as f64)
 }
@@ -2921,9 +2980,13 @@ fn usage_contribute(args: &[String]) -> Result<(), String> {
     let baseline: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str)==Some("baseline")).collect();
     let standard: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str)==Some("standard")).collect();
 
+    // Qualification counts tasks, not captured turns.
+    let baseline_tasks = group_tasks(&baseline).len();
+    let standard_tasks = group_tasks(&standard).len();
+
     let min_samples: usize = opts.get("min-samples").and_then(|x| x.parse().ok()).unwrap_or(10);
-    if !opts.contains_key("force") && (baseline.len() < min_samples || standard.len() < min_samples) {
-        return Err(format!("contribution needs at least {min_samples}+{min_samples} baseline/standard tasks; got {}+{}. Use --force only for experimental data.", baseline.len(), standard.len()));
+    if !opts.contains_key("force") && (baseline_tasks < min_samples || standard_tasks < min_samples) {
+        return Err(format!("contribution needs at least {min_samples}+{min_samples} baseline/standard tasks; got {baseline_tasks}+{standard_tasks}. Use --force only for experimental data."));
     }
 
     let requested = opts.get("metric").map(String::as_str).unwrap_or("auto");
@@ -2943,9 +3006,9 @@ fn usage_contribute(args: &[String]) -> Result<(), String> {
     let bps = metric_per_success(&baseline, metric).unwrap();
     let sps = metric_per_success(&standard, metric).unwrap();
     let change = if bps != 0.0 { (sps-bps)/bps*100.0 } else { 0.0 };
-    let bsr = decided_success_rate(&baseline).unwrap_or(0.0);
-    let ssr = decided_success_rate(&standard).unwrap_or(0.0);
-    let quality = if baseline.len() >= 10 && standard.len() >= 10 { "qualified" } else { "experimental" };
+    let bsr = decided_success_rate(&group_tasks(&baseline)).unwrap_or(0.0);
+    let ssr = decided_success_rate(&group_tasks(&standard)).unwrap_or(0.0);
+    let quality = if baseline_tasks >= 10 && standard_tasks >= 10 { "qualified" } else { "experimental" };
     let model_name = model.unwrap_or("mixed/unspecified");
     let id = format!("{}-{}-{}", agent, now_unix(), std::process::id());
     let out = opts.get("out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("docs/metrics/contributions/{id}.json")));
@@ -2976,8 +3039,8 @@ r#"{{
         json_escape(model_name),
         quality,
         metric,
-        baseline.len(),
-        standard.len(),
+        baseline_tasks,
+        standard_tasks,
         bsr,
         ssr,
         bps,
@@ -3286,6 +3349,27 @@ mod tests {
         assert!(json_parse(r#"{"a":1}}"#).is_err());
         assert!(json_parse(r#"{"a" 1}"#).is_err());
         assert!(json_parse("").is_err());
+        assert!(json_parse(r#"{"a":"\uZZZZ"}"#).is_err());
+    }
+
+    #[test]
+    fn json_decodes_surrogate_pairs_without_corrupting_them() {
+        // A user's settings may contain an emoji. Decoding each half separately
+        // would rewrite it as two replacement characters.
+        let v = json_parse(r#"{"k":"a😀b"}"#).unwrap();
+        assert_eq!(v.get("k").unwrap().as_str().unwrap(), "a\u{1F600}b");
+
+        let round = json_parse(&json_to_string(&v)).unwrap();
+        assert_eq!(round, v);
+        assert!(
+            !json_to_string(&v).contains('\u{FFFD}'),
+            "must not emit replacement characters"
+        );
+
+        // Unpaired surrogates are invalid JSON; refuse rather than corrupt.
+        assert!(json_parse(r#"{"k":"\ud83d"}"#).is_err());
+        assert!(json_parse(r#"{"k":"\ude00"}"#).is_err());
+        assert!(json_parse(r#"{"k":"\ud83dx"}"#).is_err());
     }
 
     #[test]
@@ -3339,12 +3423,13 @@ mod tests {
 
     #[test]
     fn tasks_split_on_head_sha_transitions() {
-        let rows = vec![
+        let owned = vec![
             row("s1", "aaa", "unknown", "standard"),
             row("s1", "aaa", "unknown", "standard"),
             row("s1", "bbb", "yes", "standard"),
             row("s1", "bbb", "unknown", "standard"),
         ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
         let tasks = group_tasks(&rows);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].len(), 3, "commit-closing turn ends the first task");
@@ -3353,15 +3438,71 @@ mod tests {
 
     #[test]
     fn success_rate_excludes_unknown_from_denominator() {
-        let a = row("s", "x", "yes", "standard");
-        let b = row("s", "x", "no", "standard");
-        let c = row("s", "x", "unknown", "standard");
-        let d = row("s", "x", "", "standard");
-        let rows: Vec<&BTreeMap<String, String>> = vec![&a, &b, &c, &d];
-        assert_eq!(decided_success_rate(&rows), Some(50.0));
+        let owned = vec![
+            row("", "", "yes", "standard"),
+            row("", "", "no", "standard"),
+            row("", "", "unknown", "standard"),
+            row("", "", "", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        assert_eq!(decided_success_rate(&group_tasks(&rows)), Some(50.0));
 
-        let undecided: Vec<&BTreeMap<String, String>> = vec![&c, &d];
-        assert_eq!(decided_success_rate(&undecided), None);
+        let undecided: Vec<&BTreeMap<String, String>> = owned[2..].iter().collect();
+        assert_eq!(decided_success_rate(&group_tasks(&undecided)), None);
+    }
+
+    fn turn(session: &str, sha: &str, success: &str, input: &str) -> BTreeMap<String, String> {
+        let mut m = row(session, sha, success, "standard");
+        m.insert("input_tokens".into(), input.into());
+        m.insert("credits".into(), "3".into());
+        m
+    }
+
+    #[test]
+    fn published_stats_are_per_task_not_per_turn() {
+        // Three turns of one session, closed by a commit: one task worth
+        // 30 input tokens, not three tasks of 10.
+        let owned = vec![
+            turn("s1", "aaa", "unknown", "10"),
+            turn("s1", "aaa", "unknown", "10"),
+            turn("s1", "bbb", "yes", "10"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let stats = publish_stats(&rows);
+
+        assert_eq!(stats.tasks, 1, "turns before the commit are one task");
+        assert_eq!(stats.successes, 1);
+        assert_eq!(stats.input_avg, Some(30.0), "input is summed across the task");
+        assert_eq!(stats.success_rate, Some(100.0));
+        assert_eq!(stats.credits_per_success, Some(9.0), "total credits / successful task");
+    }
+
+    #[test]
+    fn manual_single_row_records_are_unchanged_by_task_grouping() {
+        // Manual records carry no session id, so each stays its own task and
+        // averages keep their previous meaning.
+        let owned = vec![
+            turn("", "", "yes", "10"),
+            turn("", "", "no", "20"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let stats = publish_stats(&rows);
+
+        assert_eq!(stats.tasks, 2);
+        assert_eq!(stats.input_avg, Some(15.0));
+        assert_eq!(stats.success_rate, Some(50.0));
+    }
+
+    #[test]
+    fn usage_per_success_counts_tasks_not_successful_turns() {
+        let owned = vec![
+            turn("s1", "aaa", "yes", "10"),
+            turn("s1", "aaa", "yes", "10"),
+            turn("s1", "bbb", "yes", "10"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        // 9 credits total over 1 successful task, not 3 credits over 3 rows.
+        assert_eq!(metric_per_success(&rows, "credits"), Some(9.0));
     }
 
     #[test]

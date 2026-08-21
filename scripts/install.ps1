@@ -21,6 +21,7 @@ $ContractPaths = @(
   "docs/ai/BOOTSTRAP.md",
   "docs/ai/MEMORY_POLICY.md",
   "docs/ai/MEMORY_AUDIT.md",
+  "docs/ai/PRIVATE_CONTEXT.md",
   "docs/ai/TASK_PROTOCOL.md",
   "docs/ai/TASK_CLOSEOUT.md",
   "docs/development",
