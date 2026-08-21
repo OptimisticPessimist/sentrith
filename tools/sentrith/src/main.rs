@@ -712,8 +712,38 @@ fn is_sentrith_command(cmd: &str) -> bool {
         || normalized.ends_with("/bin/sentrith.exe")
 }
 
-/// Rewrite the example's `./bin/sentrith` invocation for the current platform.
-/// On native Windows, hook commands run through cmd.exe, where `./bin/...`
+fn count_sentrith_hooks(value: &Json) -> usize {
+    match value {
+        Json::Obj(entries) => entries
+            .iter()
+            .map(|(key, value)| {
+                let own = usize::from(
+                    key == "command"
+                        && value
+                            .as_str()
+                            .map(is_sentrith_command)
+                            .unwrap_or(false),
+                );
+                own + count_sentrith_hooks(value)
+            })
+            .sum(),
+        Json::Arr(items) => items.iter().map(count_sentrith_hooks).sum(),
+        _ => 0,
+    }
+}
+
+fn sentrith_hook_count(text: &str) -> usize {
+    let Ok(settings) = json_parse(text) else {
+        return 0;
+    };
+    settings
+        .get("hooks")
+        .map(count_sentrith_hooks)
+        .unwrap_or(0)
+}
+
+/// Rewrite the example's ./bin/sentrith invocation for the current platform.
+/// On native Windows, hook commands run through cmd.exe, where ./bin/...
 /// does not resolve.
 fn platform_command(cmd: &str) -> String {
     if cfg!(windows) {
@@ -864,15 +894,21 @@ fn hooks_status(opts: &BTreeMap<String, String>) -> Result<(), String> {
             println!("SENTRITH-HOOKS [{}]: not installed ({} missing)", t.agent, t.settings);
             continue;
         }
-        let text = read_text(&path);
-        let n = text.matches("sentrith").count();
+        let n = sentrith_hook_count(&read_text(&path));
         if n == 0 {
             println!("SENTRITH-HOOKS [{}]: {} exists but has no Sentrith hooks", t.agent, t.settings);
         } else {
-            println!("SENTRITH-HOOKS [{}]: installed ({} Sentrith references in {})", t.agent, n, t.settings);
+            println!("SENTRITH-HOOKS [{}]: installed ({} Sentrith hooks in {})", t.agent, n, t.settings);
         }
     }
     Ok(())
+}
+
+fn copy_file_permissions(original: &Path, replacement: &Path) -> Result<(), String> {
+    let permissions = fs::metadata(original)
+        .map_err(|e| e.to_string())?
+        .permissions();
+    fs::set_permissions(replacement, permissions).map_err(|e| e.to_string())
 }
 
 fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
@@ -973,6 +1009,9 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
         }
         let tmp = settings_path.with_extension("json.sentrith-tmp");
         fs::write(&tmp, &rendered).map_err(|e| e.to_string())?;
+        if existed {
+            copy_file_permissions(&settings_path, &tmp)?;
+        }
         fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
         touched += 1;
 
@@ -1387,7 +1426,7 @@ fn usage_status(args: &[String]) -> Result<(), String> {
     let mut hooks_ready = false;
     for t in HOOK_TARGETS {
         let path = repo_file(t.settings);
-        let installed = path.exists() && read_text(&path).contains("sentrith");
+        let installed = path.exists() && sentrith_hook_count(&read_text(&path)) > 0;
         if installed {
             hooks_ready = true;
         }
@@ -2553,8 +2592,22 @@ fn read_kv(path: &Path) -> BTreeMap<String,String> {
     m
 }
 
+const UNBORN_HEAD: &str = "<unborn>";
+
 fn git_head() -> String {
-    git(&["rev-parse", "HEAD"]).trim().to_string()
+    let head = git(&["rev-parse", "HEAD"]);
+    if !head.trim().is_empty() {
+        return head.trim().to_string();
+    }
+    if git(&["rev-parse", "--is-inside-work-tree"]).trim() == "true" {
+        UNBORN_HEAD.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn commit_reached(start_head: &str, head: &str) -> bool {
+    !start_head.is_empty() && !head.is_empty() && head != start_head
 }
 
 fn verif_path(agent: &str, session: &str) -> PathBuf {
@@ -2822,7 +2875,7 @@ fn usage_hook_claude(args: &[String]) -> Result<(), String> {
 
         let start_head = task.get("start_head").cloned().unwrap_or_default();
         let head = git_head();
-        let committed = !start_head.is_empty() && !head.is_empty() && head != start_head;
+        let committed = commit_reached(&start_head, &head);
         let success = update_and_resolve_success("claude", &session, window.verification, committed);
 
         // statusLine snapshot stays as the cost/duration fallback; it may lag
@@ -2956,7 +3009,7 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
             };
             let start_head = task.get("start_head").cloned().unwrap_or_default();
             let head = git_head();
-            let committed = !start_head.is_empty() && !head.is_empty() && head != start_head;
+            let committed = commit_reached(&start_head, &head);
             let success = update_and_resolve_success("codex", &session, verification, committed);
 
             let u = AutoUsage {
@@ -3696,6 +3749,25 @@ mod tests {
         assert!(json_parse(r#"{"k":"\ud83dx"}"#).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hook_replacement_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        fs::write(&original, "{}").unwrap();
+        let mut permissions = fs::metadata(&original).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&original, permissions).unwrap();
+        fs::write(&replacement, "{}").unwrap();
+
+        copy_file_permissions(&original, &replacement).unwrap();
+
+        let mode = fs::metadata(&replacement).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
     #[test]
     fn hook_merge_is_idempotent_and_keeps_foreign_hooks() {
         let example = json_parse(
@@ -3723,6 +3795,27 @@ mod tests {
         }
         assert_eq!(first.matches("my-linter").count(), 1);
         assert_eq!(first.matches("sentrith guard").count(), 1);
+    }
+
+    #[test]
+    fn hook_status_requires_an_owned_command() {
+        let foreign = json_parse(
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/workspace/sentrith/scripts/run-linter"}]}]}}"#,
+        )
+        .unwrap();
+        let owned = json_parse(
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(count_sentrith_hooks(foreign.get("hooks").unwrap()), 0);
+        assert_eq!(count_sentrith_hooks(owned.get("hooks").unwrap()), 1);
+        assert_eq!(
+            sentrith_hook_count(
+                r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo sentrith"}]}]}}"#
+            ),
+            0
+        );
     }
 
     #[test]
@@ -3760,6 +3853,13 @@ mod tests {
         m.insert("success".into(), success.into());
         m.insert("phase".into(), phase.into());
         m
+    }
+
+    #[test]
+    fn first_commit_after_unborn_head_is_counted() {
+        assert!(commit_reached(UNBORN_HEAD, "abc123"));
+        assert!(!commit_reached("", "abc123"));
+        assert!(!commit_reached("abc123", "abc123"));
     }
 
     #[test]
