@@ -1100,13 +1100,6 @@ fn usage_record(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Default, Clone)]
-struct UsageRow {
-    agent: String,
-    phase: String,
-    success: String,
-    nums: BTreeMap<&'static str, Option<f64>>,
-}
 
 fn parse_csv_line(line: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -1131,9 +1124,40 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     out
 }
 
-fn parse_num(s: Option<&String>) -> Option<f64> {
-    let s = s?;
-    if s.is_empty() { None } else { s.parse().ok() }
+/// Split CSV text into logical records. A quoted field may contain newlines
+/// (`csv_escape` produces them), so splitting on physical lines would cut one
+/// record in half and corrupt it on the next rewrite.
+fn split_csv_records(text: &str) -> Vec<String> {
+    let mut records = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                current.push(c);
+                if quoted && chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    quoted = !quoted;
+                }
+            }
+            '\r' if !quoted => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                records.push(std::mem::take(&mut current));
+            }
+            '\n' if !quoted => records.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        records.push(current);
+    }
+    records
 }
 
 fn usage_report(args: &[String]) -> Result<(), String> {
@@ -1153,104 +1177,72 @@ fn usage_report(args: &[String]) -> Result<(), String> {
         return usage_report_tasks(&file, &opts);
     }
 
-    let text = fs::read_to_string(&file).map_err(|e| e.to_string())?;
-    let mut lines = text.lines();
-    let header = lines.next().ok_or("usage file is empty")?;
-    let headers = parse_csv_line(header);
-    let idx: BTreeMap<String, usize> = headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.clone(), i))
-        .collect();
-
-    let numeric = [
-        "input_tokens", "cached_input_tokens", "output_tokens", "credits", "cost_usd",
-        "tool_calls", "duration_seconds", "rework_count",
-    ];
-
-    let mut rows = Vec::new();
-    for line in lines {
-        if line.trim().is_empty() { continue; }
-        let cols = parse_csv_line(line);
-        let get = |name: &str| -> Option<String> {
-            idx.get(name).and_then(|i| cols.get(*i)).cloned()
-        };
-        let agent = get("agent").unwrap_or_default();
-        if let Some(filter) = opts.get("agent") {
-            if &agent != filter { continue; }
-        }
-
-        let mut row = UsageRow {
-            agent,
-            phase: get("phase").unwrap_or_default(),
-            success: get("success").unwrap_or_default(),
-            nums: BTreeMap::new(),
-        };
-        for name in numeric {
-            row.nums.insert(name, parse_num(get(name).as_ref()));
-        }
-        rows.push(row);
-    }
-
+    // Every view is per task. Hook capture writes one row per turn, so
+    // summarizing raw rows divides each metric by however many turns happened
+    // to precede a commit, which makes phases with different turn counts
+    // incomparable.
+    let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str), None)?;
     if rows.is_empty() {
         println!("SENTRITH-USAGE: no matching rows");
         return Ok(());
     }
 
     if opts.contains_key("compare") {
-        let base: Vec<_> = rows.iter().filter(|r| r.phase == "baseline").cloned().collect();
-        let std: Vec<_> = rows.iter().filter(|r| r.phase == "standard").cloned().collect();
-        let b = summarize(&base);
-        let s = summarize(&std);
+        let pick = |phase: &str| -> Vec<&BTreeMap<String, String>> {
+            rows.iter()
+                .filter(|r| r.get("phase").map(String::as_str) == Some(phase))
+                .collect()
+        };
+        let b = phase_summary(&group_tasks(&pick("baseline")));
+        let s = phase_summary(&group_tasks(&pick("standard")));
         print_summary("baseline", &b);
         print_summary("standard", &s);
         println!("\n[standard vs baseline]");
-        for name in numeric {
-            println!("{name}: {}", pct_text(b.get(name).copied().flatten(), s.get(name).copied().flatten()));
+        for name in NUMERIC_COLUMNS {
+            println!(
+                "{name}: {}",
+                pct_text(b.get(name).copied().flatten(), s.get(name).copied().flatten())
+            );
         }
-        let bs = b.get("success_rate").copied().flatten();
-        let ss = s.get("success_rate").copied().flatten();
-        if let (Some(a), Some(bv)) = (bs, ss) {
+        if let (Some(a), Some(bv)) = (
+            b.get("success_rate").copied().flatten(),
+            s.get("success_rate").copied().flatten(),
+        ) {
             println!("success_rate: {:+.1} percentage points", bv - a);
         }
+        println!("\nValues are per task; turns of the same task are summed first.");
     } else {
-        let mut groups: BTreeMap<(String, String), Vec<UsageRow>> = BTreeMap::new();
-        for r in rows {
-            groups.entry((r.agent.clone(), r.phase.clone())).or_default().push(r);
+        let mut groups: BTreeMap<(String, String), Vec<&BTreeMap<String, String>>> = BTreeMap::new();
+        for r in &rows {
+            let key = (
+                r.get("agent").cloned().unwrap_or_default(),
+                r.get("phase").cloned().unwrap_or_default(),
+            );
+            groups.entry(key).or_default().push(r);
         }
         for ((agent, phase), rs) in groups {
-            let s = summarize(&rs);
-            print_summary(&format!("{agent} / {phase} (per turn)"), &s);
+            let summary = phase_summary(&group_tasks(&rs));
+            print_summary(&format!("{agent} / {phase}"), &summary);
         }
-        // The default view is per turn; most questions are per task, so point
-        // at the task view instead of requiring the reader to know the flag.
-        println!("\nPer-task view: sentrith usage report --tasks");
+        println!("\nValues are per task. Success breakdown: sentrith usage report --tasks");
         println!("Progress and next step: sentrith usage status");
     }
     Ok(())
 }
 
-fn summarize(rows: &[UsageRow]) -> BTreeMap<&'static str, Option<f64>> {
-    let names = [
-        "input_tokens", "cached_input_tokens", "output_tokens", "credits", "cost_usd",
-        "tool_calls", "duration_seconds", "rework_count",
-    ];
+const NUMERIC_COLUMNS: &[&str] = &[
+    "input_tokens", "cached_input_tokens", "output_tokens", "credits", "cost_usd",
+    "tool_calls", "duration_seconds", "rework_count",
+];
+
+/// Per-task averages for one phase or agent group.
+fn phase_summary(tasks: &[Vec<&BTreeMap<String, String>>]) -> BTreeMap<&'static str, Option<f64>> {
     let mut out = BTreeMap::new();
-    for name in names {
-        let vals: Vec<f64> = rows.iter().filter_map(|r| r.nums.get(name).copied().flatten()).collect();
-        out.insert(name, if vals.is_empty() { None } else { Some(vals.iter().sum::<f64>() / vals.len() as f64) });
+    for name in NUMERIC_COLUMNS {
+        out.insert(*name, mean(&per_task_values(tasks, name)));
     }
-    // Rate over decided rows only; `unknown` (and blank) rows are excluded
-    // from the denominator so automatic capture cannot deflate the rate.
-    let yes = rows.iter().filter(|r| r.success == "yes").count();
-    let no = rows.iter().filter(|r| r.success == "no").count();
-    let success_rate = if yes + no == 0 {
-        None
-    } else {
-        Some(yes as f64 / (yes + no) as f64 * 100.0)
-    };
-    out.insert("success_rate", success_rate);
-    out.insert("tasks", Some(rows.len() as f64));
+    out.insert("success_rate", decided_success_rate(tasks));
+    out.insert("tasks", Some(tasks.len() as f64));
     out
 }
 
@@ -1599,12 +1591,13 @@ struct PublishStats {
 
 fn load_usage_rows(path: &Path, agent_filter: Option<&str>, model_filter: Option<&str>) -> Result<Vec<BTreeMap<String, String>>, String> {
     let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut lines = text.lines();
-    let header = lines.next().ok_or("usage file is empty")?;
+    let records = split_csv_records(&text);
+    let mut records = records.iter();
+    let header = records.next().ok_or("usage file is empty")?;
     let headers = parse_csv_line(header);
     let mut rows = Vec::new();
 
-    for line in lines {
+    for line in records {
         if line.trim().is_empty() { continue; }
         let cols = parse_csv_line(line);
         let mut row = BTreeMap::new();
@@ -1750,15 +1743,18 @@ fn usage_publish(args: &[String]) -> Result<(), String> {
     let baseline_rows: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str) == Some("baseline")).collect();
     let standard_rows: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str) == Some("standard")).collect();
 
-    if !force && (baseline_rows.len() < min_samples || standard_rows.len() < min_samples) {
-        return Err(format!(
-            "refusing README publication: baseline={} standard={} but min-samples={}. Add more data or pass --force.",
-            baseline_rows.len(), standard_rows.len(), min_samples
-        ));
-    }
-
+    // Qualify on the same task counts the table publishes. Counting raw turns
+    // would let five turns of one task pass a five-sample threshold and publish
+    // a one-task benchmark with no small-sample warning.
     let b = publish_stats(&baseline_rows);
     let s = publish_stats(&standard_rows);
+
+    if !force && (b.tasks < min_samples || s.tasks < min_samples) {
+        return Err(format!(
+            "refusing README publication: baseline={} standard={} task(s) but min-samples={}. Add more data or pass --force.",
+            b.tasks, s.tasks, min_samples
+        ));
+    }
 
     let model_name = model.unwrap_or("mixed/unspecified");
     let measured_note_ja = if force && (b.tasks < min_samples || s.tasks < min_samples) {
@@ -1933,8 +1929,11 @@ fn ensure_usage_file(path: &Path) -> Result<(), String> {
 /// left untouched.
 fn migrate_usage_file_if_needed(path: &Path) -> Result<(), String> {
     let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut lines = text.lines();
-    let Some(header) = lines.next() else { return Ok(()); };
+    // Split on logical records: a quoted field may span physical lines, and
+    // appending columns per physical line would inject commas into it.
+    let records = split_csv_records(&text);
+    let mut records = records.iter();
+    let Some(header) = records.next() else { return Ok(()); };
     if header.trim_end() == USAGE_HEADER.trim_end() {
         return Ok(());
     }
@@ -1942,11 +1941,11 @@ fn migrate_usage_file_if_needed(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     let mut out = String::from(USAGE_HEADER);
-    for line in lines {
-        if line.trim().is_empty() {
+    for record in records {
+        if record.trim().is_empty() {
             continue;
         }
-        out.push_str(line);
+        out.push_str(record);
         out.push_str(",,");
         out.push('\n');
     }
@@ -2049,8 +2048,19 @@ fn baseline_start() -> Result<(), String> {
             baseline_stash_dir().display()
         ));
     }
+    // Set the phase marker up front. If this fails, nothing has moved yet and
+    // the working tree is untouched; doing it after the moves would leave the
+    // contract stashed with no marker on an early return.
+    fs::create_dir_all(".ai-usage")
+        .map_err(|e| format!("failed to prepare .ai-usage: {e}"))?;
+    fs::write(phase_marker_path(), "baseline\n")
+        .map_err(|e| format!("failed to write the phase marker: {e}"))?;
+
     let stash = baseline_stash_dir();
-    fs::create_dir_all(&stash).map_err(|e| e.to_string())?;
+    if let Err(e) = fs::create_dir_all(&stash) {
+        let _ = fs::remove_file(phase_marker_path());
+        return Err(e.to_string());
+    }
     let manifest = stash.join("STASHED.txt");
 
     // The manifest is written before each move, so an interrupted run still
@@ -2100,6 +2110,7 @@ fn baseline_start() -> Result<(), String> {
         if rollback_failed.is_empty() {
             let _ = fs::remove_file(&manifest);
             let _ = fs::remove_dir_all(&stash);
+            let _ = fs::remove_file(phase_marker_path());
             return Err(format!("{err}; rolled back, the working tree is unchanged"));
         }
         return Err(format!(
@@ -2112,11 +2123,9 @@ fn baseline_start() -> Result<(), String> {
     if moved.is_empty() {
         let _ = fs::remove_file(&manifest);
         let _ = fs::remove_dir_all(&stash);
+        let _ = fs::remove_file(phase_marker_path());
         return Err("no Sentrith contract files found to stash; is this a Sentrith project?".into());
     }
-
-    fs::create_dir_all(".ai-usage").map_err(|e| e.to_string())?;
-    fs::write(phase_marker_path(), "baseline\n").map_err(|e| e.to_string())?;
 
     println!("SENTRITH-BASELINE: started. Stashed {} path(s):", moved.len());
     for m in &moved {
@@ -3400,6 +3409,76 @@ mod tests {
         // Migration must be idempotent.
         ensure_usage_file(&path).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn csv_records_survive_newlines_inside_quoted_fields() {
+        let text = "a,b\n\"line one\nline two\",x\n\"has \"\"quote\"\" and\nnewline\",y\n";
+        let records = split_csv_records(text);
+        assert_eq!(records.len(), 3, "one header plus two logical records");
+        assert_eq!(parse_csv_line(&records[1]), vec!["line one\nline two", "x"]);
+        assert_eq!(
+            parse_csv_line(&records[2]),
+            vec!["has \"quote\" and\nnewline", "y"]
+        );
+
+        // CRLF files must split the same way.
+        let crlf = "a,b\r\n\"one\r\ntwo\",x\r\n";
+        assert_eq!(split_csv_records(crlf).len(), 2);
+    }
+
+    #[test]
+    fn migration_does_not_corrupt_multiline_fields() {
+        // `csv_escape` quotes embedded newlines, so a v1 row can span physical
+        // lines. Appending columns per line would inject commas into the field.
+        let path = temp_path("usage.csv");
+        let v1_row = "1,claude,m,standard,\"first line\nsecond line\",1,2,3,,,,,yes,0,manual,sess,note";
+        fs::write(&path, format!("{}{}\n", USAGE_HEADER_V1, v1_row)).unwrap();
+
+        ensure_usage_file(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let records = split_csv_records(&text);
+        assert_eq!(records[0], USAGE_HEADER.trim_end());
+        let cols = parse_csv_line(&records[1]);
+        assert_eq!(
+            cols[4], "first line\nsecond line",
+            "the multiline field must be unchanged"
+        );
+        assert_eq!(cols.len(), USAGE_HEADER.trim_end().split(',').count());
+        assert_eq!(cols[17], "");
+        assert_eq!(cols[18], "");
+    }
+
+    #[test]
+    fn phase_comparison_is_per_task_not_per_turn() {
+        // Codex's repro: a three-turn baseline task and a one-turn standard
+        // task, each totaling 30 tokens. Per-turn averaging would report
+        // 10 vs 30; per task they are equal.
+        let baseline_owned = vec![
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "aaa", "yes", "10"),
+        ];
+        let standard_owned = vec![turn("s2", "bbb", "yes", "30")];
+
+        let baseline: Vec<&BTreeMap<String, String>> = baseline_owned.iter().collect();
+        let standard: Vec<&BTreeMap<String, String>> = standard_owned.iter().collect();
+
+        let b = phase_summary(&group_tasks(&baseline));
+        let s = phase_summary(&group_tasks(&standard));
+
+        assert_eq!(b.get("tasks").copied().flatten(), Some(1.0));
+        assert_eq!(s.get("tasks").copied().flatten(), Some(1.0));
+        assert_eq!(b.get("input_tokens").copied().flatten(), Some(30.0));
+        assert_eq!(s.get("input_tokens").copied().flatten(), Some(30.0));
+        assert_eq!(
+            pct_text(
+                b.get("input_tokens").copied().flatten(),
+                s.get("input_tokens").copied().flatten()
+            ),
+            "+0.0%"
+        );
     }
 
     #[test]
