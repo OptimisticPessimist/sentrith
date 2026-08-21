@@ -36,8 +36,12 @@ Provider usageと結合する前の作業境界です。
 
 ```text
 1 turn   = usage.csv 1行
-1 task   = 同一session内で head_sha が変わるまでのturn群
+1 task   = 同一session内で、commitを記録したturnまでのturn群
 ```
+
+`head_sha` 列は「そのturnがcommitを作った場合のみ」書かれます。値があること自体がtask境界の証拠です。
+
+turn終了時のHEADを常に記録する方式では、sessionの最初のturnがcommitした場合に「元からあったHEAD」と区別できず、そのtaskが次のtaskへ吸収されてしまいます。
 
 `sentrith usage report --tasks` はこの規則でturnをtaskへ集約して集計します。
 
@@ -53,7 +57,7 @@ commit到達 + 直近のtest実行がred    -> no
 
 判定材料:
 
-- **commit到達**: `UserPromptSubmit` 時点のHEADと `Stop` 時点のHEADが異なる
+- **commit到達**: `UserPromptSubmit` 時点のHEADと `Stop` 時点のHEADが異なる(このとき、そのcommitのSHAを `head_sha` へ記録)
 - **test実行結果**: turn内で実行されたtest系コマンド(`cargo test`、`pytest`、`npm test` 等)の成否
 
 `unknown` は失敗ではありません。**success rateの分母から除外**します。

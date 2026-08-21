@@ -1260,7 +1260,6 @@ fn summarize(rows: &[UsageRow]) -> BTreeMap<&'static str, Option<f64>> {
 fn group_tasks<'a>(rows: &[&'a BTreeMap<String, String>]) -> Vec<Vec<&'a BTreeMap<String, String>>> {
     let mut tasks: Vec<Vec<&'a BTreeMap<String, String>>> = Vec::new();
     let mut open: BTreeMap<String, Vec<&'a BTreeMap<String, String>>> = BTreeMap::new();
-    let mut last_sha: BTreeMap<String, String> = BTreeMap::new();
     for row in rows.iter().copied() {
         let sid = row.get("session_id").cloned().unwrap_or_default();
         if sid.is_empty() {
@@ -1268,27 +1267,23 @@ fn group_tasks<'a>(rows: &[&'a BTreeMap<String, String>]) -> Vec<Vec<&'a BTreeMa
             continue;
         }
         open.entry(sid.clone()).or_default().push(row);
-        let sha = row.get("head_sha").cloned().unwrap_or_default();
 
-        // A decided outcome is itself proof that this turn closed a task:
-        // hook capture only resolves `yes`/`no` when HEAD moved during the turn.
-        // Relying on a SHA transition alone would miss a session whose very
-        // first captured turn commits, merging it into the next task and
-        // overwriting its outcome with a later row.
+        // `head_sha` is written only for a turn that produced a commit, so any
+        // value closes the task. Comparing against a previous SHA instead would
+        // miss a session whose first captured turn commits — including the case
+        // where no test ran and the outcome is `unknown`, which carries no other
+        // signal that a task ended.
+        let committed = !row.get("head_sha").map(String::as_str).unwrap_or("").is_empty();
+        // Manual ledger rows may carry an outcome without a SHA.
         let decided = matches!(
             row.get("success").map(String::as_str).unwrap_or(""),
             "yes" | "no"
         );
-        let prev = last_sha.get(&sid).cloned().unwrap_or_default();
-        let transitioned = !sha.is_empty() && !prev.is_empty() && prev != sha;
 
-        if decided || transitioned {
+        if committed || decided {
             if let Some(g) = open.remove(&sid) {
                 tasks.push(g);
             }
-        }
-        if !sha.is_empty() {
-            last_sha.insert(sid, sha);
         }
     }
     for (_, g) in open {
@@ -1520,20 +1515,15 @@ fn churn_for_commit(sha: &str, days: f64) -> Option<(usize, usize)> {
 fn usage_report_churn(file: &Path, opts: &BTreeMap<String, String>) -> Result<(), String> {
     let days: f64 = opts.get("days").and_then(|x| x.parse().ok()).unwrap_or(14.0);
     let rows = load_usage_rows(file, opts.get("agent").map(String::as_str), None)?;
-    // Only commits observed to be created mid-session (a head_sha transition)
-    // are attributed to recorded work; pre-existing HEADs are skipped.
-    let mut last: BTreeMap<String, String> = BTreeMap::new();
+    // A recorded `head_sha` is by construction a commit observed during that
+    // turn, so every one counts. Requiring a transition from a previous SHA
+    // would drop each session's first commit, including sessions that contain
+    // exactly one.
     let mut done: BTreeSet<String> = BTreeSet::new();
     let mut per_phase: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for r in &rows {
-        let sid = r.get("session_id").cloned().unwrap_or_default();
         let sha = r.get("head_sha").cloned().unwrap_or_default();
-        if sha.is_empty() {
-            continue;
-        }
-        let is_new_commit = last.get(&sid).map(|p| p != &sha).unwrap_or(false);
-        last.insert(sid, sha.clone());
-        if !is_new_commit || !done.insert(sha.clone()) {
+        if sha.is_empty() || !done.insert(sha.clone()) {
             continue;
         }
         if let Some((changed, total)) = churn_for_commit(&sha, days) {
@@ -2217,20 +2207,27 @@ fn baseline_stop() -> Result<(), String> {
         }
     }
 
-    let _ = fs::remove_file(phase_marker_path());
-
-    if failed.is_empty() {
-        let _ = fs::remove_file(&manifest);
-        let _ = fs::remove_dir_all(&stash);
-        println!("SENTRITH-BASELINE: stopped. Restored {restored} path(s); phase is standard again.");
-        println!("Start a NEW agent session so the contract is loaded before your next task.");
-    } else {
-        println!("SENTRITH-BASELINE: restored {restored} path(s), but these need manual attention:");
-        for f in &failed {
-            println!("  {f}");
-        }
-        println!("Stash kept at {} so nothing is lost.", stash.display());
+    if !failed.is_empty() {
+        // The marker stays: part of the contract is still stashed, so the
+        // project is not back in `standard`. Clearing it here would silently
+        // label the following turns `standard` while the agent is still running
+        // without its instructions, contaminating the comparison.
+        let mut msg = format!(
+            "restored {restored} path(s), but the baseline is still active because these need manual attention: {}",
+            failed.join(", ")
+        );
+        msg.push_str(&format!(
+            ". The stash is kept at {} and the phase marker still reads `baseline`. Resolve the conflicts and run `sentrith usage baseline stop` again.",
+            stash.display()
+        ));
+        return Err(msg);
     }
+
+    let _ = fs::remove_file(phase_marker_path());
+    let _ = fs::remove_file(&manifest);
+    let _ = fs::remove_dir_all(&stash);
+    println!("SENTRITH-BASELINE: stopped. Restored {restored} path(s); phase is standard again.");
+    println!("Start a NEW agent session so the contract is loaded before your next task.");
     Ok(())
 }
 
@@ -2761,7 +2758,11 @@ fn usage_hook_claude(args: &[String]) -> Result<(), String> {
             } else {
                 "Transcript unavailable; estimated session-cost delta from statusLine JSON only.".into()
             },
-            head_sha: head,
+            // Recorded only when this turn actually produced a commit, so a
+            // non-empty value means "this turn closed a task". Storing HEAD
+            // unconditionally could not distinguish a first turn that
+            // committed from one that merely inherited an existing HEAD.
+            head_sha: if committed { head } else { String::new() },
             verification: match window.verification {
                 Some(true) => "pass".into(),
                 Some(false) => "fail".into(),
@@ -2855,7 +2856,7 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
                 source: "codex-hook-transcript-best-effort".into(),
                 session_id: session.clone(),
                 notes: "Best-effort interactive capture: Codex documents transcript_path but warns transcript format is not a stable hook interface. Prefer usage run codex for stable JSON usage.".into(),
-                head_sha: head,
+                head_sha: if committed { head } else { String::new() },
                 verification: match verification {
                     Some(true) => "pass".into(),
                     Some(false) => "fail".into(),
@@ -3530,10 +3531,10 @@ mod tests {
     #[test]
     fn tasks_split_on_head_sha_transitions() {
         let owned = vec![
-            row("s1", "aaa", "unknown", "standard"),
-            row("s1", "aaa", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
             row("s1", "bbb", "yes", "standard"),
-            row("s1", "bbb", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
         ];
         let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
         let tasks = group_tasks(&rows);
@@ -3569,8 +3570,8 @@ mod tests {
         // Three turns of one session, closed by a commit: one task worth
         // 30 input tokens, not three tasks of 10.
         let owned = vec![
-            turn("s1", "aaa", "unknown", "10"),
-            turn("s1", "aaa", "unknown", "10"),
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "", "unknown", "10"),
             turn("s1", "bbb", "yes", "10"),
         ];
         let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
@@ -3620,10 +3621,10 @@ mod tests {
     #[test]
     fn undecided_turns_stay_with_the_task_they_precede() {
         let owned = vec![
-            row("s1", "aaa", "unknown", "standard"),
-            row("s1", "aaa", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
             row("s1", "bbb", "yes", "standard"),
-            row("s1", "bbb", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
         ];
         let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
         let tasks = group_tasks(&rows);
@@ -3635,12 +3636,54 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_closes_its_task_even_without_a_test_run() {
+        // A first turn that commits without running tests records
+        // `success=unknown`, so the outcome carries no signal. The recorded
+        // commit must still end the task, or its usage merges into the next one.
+        let owned = vec![
+            row("s1", "aaa", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
+            row("s1", "bbb", "yes", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let tasks = group_tasks(&rows);
+
+        assert_eq!(tasks.len(), 2, "the unverified first commit is its own task");
+        assert_eq!(tasks[0].len(), 1);
+        assert_eq!(task_success(&tasks[0]), "unknown");
+        assert_eq!(tasks[1].len(), 2);
+        assert_eq!(task_success(&tasks[1]), "yes");
+    }
+
+    #[test]
+    fn every_recorded_commit_is_eligible_for_churn() {
+        // A session with exactly one commit must not be skipped: each recorded
+        // head_sha is by construction a commit observed during that turn.
+        let owned = vec![
+            row("s1", "aaa", "unknown", "standard"),
+            row("s2", "bbb", "yes", "standard"),
+            row("s2", "bbb", "unknown", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let shas: Vec<String> = {
+            let mut seen = BTreeSet::new();
+            rows.iter()
+                .filter_map(|r| r.get("head_sha"))
+                .filter(|s| !s.is_empty())
+                .filter(|s| seen.insert((*s).clone()))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(shas, vec!["aaa".to_string(), "bbb".to_string()]);
+    }
+
+    #[test]
     fn usage_per_success_counts_tasks_not_successful_turns() {
         // Two working turns and a third that commits: capture only resolves a
         // `yes` on the turn where HEAD moved, so this is one successful task.
         let owned = vec![
-            turn("s1", "aaa", "unknown", "10"),
-            turn("s1", "aaa", "unknown", "10"),
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "", "unknown", "10"),
             turn("s1", "bbb", "yes", "10"),
         ];
         let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();

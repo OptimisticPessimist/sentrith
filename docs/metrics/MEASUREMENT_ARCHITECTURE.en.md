@@ -36,8 +36,12 @@ Besides the explicit ledger written by `usage task start` / `stop`, hook-based c
 
 ```text
 1 turn = one usage.csv row
-1 task = the turns of a session up to a head_sha change
+1 task = the turns of a session up to and including the turn that commits
 ```
+
+The `head_sha` column is written **only** for a turn that produced a commit, so any value is itself the task boundary.
+
+Recording HEAD at the end of every turn cannot distinguish a first turn that committed from one that merely inherited an existing HEAD, which would merge that task into the next one.
 
 `sentrith usage report --tasks` aggregates turns into tasks using that rule.
 
@@ -53,7 +57,7 @@ otherwise (nothing to decide on)     -> unknown
 
 Evidence used:
 
-- **commit reached**: HEAD at `Stop` differs from HEAD at `UserPromptSubmit`
+- **commit reached**: HEAD at `Stop` differs from HEAD at `UserPromptSubmit` (the resulting SHA is what `head_sha` records)
 - **test outcome**: success/failure of test-runner commands (`cargo test`, `pytest`, `npm test`, …) executed during the turn
 
 `unknown` is not failure. It is **excluded from the success-rate denominator**:

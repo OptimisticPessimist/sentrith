@@ -13,8 +13,10 @@ Plan: `PLAN.md`
 - [x] T008 — `usage report --churn` (file-level, from `git log --numstat`) + parsing tests
 - [x] T009 — Update hook example configs (drop `--phase standard`)
 - [x] T010 — Update metrics/automation docs (ja/en)
-- [ ] T011 — CI green on all platforms
+- [x] T011 — CI green on all platforms
 
-T011 is the outstanding gate: no Rust toolchain exists on the author machine, so
-`cargo test` has not been executed locally. `sentrith-ci.yml` runs it on
-Linux/Windows/macOS when the branch is pushed.
+All tasks complete. A Rust toolchain was installed locally, so `cargo test` and
+`cargo build --release` now run before every push; CI confirms them on
+Linux/Windows/macOS.
+
+Follow-up work from code review is recorded in the PR, not here.
