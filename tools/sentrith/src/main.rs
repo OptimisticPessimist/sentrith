@@ -2091,23 +2091,11 @@ fn json_string_field(s: &str, key: &str) -> Option<String> {
     let pos = s.find(&needle)?;
     let rest = &s[pos + needle.len()..];
     let colon = rest.find(':')?;
-    let rest = rest[colon + 1..].trim_start();
-    if !rest.starts_with('"') { return None; }
-    let mut out = String::new();
-    let mut escaped = false;
-    for c in rest[1..].chars() {
-        if escaped {
-            out.push(c);
-            escaped = false;
-        } else if c == '\\' {
-            escaped = true;
-        } else if c == '"' {
-            return Some(out);
-        } else {
-            out.push(c);
-        }
+    let mut parser = JsonParser::new(rest[colon + 1..].trim_start());
+    match parser.value().ok()? {
+        Json::Str(value) => Some(value),
+        _ => None,
     }
-    None
 }
 
 fn json_number_field(s: &str, key: &str) -> Option<f64> {
@@ -2844,18 +2832,26 @@ fn extract_id_after(line: &str, marker: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn shell_command_segments(command: &str) -> Vec<Vec<String>> {
-    let mut segments = vec![Vec::new()];
+fn finish_shell_segment(
+    segments: &mut Vec<(Vec<String>, String)>,
+    token: &mut String,
+    operator: String,
+) {
+    if !token.is_empty() {
+        segments.last_mut().unwrap().0.push(std::mem::take(token));
+    }
+    if !segments.last().unwrap().0.is_empty() {
+        segments.push((Vec::new(), operator));
+    }
+}
+
+fn shell_command_segments(command: &str) -> Vec<(Vec<String>, String)> {
+    let mut segments = vec![(Vec::new(), String::new())];
     let mut token = String::new();
     let mut quote = None;
+    let mut chars = command.chars().peekable();
 
-    let flush_token = |segments: &mut Vec<Vec<String>>, token: &mut String| {
-        if !token.is_empty() {
-            segments.last_mut().unwrap().push(std::mem::take(token));
-        }
-    };
-
-    for ch in command.chars() {
+    while let Some(ch) = chars.next() {
         if let Some(q) = quote {
             if ch == q {
                 quote = None;
@@ -2866,18 +2862,38 @@ fn shell_command_segments(command: &str) -> Vec<Vec<String>> {
         }
         match ch {
             '\'' | '"' => quote = Some(ch),
-            c if c.is_whitespace() => flush_token(&mut segments, &mut token),
-            ';' | '|' | '&' => {
-                flush_token(&mut segments, &mut token);
-                if !segments.last().unwrap().is_empty() {
-                    segments.push(Vec::new());
+            '\n' => finish_shell_segment(&mut segments, &mut token, "\n".into()),
+            c if c.is_whitespace() => {
+                if !token.is_empty() {
+                    segments.last_mut().unwrap().0.push(std::mem::take(&mut token));
                 }
+            }
+            ';' => finish_shell_segment(&mut segments, &mut token, ";".into()),
+            '&' => {
+                let operator = if chars.peek() == Some(&'&') {
+                    chars.next();
+                    "&&"
+                } else {
+                    "&"
+                };
+                finish_shell_segment(&mut segments, &mut token, operator.into());
+            }
+            '|' => {
+                let operator = if chars.peek() == Some(&'|') {
+                    chars.next();
+                    "||"
+                } else {
+                    "|"
+                };
+                finish_shell_segment(&mut segments, &mut token, operator.into());
             }
             _ => token.push(ch),
         }
     }
-    flush_token(&mut segments, &mut token);
-    segments.retain(|segment| !segment.is_empty());
+    if !token.is_empty() {
+        segments.last_mut().unwrap().0.push(token);
+    }
+    segments.retain(|(tokens, _)| !tokens.is_empty());
     segments
 }
 
@@ -2976,13 +2992,29 @@ fn is_test_invocation(tokens: &[String]) -> bool {
     }
 }
 
-/// Recognize an actual test-runner executable in a shell command. Text that
-/// merely mentions a test command, such as `echo "cargo test"` or `rg`,
-/// must not mark verification as successful.
+/// Recognize a test invocation only when its status controls the shell result.
+/// Text that merely mentions a test command, masked failures, and pipelines
+/// are excluded so a successful wrapper cannot turn a failed test into a pass.
 fn is_test_command(cmd: &str) -> bool {
-    shell_command_segments(cmd)
+    let segments = shell_command_segments(cmd);
+    let matches: Vec<usize> = segments
         .iter()
-        .any(|segment| is_test_invocation(segment))
+        .enumerate()
+        .filter_map(|(index, (tokens, _))| is_test_invocation(tokens).then_some(index))
+        .collect();
+    if matches.len() != 1 {
+        return false;
+    }
+    let test_index = matches[0];
+    if segments[..=test_index]
+        .iter()
+        .any(|(_, operator)| matches!(operator.as_str(), "||" | "|" | "&"))
+    {
+        return false;
+    }
+    !segments[test_index + 1..]
+        .iter()
+        .any(|(_, operator)| matches!(operator.as_str(), ";" | "||" | "|" | "&"))
 }
 
 /// Parse the Claude Code transcript JSONL lines after `skip_lines`.
@@ -3874,6 +3906,13 @@ mod tests {
         assert!(!is_test_command(r#"rg "cargo test" docs"#));
         assert!(is_test_command("env CI=1 cargo test"));
         assert!(is_test_command(r#""/opt/project/bin/cargo" test"#));
+        assert!(is_test_command("cd tools && cargo test"));
+        assert!(is_test_command("cd tools\ncargo test"));
+        assert!(is_test_command("cargo test && echo done"));
+        assert!(!is_test_command("cargo test || true"));
+        assert!(!is_test_command("cargo test; echo done"));
+        assert!(!is_test_command("cargo test | tee test.log"));
+        assert!(!is_test_command("cargo test --no-run"));
         assert!(!is_test_command("cargo test --no-run"));
         assert!(!is_test_command("cargo test -- --list"));
         assert!(!is_test_command("pytest --collect-only"));
@@ -3896,6 +3935,9 @@ mod tests {
 
         let unrelated = r#"{"command":"ls","exit_code":1}"#;
         assert_eq!(scan_codex_window_for_tests(unrelated, 0), None);
+
+        let multiline = r#"{"command":"cd tools\ncargo test","exit_code":0}"#;
+        assert_eq!(scan_codex_window_for_tests(multiline, 0), Some(true));
     }
 
     #[test]
