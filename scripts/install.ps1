@@ -73,7 +73,7 @@ if ($Update) {
     Write-Host "Ask your agent to fill them (see docs/ai/BOOTSTRAP.md)."
   }
   Write-Host "Review: git diff -- AGENTS.md docs/development docs/profiles"
-  Write-Host "See docs/guide/UPDATING.md before your next task."
+  Write-Host "Post-update steps: docs/guide/UPDATING.en.md (日本語: UPDATING.ja.md) in the Sentrith source."
   exit 0
 }
 

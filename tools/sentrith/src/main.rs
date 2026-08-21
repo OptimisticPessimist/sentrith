@@ -1269,13 +1269,25 @@ fn group_tasks<'a>(rows: &[&'a BTreeMap<String, String>]) -> Vec<Vec<&'a BTreeMa
         }
         open.entry(sid.clone()).or_default().push(row);
         let sha = row.get("head_sha").cloned().unwrap_or_default();
-        if !sha.is_empty() {
-            let prev = last_sha.get(&sid).cloned().unwrap_or_default();
-            if !prev.is_empty() && prev != sha {
-                if let Some(g) = open.remove(&sid) {
-                    tasks.push(g);
-                }
+
+        // A decided outcome is itself proof that this turn closed a task:
+        // hook capture only resolves `yes`/`no` when HEAD moved during the turn.
+        // Relying on a SHA transition alone would miss a session whose very
+        // first captured turn commits, merging it into the next task and
+        // overwriting its outcome with a later row.
+        let decided = matches!(
+            row.get("success").map(String::as_str).unwrap_or(""),
+            "yes" | "no"
+        );
+        let prev = last_sha.get(&sid).cloned().unwrap_or_default();
+        let transitioned = !sha.is_empty() && !prev.is_empty() && prev != sha;
+
+        if decided || transitioned {
+            if let Some(g) = open.remove(&sid) {
+                tasks.push(g);
             }
+        }
+        if !sha.is_empty() {
             last_sha.insert(sid, sha);
         }
     }
@@ -2049,8 +2061,14 @@ fn baseline_start() -> Result<(), String> {
     }
     let stash = baseline_stash_dir();
     fs::create_dir_all(&stash).map_err(|e| e.to_string())?;
+    let manifest = stash.join("STASHED.txt");
 
-    let mut moved = Vec::new();
+    // The manifest is written before each move, so an interrupted run still
+    // leaves a record of what was stashed. Losing the manifest would strand the
+    // moved files, and `baseline stop` deletes the stash directory once it has
+    // restored everything the manifest names.
+    let mut moved: Vec<String> = Vec::new();
+    let mut failure: Option<String> = None;
     for path in BASELINE_STASH_PATHS {
         let src = repo_file(path);
         if !src.exists() {
@@ -2058,20 +2076,57 @@ fn baseline_start() -> Result<(), String> {
         }
         let dst = stash.join(path);
         if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if let Err(e) = fs::create_dir_all(parent) {
+                failure = Some(format!("failed to prepare stash for {path}: {e}"));
+                break;
+            }
         }
-        fs::rename(&src, &dst).map_err(|e| format!("failed to stash {path}: {e}"))?;
+        let mut planned = moved.clone();
+        planned.push((*path).to_string());
+        if let Err(e) = fs::write(&manifest, planned.join("\n") + "\n") {
+            failure = Some(format!("failed to record stash manifest: {e}"));
+            break;
+        }
+        if let Err(e) = fs::rename(&src, &dst) {
+            failure = Some(format!("failed to stash {path}: {e}"));
+            break;
+        }
         moved.push((*path).to_string());
     }
 
+    if let Some(err) = failure {
+        // Roll back so a partial stash never leaves the project without its
+        // contract files, and never leaves files only inside the stash.
+        let mut rollback_failed = Vec::new();
+        for path in moved.iter().rev() {
+            let src = stash.join(path);
+            let dst = repo_file(path);
+            if src.exists() && !dst.exists() {
+                if let Err(e) = fs::rename(&src, &dst) {
+                    rollback_failed.push(format!("{path} ({e})"));
+                }
+            }
+        }
+        if rollback_failed.is_empty() {
+            let _ = fs::remove_file(&manifest);
+            let _ = fs::remove_dir_all(&stash);
+            return Err(format!("{err}; rolled back, the working tree is unchanged"));
+        }
+        return Err(format!(
+            "{err}; rollback incomplete for: {}. Files are still in {} — restore them manually.",
+            rollback_failed.join(", "),
+            stash.display()
+        ));
+    }
+
     if moved.is_empty() {
+        let _ = fs::remove_file(&manifest);
         let _ = fs::remove_dir_all(&stash);
         return Err("no Sentrith contract files found to stash; is this a Sentrith project?".into());
     }
 
     fs::create_dir_all(".ai-usage").map_err(|e| e.to_string())?;
     fs::write(phase_marker_path(), "baseline\n").map_err(|e| e.to_string())?;
-    fs::write(stash.join("STASHED.txt"), moved.join("\n") + "\n").map_err(|e| e.to_string())?;
 
     println!("SENTRITH-BASELINE: started. Stashed {} path(s):", moved.len());
     for m in &moved {
@@ -2084,15 +2139,66 @@ fn baseline_start() -> Result<(), String> {
     Ok(())
 }
 
+enum StashState {
+    /// Nothing was ever stashed; the directory is safe to remove.
+    Empty,
+    /// The manifest names these paths, in stash order.
+    Listed(Vec<String>),
+    /// Files exist but no manifest explains them. They may be the only copy, so
+    /// they must not be deleted.
+    Unattributable(Vec<String>),
+}
+
+fn inspect_stash(stash: &Path) -> Result<StashState, String> {
+    let listed: Vec<String> = read_text(&stash.join("STASHED.txt"))
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !listed.is_empty() {
+        return Ok(StashState::Listed(listed));
+    }
+    let leftovers: Vec<String> = fs::read_dir(stash)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n != "STASHED.txt")
+        .collect();
+    if leftovers.is_empty() {
+        Ok(StashState::Empty)
+    } else {
+        Ok(StashState::Unattributable(leftovers))
+    }
+}
+
 fn baseline_stop() -> Result<(), String> {
     let stash = baseline_stash_dir();
     if !stash.exists() {
         return Err("no active baseline to stop".into());
     }
-    let list = read_text(&stash.join("STASHED.txt"));
+    let manifest = stash.join("STASHED.txt");
+    let entries = match inspect_stash(&stash)? {
+        StashState::Listed(paths) => paths,
+        StashState::Empty => {
+            let _ = fs::remove_file(&manifest);
+            let _ = fs::remove_dir_all(&stash);
+            let _ = fs::remove_file(phase_marker_path());
+            println!("SENTRITH-BASELINE: stopped; the stash was empty. Phase is standard again.");
+            return Ok(());
+        }
+        StashState::Unattributable(leftovers) => {
+            return Err(format!(
+                "{} has no manifest but still contains: {}. Move them back manually; nothing was deleted.",
+                stash.display(),
+                leftovers.join(", ")
+            ));
+        }
+    };
+
     let mut restored = 0;
     let mut failed = Vec::new();
-    for path in list.lines().filter(|l| !l.trim().is_empty()) {
+    for path in entries.iter().map(String::as_str) {
         let src = stash.join(path);
         let dst = repo_file(path);
         if !src.exists() {
@@ -2114,7 +2220,7 @@ fn baseline_stop() -> Result<(), String> {
     let _ = fs::remove_file(phase_marker_path());
 
     if failed.is_empty() {
-        let _ = fs::remove_file(stash.join("STASHED.txt"));
+        let _ = fs::remove_file(&manifest);
         let _ = fs::remove_dir_all(&stash);
         println!("SENTRITH-BASELINE: stopped. Restored {restored} path(s); phase is standard again.");
         println!("Start a NEW agent session so the contract is loaded before your next task.");
@@ -3494,10 +3600,47 @@ mod tests {
     }
 
     #[test]
-    fn usage_per_success_counts_tasks_not_successful_turns() {
+    fn first_captured_turn_can_close_its_own_task() {
+        // A session whose very first captured turn commits has no previous SHA
+        // to transition from. Without the decided-outcome rule its task would
+        // merge into the next one and its `yes` would be overwritten.
         let owned = vec![
-            turn("s1", "aaa", "yes", "10"),
-            turn("s1", "aaa", "yes", "10"),
+            row("s1", "bbb", "yes", "standard"),
+            row("s1", "ccc", "no", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let tasks = group_tasks(&rows);
+
+        assert_eq!(tasks.len(), 2, "each committed turn closes its own task");
+        assert_eq!(task_success(&tasks[0]), "yes");
+        assert_eq!(task_success(&tasks[1]), "no");
+        assert_eq!(decided_success_rate(&tasks), Some(50.0));
+    }
+
+    #[test]
+    fn undecided_turns_stay_with_the_task_they_precede() {
+        let owned = vec![
+            row("s1", "aaa", "unknown", "standard"),
+            row("s1", "aaa", "unknown", "standard"),
+            row("s1", "bbb", "yes", "standard"),
+            row("s1", "bbb", "unknown", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let tasks = group_tasks(&rows);
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].len(), 3);
+        assert_eq!(task_success(&tasks[0]), "yes");
+        assert_eq!(task_success(&tasks[1]), "unknown");
+    }
+
+    #[test]
+    fn usage_per_success_counts_tasks_not_successful_turns() {
+        // Two working turns and a third that commits: capture only resolves a
+        // `yes` on the turn where HEAD moved, so this is one successful task.
+        let owned = vec![
+            turn("s1", "aaa", "unknown", "10"),
+            turn("s1", "aaa", "unknown", "10"),
             turn("s1", "bbb", "yes", "10"),
         ];
         let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
@@ -3512,6 +3655,33 @@ mod tests {
         assert!(files.contains("src/a.rs"));
         assert!(files.contains("src/b.rs"));
         assert!(!files.contains("bin/blob"), "binary rows have no numeric counts");
+    }
+
+    #[test]
+    fn stash_without_a_manifest_is_never_treated_as_deletable() {
+        // An interrupted start can leave files with no manifest. They may be
+        // the only copy of a contract file, so `stop` must refuse rather than
+        // remove the directory.
+        let stash = temp_path("stash");
+        fs::create_dir_all(&stash).unwrap();
+        fs::write(stash.join("AGENTS.md"), "contract").unwrap();
+
+        match inspect_stash(&stash).unwrap() {
+            StashState::Unattributable(found) => assert_eq!(found, vec!["AGENTS.md"]),
+            _ => panic!("a stash with contents and no manifest must be unattributable"),
+        }
+
+        // With a manifest, the same directory is restorable.
+        fs::write(stash.join("STASHED.txt"), "AGENTS.md\n\n").unwrap();
+        match inspect_stash(&stash).unwrap() {
+            StashState::Listed(paths) => assert_eq!(paths, vec!["AGENTS.md"]),
+            _ => panic!("a manifest must be honored"),
+        }
+
+        // A genuinely empty stash is safe to drop.
+        let empty = temp_path("empty-stash");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(inspect_stash(&empty).unwrap(), StashState::Empty));
     }
 
     #[test]

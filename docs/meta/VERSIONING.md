@@ -34,13 +34,13 @@ The practical test for a MINOR bump: a user on the previous version can run
 `install.sh --update`, read the printed summary, and keep working.
 
 If that is not true, the release notes must say exactly what to do by hand, and
-`docs/guide/UPDATING.md` must cover it.
+`docs/guide/UPDATING.en.md` (and its `.ja` counterpart) must cover it.
 
 ## Release checklist
 
 1. Update `version` in `tools/sentrith/Cargo.toml`.
 2. Confirm `cargo test` and `cargo build --release` pass on all CI platforms.
-3. Note user-facing migrations in `docs/guide/UPDATING.md`.
+3. Note user-facing migrations in `docs/guide/UPDATING.en.md` and `UPDATING.ja.md`.
 4. Tag `sentrith-vX.Y.Z`; the release workflow builds and publishes binaries
    plus `SHA256SUMS`.
 

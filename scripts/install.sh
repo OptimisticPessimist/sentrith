@@ -91,7 +91,7 @@ if [ "$UPDATE" -eq 1 ]; then
   fi
   printf '%s\n' \
     "Review: git diff -- AGENTS.md docs/development docs/profiles" \
-    "See docs/guide/UPDATING.md before your next task."
+    "Post-update steps: docs/guide/UPDATING.en.md (日本語: UPDATING.ja.md) in the Sentrith source."
   exit 0
 fi
 
