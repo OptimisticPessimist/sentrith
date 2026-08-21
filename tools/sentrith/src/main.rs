@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -2128,22 +2128,6 @@ fn read_stdin_all() -> Result<String, String> {
     Ok(s)
 }
 
-const USAGE_LOCK_STALE_AFTER_SECS: u64 = 15;
-
-fn stale_usage_lock(lock_path: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(lock_path) else {
-        return false;
-    };
-    let created = text
-        .lines()
-        .find_map(|line| line.strip_prefix("created=")?.parse::<u64>().ok());
-    let Some(created) = created else {
-        return false;
-    };
-    let now = now_unix().parse::<u64>().unwrap_or(created);
-    now.saturating_sub(created) >= USAGE_LOCK_STALE_AFTER_SECS
-}
-
 fn with_usage_file_lock<T, F>(path: &Path, operation: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String>,
@@ -2154,25 +2138,31 @@ where
         }
     }
     let lock_path = path.with_extension("csv.lock");
-    let mut guard = None;
+    let mut guard: Option<File> = None;
     for _ in 0..500 {
-        match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
-            Ok(mut file) => {
-                let owner = format!("pid={}\ncreated={}\n", std::process::id(), now_unix());
-                if let Err(e) = file.write_all(owner.as_bytes()) {
-                    let _ = fs::remove_file(&lock_path);
-                    return Err(e.to_string());
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => match file.try_lock() {
+                Ok(()) => {
+                    let owner = format!("pid={}\ncreated={}\n", std::process::id(), now_unix());
+                    if let Err(e) = file.set_len(0).and_then(|_| file.seek(SeekFrom::Start(0))) {
+                        return Err(e.to_string());
+                    }
+                    if let Err(e) = file.write_all(owner.as_bytes()) {
+                        return Err(e.to_string());
+                    }
+                    guard = Some(file);
+                    break;
                 }
-                guard = Some(file);
-                break;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if stale_usage_lock(&lock_path) {
-                    let _ = fs::remove_file(&lock_path);
-                    continue;
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    thread::sleep(Duration::from_millis(10));
                 }
-                thread::sleep(Duration::from_millis(10));
-            }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.to_string()),
+            },
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -2181,17 +2171,12 @@ where
     };
 
     let result = operation();
+    // Keep the lock file in place. Removing it after unlocking reintroduces a
+    // race where another process can acquire a newly created file and the
+    // cleanup from this process deletes that new owner's lock. The OS-managed
+    // lock is released when this handle is dropped, including after a crash.
     drop(guard);
-    match fs::remove_file(&lock_path) {
-        Ok(()) => result,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => result,
-        Err(cleanup_error) => match result {
-            Ok(_) => Err(cleanup_error.to_string()),
-            Err(operation_error) => Err(format!(
-                "{operation_error}; failed to remove usage lock: {cleanup_error}"
-            )),
-        },
-    }
+    result
 }
 
 fn ensure_usage_file(path: &Path) -> Result<(), String> {
@@ -2912,6 +2897,31 @@ fn first_non_option_arg(args: &[String]) -> Option<&str> {
         .find(|arg| !arg.starts_with('-'))
 }
 
+fn no_test_execution_requested(name: &str, args: &[String]) -> bool {
+    let has = |flag: &str| args.iter().any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")));
+    match name {
+        "cargo" => has("--no-run") || has("--list"),
+        "pytest" | "python" | "python3" | "py" => has("--collect-only") || has("--co"),
+        "go" => has("-list"),
+        "dotnet" => has("--list-tests"),
+        "mvn" => args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-DskipTests" | "-DskipTests=true" | "-Dmaven.test.skip" | "-Dmaven.test.skip=true"
+            )
+        }),
+        "gradle" | "gradlew" => {
+            has("--dry-run") || args.windows(2).any(|w| {
+                matches!(w[0].as_str(), "-x" | "--exclude-task") && w[1] == "test"
+            })
+        }
+        "ctest" => has("-N") || has("--show-only"),
+        "jest" => has("--listTests"),
+        "vitest" => has("--list"),
+        _ => false,
+    }
+}
+
 fn is_test_invocation(tokens: &[String]) -> bool {
     let mut index = 0;
     while let Some(token) = tokens.get(index) {
@@ -2940,6 +2950,9 @@ fn is_test_invocation(tokens: &[String]) -> bool {
     };
     let args = &tokens[index + 1..];
     let name = executable_name(executable);
+    if no_test_execution_requested(&name, args) {
+        return false;
+    }
     let first = first_non_option_arg(args);
 
     match name.as_str() {
@@ -3861,6 +3874,12 @@ mod tests {
         assert!(!is_test_command(r#"rg "cargo test" docs"#));
         assert!(is_test_command("env CI=1 cargo test"));
         assert!(is_test_command(r#""/opt/project/bin/cargo" test"#));
+        assert!(!is_test_command("cargo test --no-run"));
+        assert!(!is_test_command("cargo test -- --list"));
+        assert!(!is_test_command("pytest --collect-only"));
+        assert!(!is_test_command("python -m pytest --collect-only"));
+        assert!(!is_test_command("go test -list ."));
+        assert!(!is_test_command("dotnet test --list-tests"));
     }
 
     #[test]
@@ -3877,6 +3896,39 @@ mod tests {
 
         let unrelated = r#"{"command":"ls","exit_code":1}"#;
         assert_eq!(scan_codex_window_for_tests(unrelated, 0), None);
+    }
+
+    #[test]
+    fn usage_lock_waits_for_an_os_owned_lock() {
+        let path = temp_path("usage.csv");
+        let lock = path.with_extension("csv.lock");
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock)
+            .unwrap();
+        holder.try_lock().unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            with_usage_file_lock(&worker_path, || {
+                entered_tx.send(()).unwrap();
+                Ok(())
+            })
+        });
+
+        assert!(
+            entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a held OS lock must keep another writer out"
+        );
+        drop(holder);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the waiter should enter after the lock is released");
+        worker.join().unwrap().unwrap();
+        let _ = fs::remove_file(lock);
     }
 
     #[test]
@@ -3903,14 +3955,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_usage_lock_is_reclaimed() {
+    fn preexisting_unlocked_usage_lock_file_is_reused() {
         let path = temp_path("usage.csv");
         let lock = path.with_extension("csv.lock");
         fs::write(&lock, "pid=999999\ncreated=0\n").unwrap();
 
         with_usage_file_lock(&path, || Ok(())).unwrap();
 
-        assert!(!lock.exists());
+        assert!(lock.exists(), "the persistent lock file must remain for safe reuse");
+        let _ = fs::remove_file(lock);
     }
 
     #[test]
