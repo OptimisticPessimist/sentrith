@@ -4,7 +4,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE_HEADER_V1: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes\n";
 const USAGE_HEADER: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes,head_sha,verification\n";
@@ -1114,13 +1115,6 @@ fn usage_record(args: &[String]) -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
 
-    ensure_usage_file(&file)?;
-
-    let mut f = OpenOptions::new()
-        .append(true)
-        .open(&file)
-        .map_err(|e| e.to_string())?;
-
     let values = [
         now_unix(),
         agent.to_string(),
@@ -1142,8 +1136,7 @@ fn usage_record(args: &[String]) -> Result<(), String> {
         opts.get("head-sha").cloned().unwrap_or_default(),
         opts.get("verification").cloned().unwrap_or_default(),
     ];
-    let row = values.iter().map(|x| csv_escape(x)).collect::<Vec<_>>().join(",");
-    writeln!(f, "{row}").map_err(|e| e.to_string())?;
+    append_usage_row(&file, &values)?;
 
     println!("SENTRITH-USAGE: recorded {agent} / {phase} / {task} -> {}", file.display());
     Ok(())
@@ -1980,6 +1973,47 @@ fn read_stdin_all() -> Result<String, String> {
     Ok(s)
 }
 
+fn with_usage_file_lock<T, F>(path: &Path, operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let lock_path = path.with_extension("csv.lock");
+    let mut guard = None;
+    for _ in 0..500 {
+        match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+            Ok(file) => {
+                guard = Some(file);
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let Some(guard) = guard else {
+        return Err(format!("timed out waiting for usage lock: {}", lock_path.display()));
+    };
+
+    let result = operation();
+    drop(guard);
+    match fs::remove_file(&lock_path) {
+        Ok(()) => result,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => result,
+        Err(cleanup_error) => match result {
+            Ok(_) => Err(cleanup_error.to_string()),
+            Err(operation_error) => Err(format!(
+                "{operation_error}; failed to remove usage lock: {cleanup_error}"
+            )),
+        },
+    }
+}
+
 fn ensure_usage_file(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -2017,7 +2051,7 @@ fn migrate_usage_file_if_needed(path: &Path) -> Result<(), String> {
         out.push_str(",,");
         out.push('\n');
     }
-    let tmp = path.with_extension("csv.migrate");
+    let tmp = path.with_extension(format!("csv.migrate.{}.tmp", std::process::id()));
     fs::write(&tmp, out).map_err(|e| e.to_string())?;
     fs::rename(&tmp, path).map_err(|e| e.to_string())?;
     Ok(())
@@ -2413,8 +2447,16 @@ fn num_cell(v: Option<f64>) -> String {
     }).unwrap_or_default()
 }
 
+fn append_usage_row(path: &Path, values: &[String]) -> Result<(), String> {
+    with_usage_file_lock(path, || {
+        ensure_usage_file(path)?;
+        let row = values.iter().map(|x| csv_escape(x)).collect::<Vec<_>>().join(",");
+        let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
+        writeln!(f, "{row}").map_err(|e| e.to_string())
+    })
+}
+
 fn append_auto_usage(path: &Path, u: &AutoUsage) -> Result<(), String> {
-    ensure_usage_file(path)?;
     let values = [
         now_unix(),
         u.agent.clone(),
@@ -2436,9 +2478,7 @@ fn append_auto_usage(path: &Path, u: &AutoUsage) -> Result<(), String> {
         u.head_sha.clone(),
         u.verification.clone(),
     ];
-    let row = values.iter().map(|x| csv_escape(x)).collect::<Vec<_>>().join(",");
-    let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
-    writeln!(f, "{row}").map_err(|e| e.to_string())
+    append_usage_row(path, &values)
 }
 
 fn split_double_dash(args: &[String]) -> (Vec<String>, Vec<String>) {
@@ -3580,6 +3620,39 @@ mod tests {
         // Migration must be idempotent.
         ensure_usage_file(&path).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn concurrent_first_appends_preserve_migrated_rows() {
+        let path = temp_path("usage.csv");
+        fs::write(&path, USAGE_HEADER_V1).unwrap();
+
+        let first_path = path.clone();
+        let first = thread::spawn(move || {
+            let usage = AutoUsage {
+                agent: "codex".into(),
+                task: "first".into(),
+                ..Default::default()
+            };
+            append_auto_usage(&first_path, &usage)
+        });
+        let second_path = path.clone();
+        let second = thread::spawn(move || {
+            let usage = AutoUsage {
+                agent: "codex".into(),
+                task: "second".into(),
+                ..Default::default()
+            };
+            append_auto_usage(&second_path, &usage)
+        });
+
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 3, "v2 header plus both appended rows");
+        assert!(text.lines().any(|line| line.contains(",first,")));
+        assert!(text.lines().any(|line| line.contains(",second,")));
     }
 
     #[test]
