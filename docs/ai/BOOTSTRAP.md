@@ -41,6 +41,8 @@ Give the coding agent this instruction:
 >
 > Run the narrowest safe baseline verification commands available and record only their actual outcomes.
 >
+> Then run the profile questions below and populate `docs/ai/PROFILE.md`.
+>
 > Finish with:
 >
 > 1. project-memory files created or changed
@@ -49,6 +51,54 @@ Give the coding agent this instruction:
 > 4. commands actually executed
 > 5. baseline verification results
 > 6. items that need human confirmation
+
+## Profile questions
+
+Ask these once, during bootstrap, after inspecting the repository.
+
+Propose an answer for each from repository evidence, and ask the user only to
+confirm or correct it. Do not ask questions the repository already answers.
+
+Keep it to these; do not invent extra process questions.
+
+1. Which of these does this repository contain? (multiple allowed)
+   - externally reachable API / endpoints / schemas
+   - database schema or migrations
+   - authentication / authorization
+   - model or prompt driven behavior (LLM, ML inference, RAG)
+   - training data, datasets, or data pipelines
+   - real-time / rendering / game-engine content
+2. What is the blast radius of a bad change?
+   - internal only / affects users / irreversible (money, deletion, public contract)
+3. Are there irreversible operations an agent could reach?
+4. Which external contracts must not break silently?
+5. What verification exists today beyond unit tests?
+   (integration, contract, eval, data quality, visual, platform)
+
+Map answers to profiles in `docs/profiles/`:
+
+```text
+API / schema / auth / jobs        -> Web / Backend
+prompts / models / RAG / eval     -> AI / ML
+datasets / pipelines / notebooks  -> Data
+engine / scene / asset / platform -> Game / Interactive 3D  (VRChat as subprofile)
+```
+
+Enable **every** profile that matches; profiles are additive overlays, not
+exclusive modes.
+
+Write the result to `docs/ai/PROFILE.md`:
+
+- enabled/rejected profiles, with the real paths or change kinds that trigger each
+- failure impact
+- only the techniques actually in force, each with the condition that activated it
+- domain verification commands that are not already in `PROJECT.md`
+
+Do not copy technique explanations into `PROFILE.md`. It is an index, and it is
+loaded on ordinary tasks, so it must stay small.
+
+Enable a technique only when its gate condition in the profile document is met.
+When unsure, leave it disabled and record why.
 
 ## Human review after bootstrap
 

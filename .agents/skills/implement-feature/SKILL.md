@@ -9,6 +9,9 @@ Read:
 - `docs/development/DEVELOPMENT_METHOD.md`
 - `docs/ai/PROJECT.md`
 - `docs/ai/STATE.md`
+- `docs/ai/PROFILE.md`
+
+Read a `docs/profiles/` document only when the change matches a trigger recorded in `PROFILE.md`.
 
 If a current feature spec exists, also read its `SPEC.md`, `PLAN.md`, and active `TASKS.md` as needed.
 

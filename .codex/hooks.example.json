@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "./bin/sentrith usage hook codex --phase standard",
+            "command": "./bin/sentrith usage hook codex",
             "timeout": 5,
             "additionalContextLimit": 300
           }
@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "./bin/sentrith usage hook codex --phase standard",
+            "command": "./bin/sentrith usage hook codex",
             "timeout": 5,
             "additionalContextLimit": 300
           }

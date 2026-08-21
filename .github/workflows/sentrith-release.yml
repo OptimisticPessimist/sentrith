@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing or new release tag (for example sentrith-v1.0.0)"
+        description: "Existing or new release tag (for example sentrith-v0.2.0)"
         required: true
         type: string
 
@@ -87,6 +87,13 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Resolve tag
         id: tag

@@ -7,9 +7,12 @@ Read:
 
 - `AGENTS.md`
 - `docs/ai/PROJECT.md`
+- `docs/ai/PROFILE.md`
 - relevant feature spec/acceptance criteria if present
 
 Inspect the actual diff and relevant surrounding code/tests.
+
+When the diff matches a trigger in `PROFILE.md`, check the matched profile's verification dimensions as part of "missing verification".
 
 Prioritize findings:
 

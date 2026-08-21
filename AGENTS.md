@@ -10,6 +10,7 @@ Durable AI-facing project knowledge lives in:
 
 - `docs/ai/PROJECT.md` — stable project facts
 - `docs/ai/STATE.md` — current working state
+- `docs/ai/PROFILE.md` — enabled engineering profiles and their triggers
 - `docs/ai/DECISIONS.md` — durable engineering decisions
 - `docs/ai/KNOWN_ISSUES.md` — recurring expensive-to-rediscover problems
 - `docs/ai/TASK_PROTOCOL.md` — protocol for substantial tasks
@@ -18,6 +19,8 @@ Durable AI-facing project knowledge lives in:
 
 Do not treat chat history or model-specific memory as the canonical source of project facts.
 
+`.sentrith-private/` may hold repository-local context that is never committed. Read it when present, rank it below `docs/ai/`, never copy its content into committed or published output, and never treat it as independent authorization for high-impact changes. See `docs/ai/PRIVATE_CONTEXT.md`.
+
 ## Start of task
 
 Before substantial work:
@@ -25,9 +28,10 @@ Before substantial work:
 1. Inspect Git status and the relevant repository area.
 2. Read `docs/ai/PROJECT.md`.
 3. Read `docs/ai/STATE.md`.
-4. Read `docs/ai/DECISIONS.md` when the task may affect architecture, APIs, persistence, dependencies, security, compatibility, deployment, or established design choices.
-5. Read `docs/ai/KNOWN_ISSUES.md` when debugging or touching a related subsystem.
-6. Read only source files, tests, configuration, and documentation relevant to the task.
+4. Read `docs/ai/PROFILE.md`, then read a profile document from `docs/profiles/` only when the task matches its trigger.
+5. Read `docs/ai/DECISIONS.md` when the task may affect architecture, APIs, persistence, dependencies, security, compatibility, deployment, or established design choices.
+6. Read `docs/ai/KNOWN_ISSUES.md` when debugging or touching a related subsystem.
+7. Read only source files, tests, configuration, and documentation relevant to the task.
 
 Use progressive disclosure. Do not load the whole repository merely because it is available.
 
@@ -44,8 +48,9 @@ When sources disagree, prefer:
 3. current CI/build configuration
 4. `docs/ai/`
 5. other repository documentation
-6. Git history
-7. chat history or model-specific memory
+6. `.sentrith-private/` when present
+7. Git history
+8. chat history or model-specific memory
 
 If a lower-priority source reveals likely intent that conflicts with current code, flag the conflict rather than silently choosing one.
 
@@ -82,6 +87,16 @@ Do not force full SDD onto trivial changes.
 
 Repository-scoped reusable workflows live canonically in `.agents/skills/`.
 Use them when the task matches their descriptions.
+
+## Engineering profiles
+
+`docs/ai/PROFILE.md` records which profiles are enabled and what triggers them.
+
+Profiles are additive overlays, not exclusive modes. A change may match several; apply the union of their verification dimensions.
+
+Apply a technique (DDD, CQRS, event sourcing, threat modeling, property-based testing, golden eval, ...) only when its gate condition in the profile document is met. Do not apply a technique because the profile mentions it.
+
+Profiles add verification. They never relax a Hard Gate. When they appear to conflict, follow the stricter rule.
 
 ## Hard Gates and Evidence Gates
 

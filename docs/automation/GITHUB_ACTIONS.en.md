@@ -32,7 +32,7 @@ Builds precompiled binaries for supported platforms and publishes release artifa
 Expected public tag format:
 
 ```text
-sentrith-v1.0.0
+sentrith-v0.2.0
 ```
 
 The source package version is kept in:

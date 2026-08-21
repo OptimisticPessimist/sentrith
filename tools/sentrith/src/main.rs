@@ -6,7 +6,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const USAGE_HEADER: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes\n";
+const USAGE_HEADER_V1: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes\n";
+const USAGE_HEADER: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes,head_sha,verification\n";
+
+const TEST_COMMAND_PATTERNS: &[&str] = &[
+    "cargo test", "pytest", "npm test", "npm run test", "yarn test", "pnpm test",
+    "go test", "dotnet test", "mvn test", "gradle test", "./gradlew test",
+    "rspec", "phpunit", "vitest", "jest", "mix test", "ctest", "tox",
+    "make test", "rake test", "unittest",
+];
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -21,6 +29,7 @@ fn main() {
         "guard" => guard_check(),
         "review-hint" => review_hint(),
         "diff-budget" => diff_budget(),
+        "hooks" => hooks_command(&args[1..]),
         "usage" => usage_command(&args[1..]),
         "version" | "--version" | "-V" => {
             println!("sentrith {}", env!("CARGO_PKG_VERSION"));
@@ -50,6 +59,12 @@ Commands:
   sentrith review-hint
   sentrith diff-budget
 
+  sentrith hooks install [--agent claude|codex|all] [--dry-run]
+  sentrith hooks status [--agent claude|codex|all]
+
+  sentrith usage status [--min-samples 5] [--agent <name>]
+  sentrith usage baseline start|stop|status
+
   sentrith usage record --agent <codex|claude|copilot|gemini|other> --task <name> [options]
   sentrith usage run codex --task <name> [--phase standard] -- <codex exec args...>
   sentrith usage run copilot --task <name> [--phase standard] -- <copilot args...>
@@ -62,6 +77,8 @@ Commands:
   sentrith usage contribute --agent <name> [--metric auto|credits|cost_usd|tokens] [options]
   sentrith usage aggregate [--dir docs/metrics/contributions] [--publish]
   sentrith usage report [--compare] [--agent <name>] [--file <path>]
+  sentrith usage report --tasks [--agent <name>] [--file <path>]
+  sentrith usage report --churn [--days 14] [--agent <name>] [--file <path>]
   sentrith usage publish [options]
   sentrith usage note <text> [--file <path>]
 
@@ -81,16 +98,339 @@ Usage record options:
   --notes <text>
   --file <path>
 
+Phase resolution (highest first):
+  --phase            explicit flag
+  .ai-usage/phase    marker written by `usage baseline start`
+  SENTRITH_PHASE     environment variable
+  standard           default
+
 Provider measurement:
   GitHub Copilot snapshot uses `gh api` only when explicitly requested.
   Other commands are local/deterministic and make no model calls.
   Raw prompts, source code, repository names, transcripts, and session IDs
   are never included in community contribution files.
+
+Success semantics:
+  Hook-captured rows derive success from repository evidence only:
+  commit reached + last recorded test outcome. Undecidable rows are `unknown`
+  and are excluded from success-rate denominators.
 "#);
 }
 
 fn repo_file(path: &str) -> PathBuf {
     Path::new(path).to_path_buf()
+}
+
+// ---------------------------------------------------------------------------
+// Minimal JSON model
+//
+// Editing a user's settings file by hand is the main friction point in enabling
+// measurement, but corrupting that file is worse than the friction. This keeps
+// the zero-dependency rule while allowing a parse -> edit -> serialize cycle.
+// Object keys are stored as an ordered Vec so round-tripping preserves order,
+// and numbers stay as their original text so no precision is invented.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum Json {
+    Null,
+    Bool(bool),
+    Num(String),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Obj(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn set(&mut self, key: &str, value: Json) {
+        if let Json::Obj(entries) = self {
+            if let Some(slot) = entries.iter_mut().find(|(k, _)| k == key) {
+                slot.1 = value;
+            } else {
+                entries.push((key.to_string(), value));
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Json::Obj(entries) = self {
+            entries.retain(|(k, _)| k != key);
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Json::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+struct JsonParser<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(s: &'a str) -> Self {
+        JsonParser { b: s.as_bytes(), i: 0 }
+    }
+
+    fn ws(&mut self) {
+        while self.i < self.b.len() && (self.b[self.i] as char).is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
+    fn expect(&mut self, c: u8) -> Result<(), String> {
+        if self.peek() == Some(c) {
+            self.i += 1;
+            Ok(())
+        } else {
+            Err(format!("expected '{}' at byte {}", c as char, self.i))
+        }
+    }
+
+    fn value(&mut self) -> Result<Json, String> {
+        self.ws();
+        match self.peek().ok_or("unexpected end of JSON")? {
+            b'{' => self.object(),
+            b'[' => self.array(),
+            b'"' => Ok(Json::Str(self.string()?)),
+            b't' => self.literal("true", Json::Bool(true)),
+            b'f' => self.literal("false", Json::Bool(false)),
+            b'n' => self.literal("null", Json::Null),
+            _ => self.number(),
+        }
+    }
+
+    fn literal(&mut self, text: &str, value: Json) -> Result<Json, String> {
+        if self.b[self.i..].starts_with(text.as_bytes()) {
+            self.i += text.len();
+            Ok(value)
+        } else {
+            Err(format!("invalid literal at byte {}", self.i))
+        }
+    }
+
+    fn number(&mut self) -> Result<Json, String> {
+        let start = self.i;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.' | b'e' | b'E') {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if start == self.i {
+            return Err(format!("invalid value at byte {}", self.i));
+        }
+        Ok(Json::Num(String::from_utf8_lossy(&self.b[start..self.i]).to_string()))
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        self.expect(b'"')?;
+        let mut out = String::new();
+        loop {
+            let c = self.peek().ok_or("unterminated string")?;
+            self.i += 1;
+            match c {
+                b'"' => return Ok(out),
+                b'\\' => {
+                    let e = self.peek().ok_or("unterminated escape")?;
+                    self.i += 1;
+                    match e {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{8}'),
+                        b'f' => out.push('\u{c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let hex = self
+                                .b
+                                .get(self.i..self.i + 4)
+                                .ok_or("truncated \\u escape")?;
+                            let code = u32::from_str_radix(&String::from_utf8_lossy(hex), 16)
+                                .map_err(|_| "invalid \\u escape".to_string())?;
+                            self.i += 4;
+                            // Surrogate pairs are re-encoded via the replacement
+                            // character rather than being silently dropped.
+                            out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        }
+                        _ => return Err("invalid escape".into()),
+                    }
+                }
+                _ => {
+                    // Copy the whole UTF-8 sequence, not just this byte.
+                    let len = utf8_len(c);
+                    let end = (self.i - 1 + len).min(self.b.len());
+                    out.push_str(&String::from_utf8_lossy(&self.b[self.i - 1..end]));
+                    self.i = end;
+                }
+            }
+        }
+    }
+
+    fn array(&mut self) -> Result<Json, String> {
+        self.expect(b'[')?;
+        let mut items = Vec::new();
+        self.ws();
+        if self.peek() == Some(b']') {
+            self.i += 1;
+            return Ok(Json::Arr(items));
+        }
+        loop {
+            items.push(self.value()?);
+            self.ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.i += 1;
+                }
+                Some(b']') => {
+                    self.i += 1;
+                    return Ok(Json::Arr(items));
+                }
+                _ => return Err(format!("expected ',' or ']' at byte {}", self.i)),
+            }
+        }
+    }
+
+    fn object(&mut self) -> Result<Json, String> {
+        self.expect(b'{')?;
+        let mut entries = Vec::new();
+        self.ws();
+        if self.peek() == Some(b'}') {
+            self.i += 1;
+            return Ok(Json::Obj(entries));
+        }
+        loop {
+            self.ws();
+            let key = self.string()?;
+            self.ws();
+            self.expect(b':')?;
+            let value = self.value()?;
+            entries.push((key, value));
+            self.ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.i += 1;
+                }
+                Some(b'}') => {
+                    self.i += 1;
+                    return Ok(Json::Obj(entries));
+                }
+                _ => return Err(format!("expected ',' or '}}' at byte {}", self.i)),
+            }
+        }
+    }
+}
+
+fn utf8_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
+fn json_parse(text: &str) -> Result<Json, String> {
+    let mut p = JsonParser::new(text);
+    let v = p.value()?;
+    p.ws();
+    if p.i != p.b.len() {
+        return Err(format!("trailing data at byte {}", p.i));
+    }
+    Ok(v)
+}
+
+fn json_write_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn json_render(v: &Json, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    let pad_inner = "  ".repeat(indent + 1);
+    match v {
+        Json::Null => out.push_str("null"),
+        Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Json::Num(n) => out.push_str(n),
+        Json::Str(s) => json_write_string(out, s),
+        Json::Arr(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push_str("[\n");
+            for (i, item) in items.iter().enumerate() {
+                out.push_str(&pad_inner);
+                json_render(item, indent + 1, out);
+                if i + 1 < items.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push(']');
+        }
+        Json::Obj(entries) => {
+            if entries.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push_str("{\n");
+            for (i, (k, val)) in entries.iter().enumerate() {
+                out.push_str(&pad_inner);
+                json_write_string(out, k);
+                out.push_str(": ");
+                json_render(val, indent + 1, out);
+                if i + 1 < entries.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push('}');
+        }
+    }
+}
+
+fn json_to_string(v: &Json) -> String {
+    let mut out = String::new();
+    json_render(v, 0, &mut out);
+    out.push('\n');
+    out
 }
 
 fn read_text(path: &Path) -> String {
@@ -140,6 +480,20 @@ fn preflight() -> Result<(), String> {
         }
         if slines > 120 {
             warnings.push(format!("STATE.md is {slines} lines; consider memory-audit."));
+        }
+    }
+
+    let profile = repo_file("docs/ai/PROFILE.md");
+    if profile.exists() {
+        let ftxt = read_text(&profile);
+        if ftxt.contains("Status: not initialized") {
+            warnings.push("Engineering profile not selected; run project-bootstrap profile questions.".to_string());
+        }
+        let flines = ftxt.lines().count();
+        if flines > 100 {
+            warnings.push(format!(
+                "PROFILE.md is {flines} lines; it loads on ordinary tasks, keep it an index."
+            ));
         }
     }
 
@@ -311,12 +665,305 @@ fn diff_budget() -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// hooks install
+// ---------------------------------------------------------------------------
+
+/// Sentrith owns the hook entries whose command mentions the binary. Everything
+/// else in the user's settings file is left untouched.
+fn is_sentrith_command(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    lower.contains("sentrith")
+}
+
+/// Rewrite the example's `./bin/sentrith` invocation for the current platform.
+/// On native Windows, hook commands run through cmd.exe, where `./bin/...`
+/// does not resolve.
+fn platform_command(cmd: &str) -> String {
+    if cfg!(windows) {
+        cmd.replace("./bin/sentrith", "bin\\sentrith.exe")
+    } else {
+        cmd.to_string()
+    }
+}
+
+fn map_commands(v: &mut Json) {
+    match v {
+        Json::Obj(entries) => {
+            for (k, val) in entries.iter_mut() {
+                if k == "command" {
+                    if let Json::Str(s) = val {
+                        *s = platform_command(s);
+                    }
+                } else {
+                    map_commands(val);
+                }
+            }
+        }
+        Json::Arr(items) => {
+            for item in items {
+                map_commands(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drop Sentrith-owned entries from a hooks object, leaving other tools' hooks
+/// in place. Empty matcher groups and empty events are removed so repeated
+/// installs do not accumulate husks.
+fn strip_sentrith_hooks(hooks: &mut Json) {
+    let Json::Obj(events) = hooks else { return };
+    for (_, groups) in events.iter_mut() {
+        if let Json::Arr(group_list) = groups {
+            for group in group_list.iter_mut() {
+                if let Some(Json::Arr(inner)) = group.get("hooks").cloned() {
+                    let kept: Vec<Json> = inner
+                        .into_iter()
+                        .filter(|h| {
+                            !h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(is_sentrith_command)
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    group.set("hooks", Json::Arr(kept));
+                }
+            }
+            group_list.retain(|g| !matches!(g.get("hooks"), Some(Json::Arr(v)) if v.is_empty()));
+        }
+    }
+    events.retain(|(_, groups)| !matches!(groups, Json::Arr(v) if v.is_empty()));
+}
+
+/// Append the example's Sentrith groups into the target hooks object.
+fn merge_sentrith_hooks(target: &mut Json, source: &Json) -> usize {
+    let Json::Obj(src_events) = source else { return 0 };
+    let mut added = 0;
+    for (event, src_groups) in src_events {
+        let Json::Arr(src_list) = src_groups else { continue };
+        let mut owned: Vec<Json> = Vec::new();
+        for group in src_list {
+            if let Some(Json::Arr(inner)) = group.get("hooks") {
+                let sentrith_only: Vec<Json> = inner
+                    .iter()
+                    .filter(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(is_sentrith_command)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect();
+                if !sentrith_only.is_empty() {
+                    added += sentrith_only.len();
+                    let mut g = group.clone();
+                    g.set("hooks", Json::Arr(sentrith_only));
+                    owned.push(g);
+                }
+            }
+        }
+        if owned.is_empty() {
+            continue;
+        }
+        match target.get(event).cloned() {
+            Some(Json::Arr(mut existing)) => {
+                existing.extend(owned);
+                target.set(event, Json::Arr(existing));
+            }
+            _ => target.set(event, Json::Arr(owned)),
+        }
+    }
+    added
+}
+
+struct HookTarget {
+    agent: &'static str,
+    example: &'static str,
+    settings: &'static str,
+    /// Claude keeps hooks inside settings.json alongside unrelated settings and
+    /// also supports statusLine; Codex uses a dedicated hooks file.
+    with_status_line: bool,
+}
+
+const HOOK_TARGETS: &[HookTarget] = &[
+    HookTarget {
+        agent: "claude",
+        example: ".claude/settings.hooks.example.json",
+        settings: ".claude/settings.json",
+        with_status_line: true,
+    },
+    HookTarget {
+        agent: "codex",
+        example: ".codex/hooks.example.json",
+        settings: ".codex/hooks.json",
+        with_status_line: false,
+    },
+];
+
+fn hooks_command(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("hooks requires install or status".into());
+    }
+    let (opts, _) = parse_options(&args[1..])?;
+    match args[0].as_str() {
+        "install" => hooks_install(&opts),
+        "status" => hooks_status(&opts),
+        x => Err(format!("unknown hooks subcommand: {x}")),
+    }
+}
+
+fn selected_targets(opts: &BTreeMap<String, String>) -> Vec<&'static HookTarget> {
+    let want = opts.get("agent").map(String::as_str).unwrap_or("all");
+    HOOK_TARGETS
+        .iter()
+        .filter(|t| want == "all" || want == t.agent)
+        .collect()
+}
+
+fn hooks_status(opts: &BTreeMap<String, String>) -> Result<(), String> {
+    for t in selected_targets(opts) {
+        let path = repo_file(t.settings);
+        if !path.exists() {
+            println!("SENTRITH-HOOKS [{}]: not installed ({} missing)", t.agent, t.settings);
+            continue;
+        }
+        let text = read_text(&path);
+        let n = text.matches("sentrith").count();
+        if n == 0 {
+            println!("SENTRITH-HOOKS [{}]: {} exists but has no Sentrith hooks", t.agent, t.settings);
+        } else {
+            println!("SENTRITH-HOOKS [{}]: installed ({} Sentrith references in {})", t.agent, n, t.settings);
+        }
+    }
+    Ok(())
+}
+
+fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
+    let dry_run = opts.contains_key("dry-run");
+    let mut touched = 0;
+
+    for t in selected_targets(opts) {
+        let example_path = repo_file(t.example);
+        if !example_path.exists() {
+            println!("SENTRITH-HOOKS [{}]: skipped, {} not found", t.agent, t.example);
+            continue;
+        }
+        let mut example = json_parse(&read_text(&example_path))
+            .map_err(|e| format!("{}: {e}", t.example))?;
+        map_commands(&mut example);
+
+        let settings_path = repo_file(t.settings);
+        let existed = settings_path.exists();
+        let mut settings = if existed {
+            let raw = read_text(&settings_path);
+            if raw.trim().is_empty() {
+                Json::Obj(Vec::new())
+            } else {
+                json_parse(&raw).map_err(|e| {
+                    format!(
+                        "{} is not valid JSON ({e}); fix or move it before running hooks install",
+                        t.settings
+                    )
+                })?
+            }
+        } else {
+            Json::Obj(Vec::new())
+        };
+        if !matches!(settings, Json::Obj(_)) {
+            return Err(format!("{} must contain a JSON object", t.settings));
+        }
+
+        let mut hooks = settings.get("hooks").cloned().unwrap_or(Json::Obj(Vec::new()));
+        if !matches!(hooks, Json::Obj(_)) {
+            return Err(format!("{}: \"hooks\" must be an object", t.settings));
+        }
+        // Removing our own entries first makes install idempotent and lets an
+        // upgrade replace commands that changed between versions.
+        strip_sentrith_hooks(&mut hooks);
+        let added = match example.get("hooks") {
+            Some(src) => merge_sentrith_hooks(&mut hooks, src),
+            None => 0,
+        };
+        if matches!(&hooks, Json::Obj(e) if e.is_empty()) {
+            settings.remove("hooks");
+        } else {
+            settings.set("hooks", hooks);
+        }
+
+        let mut status_note = String::new();
+        if t.with_status_line {
+            if let Some(sl) = example.get("statusLine").cloned() {
+                let current = settings.get("statusLine").cloned();
+                let ours = current
+                    .as_ref()
+                    .and_then(|c| c.get("command"))
+                    .and_then(|c| c.as_str())
+                    .map(is_sentrith_command)
+                    .unwrap_or(false);
+                match current {
+                    None => {
+                        settings.set("statusLine", sl);
+                        status_note = "; statusLine set".into();
+                    }
+                    Some(_) if ours => {
+                        settings.set("statusLine", sl);
+                        status_note = "; statusLine updated".into();
+                    }
+                    Some(_) => {
+                        status_note =
+                            "; kept your existing statusLine (cost capture falls back to transcript-only)"
+                                .into();
+                    }
+                }
+            }
+        }
+
+        let rendered = json_to_string(&settings);
+        // Never write output we cannot read back.
+        json_parse(&rendered).map_err(|e| format!("internal: produced invalid JSON ({e})"))?;
+
+        if dry_run {
+            println!("--- {} (dry run) ---\n{}", t.settings, rendered);
+            continue;
+        }
+
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if existed {
+            let backup = settings_path.with_extension("json.sentrith-bak");
+            fs::copy(&settings_path, &backup).map_err(|e| e.to_string())?;
+        }
+        let tmp = settings_path.with_extension("json.sentrith-tmp");
+        fs::write(&tmp, &rendered).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
+        touched += 1;
+
+        println!(
+            "SENTRITH-HOOKS [{}]: {} hook(s) installed into {}{}{}",
+            t.agent,
+            added,
+            t.settings,
+            status_note,
+            if existed { " (backup: *.json.sentrith-bak)" } else { " (created)" }
+        );
+    }
+
+    if !dry_run && touched > 0 {
+        println!("Restart the agent session so it re-reads the settings.");
+    }
+    Ok(())
+}
+
 fn usage_command(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage requires record, report, or note".into());
     }
     match args[0].as_str() {
         "record" => usage_record(&args[1..]),
+        "status" => usage_status(&args[1..]),
+        "baseline" => usage_baseline(&args[1..]),
         "run" => usage_run(&args[1..]),
         "hook" => usage_hook(&args[1..]),
         "claude-status" => usage_claude_status(&args[1..]),
@@ -381,9 +1028,10 @@ fn usage_record(args: &[String]) -> Result<(), String> {
         return Err("--agent must be codex, claude, copilot, gemini, or other".into());
     }
 
-    let phase = opts.get("phase").map(String::as_str).unwrap_or("standard");
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
+    let phase = phase.as_str();
     if !["baseline", "standard", "other"].contains(&phase) {
-        return Err("--phase must be baseline, standard, or other".into());
+        return Err("--phase (or SENTRITH_PHASE) must be baseline, standard, or other".into());
     }
 
     let file = opts
@@ -391,20 +1039,12 @@ fn usage_record(args: &[String]) -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
 
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let exists = file.exists();
+    ensure_usage_file(&file)?;
 
     let mut f = OpenOptions::new()
-        .create(true)
         .append(true)
         .open(&file)
         .map_err(|e| e.to_string())?;
-
-    if !exists {
-        f.write_all(USAGE_HEADER.as_bytes()).map_err(|e| e.to_string())?;
-    }
 
     let values = [
         now_unix(),
@@ -424,6 +1064,8 @@ fn usage_record(args: &[String]) -> Result<(), String> {
         opts.get("source").cloned().unwrap_or_else(|| "manual".to_string()),
         opts.get("session-id").cloned().unwrap_or_default(),
         opts.get("notes").cloned().unwrap_or_default(),
+        opts.get("head-sha").cloned().unwrap_or_default(),
+        opts.get("verification").cloned().unwrap_or_default(),
     ];
     let row = values.iter().map(|x| csv_escape(x)).collect::<Vec<_>>().join(",");
     writeln!(f, "{row}").map_err(|e| e.to_string())?;
@@ -477,6 +1119,12 @@ fn usage_report(args: &[String]) -> Result<(), String> {
     if !file.exists() {
         println!("SENTRITH-USAGE: no data file: {}", file.display());
         return Ok(());
+    }
+    if opts.contains_key("churn") {
+        return usage_report_churn(&file, &opts);
+    }
+    if opts.contains_key("tasks") {
+        return usage_report_tasks(&file, &opts);
     }
 
     let text = fs::read_to_string(&file).map_err(|e| e.to_string())?;
@@ -546,8 +1194,12 @@ fn usage_report(args: &[String]) -> Result<(), String> {
         }
         for ((agent, phase), rs) in groups {
             let s = summarize(&rs);
-            print_summary(&format!("{agent} / {phase}"), &s);
+            print_summary(&format!("{agent} / {phase} (per turn)"), &s);
         }
+        // The default view is per turn; most questions are per task, so point
+        // at the task view instead of requiring the reader to know the flag.
+        println!("\nPer-task view: sentrith usage report --tasks");
+        println!("Progress and next step: sentrith usage status");
     }
     Ok(())
 }
@@ -562,14 +1214,311 @@ fn summarize(rows: &[UsageRow]) -> BTreeMap<&'static str, Option<f64>> {
         let vals: Vec<f64> = rows.iter().filter_map(|r| r.nums.get(name).copied().flatten()).collect();
         out.insert(name, if vals.is_empty() { None } else { Some(vals.iter().sum::<f64>() / vals.len() as f64) });
     }
-    let success_rate = if rows.is_empty() {
+    // Rate over decided rows only; `unknown` (and blank) rows are excluded
+    // from the denominator so automatic capture cannot deflate the rate.
+    let yes = rows.iter().filter(|r| r.success == "yes").count();
+    let no = rows.iter().filter(|r| r.success == "no").count();
+    let success_rate = if yes + no == 0 {
         None
     } else {
-        Some(rows.iter().filter(|r| r.success == "yes").count() as f64 / rows.len() as f64 * 100.0)
+        Some(yes as f64 / (yes + no) as f64 * 100.0)
     };
     out.insert("success_rate", success_rate);
     out.insert("tasks", Some(rows.len() as f64));
     out
+}
+
+/// Group turn rows into tasks: rows without a session id stand alone;
+/// within a session, a change of `head_sha` closes the current task at the
+/// row that observed the new commit.
+fn group_tasks(rows: &[BTreeMap<String, String>]) -> Vec<Vec<&BTreeMap<String, String>>> {
+    let mut tasks: Vec<Vec<&BTreeMap<String, String>>> = Vec::new();
+    let mut open: BTreeMap<String, Vec<&BTreeMap<String, String>>> = BTreeMap::new();
+    let mut last_sha: BTreeMap<String, String> = BTreeMap::new();
+    for row in rows {
+        let sid = row.get("session_id").cloned().unwrap_or_default();
+        if sid.is_empty() {
+            tasks.push(vec![row]);
+            continue;
+        }
+        open.entry(sid.clone()).or_default().push(row);
+        let sha = row.get("head_sha").cloned().unwrap_or_default();
+        if !sha.is_empty() {
+            let prev = last_sha.get(&sid).cloned().unwrap_or_default();
+            if !prev.is_empty() && prev != sha {
+                if let Some(g) = open.remove(&sid) {
+                    tasks.push(g);
+                }
+            }
+            last_sha.insert(sid, sha);
+        }
+    }
+    for (_, g) in open {
+        if !g.is_empty() {
+            tasks.push(g);
+        }
+    }
+    tasks
+}
+
+fn usage_report_tasks(file: &Path, opts: &BTreeMap<String, String>) -> Result<(), String> {
+    let rows = load_usage_rows(file, opts.get("agent").map(String::as_str), None)?;
+    if rows.is_empty() {
+        println!("SENTRITH-USAGE: no matching rows");
+        return Ok(());
+    }
+    let tasks = group_tasks(&rows);
+    let mut by_phase: BTreeMap<String, Vec<&Vec<&BTreeMap<String, String>>>> = BTreeMap::new();
+    for t in &tasks {
+        let phase = t.last().copied().and_then(|r| r.get("phase")).cloned().unwrap_or_default();
+        by_phase.entry(phase).or_default().push(t);
+    }
+    for (phase, group) in by_phase {
+        let mut yes = 0usize;
+        let mut no = 0usize;
+        let mut unknown = 0usize;
+        let mut cost = 0.0;
+        let mut cost_n = 0usize;
+        let mut tokens = 0.0;
+        let mut tokens_n = 0usize;
+        let mut turns = 0usize;
+        for t in &group {
+            turns += t.len();
+            match t.last().copied().and_then(|r| r.get("success")).map(String::as_str).unwrap_or("") {
+                "yes" => yes += 1,
+                "no" => no += 1,
+                _ => unknown += 1,
+            }
+            let refs: Vec<&BTreeMap<String, String>> = t.iter().copied().collect();
+            if let Some(c) = sum_field(&refs, "cost_usd") {
+                cost += c;
+                cost_n += 1;
+            }
+            let i = sum_field(&refs, "input_tokens").unwrap_or(0.0);
+            let o = sum_field(&refs, "output_tokens").unwrap_or(0.0);
+            if i > 0.0 || o > 0.0 {
+                tokens += i + o;
+                tokens_n += 1;
+            }
+        }
+        let n = group.len();
+        println!("\n[tasks: {phase}]");
+        println!("tasks: {n} (turns: {turns})");
+        println!("success: yes={yes} no={no} unknown={unknown}");
+        if yes + no > 0 {
+            println!(
+                "success rate (yes/(yes+no)): {:.1}%",
+                yes as f64 / (yes + no) as f64 * 100.0
+            );
+        } else {
+            println!("success rate: - (no decided tasks)");
+        }
+        if cost_n > 0 {
+            println!("avg cost USD / task: {:.4}", cost / cost_n as f64);
+            if yes > 0 {
+                println!("cost USD / successful task: {:.4}", cost / yes as f64);
+            }
+        }
+        if tokens_n > 0 {
+            println!("avg tokens / task: {:.0}", tokens / tokens_n as f64);
+        }
+    }
+    println!("\nSuccess uses objective proxies (commit reached + last recorded test outcome); unknown tasks are excluded from the rate.");
+    Ok(())
+}
+
+/// One-screen answer to "am I measuring, and how far am I from a number?".
+fn usage_status(args: &[String]) -> Result<(), String> {
+    let (opts, _) = parse_options(args)?;
+    let min: usize = opts.get("min-samples").and_then(|x| x.parse().ok()).unwrap_or(5);
+    let file = opts
+        .get("file")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
+
+    println!("== capture ==");
+    let mut hooks_ready = false;
+    for t in HOOK_TARGETS {
+        let path = repo_file(t.settings);
+        let installed = path.exists() && read_text(&path).contains("sentrith");
+        if installed {
+            hooks_ready = true;
+        }
+        println!(
+            "{:<7} {}",
+            t.agent,
+            if installed { "hooks installed" } else { "hooks NOT installed" }
+        );
+    }
+
+    println!("\n== phase ==");
+    if baseline_active() {
+        println!("baseline mode ACTIVE (contract stashed); turns record phase=baseline");
+    } else {
+        println!("recording phase: {}", resolve_phase(None));
+    }
+
+    println!("\n== data ==");
+    if !file.exists() {
+        println!("no usage file yet: {}", file.display());
+        println!("\n== next ==");
+        if !hooks_ready {
+            println!("1. sentrith hooks install");
+            println!("2. sentrith usage baseline start   (measure without the contract first)");
+        } else {
+            println!("1. sentrith usage baseline start   (measure without the contract first)");
+        }
+        return Ok(());
+    }
+
+    let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str), None)?;
+    let tasks = group_tasks(&rows);
+    let mut counts: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
+    for t in &tasks {
+        let phase = t.last().copied().and_then(|r| r.get("phase")).cloned().unwrap_or_default();
+        let e = counts.entry(phase).or_insert((0, 0, 0, 0));
+        e.0 += 1;
+        match t.last().copied().and_then(|r| r.get("success")).map(String::as_str).unwrap_or("") {
+            "yes" => e.1 += 1,
+            "no" => e.2 += 1,
+            _ => e.3 += 1,
+        }
+    }
+    println!("turns recorded: {}", rows.len());
+    for (phase, (n, yes, no, unknown)) in &counts {
+        println!("{phase:<9} tasks: {n:<4} (yes {yes}, no {no}, unknown {unknown})");
+    }
+
+    let base_n = counts.get("baseline").map(|c| c.0).unwrap_or(0);
+    let std_n = counts.get("standard").map(|c| c.0).unwrap_or(0);
+
+    println!("\n== next ==");
+    if base_n < min {
+        println!(
+            "collect {} more baseline task(s) ({}/{}).",
+            min - base_n,
+            base_n,
+            min
+        );
+        if !baseline_active() {
+            println!("  sentrith usage baseline start");
+        }
+    } else if std_n < min {
+        if baseline_active() {
+            println!("baseline is complete ({base_n}/{min}). Restore the contract:");
+            println!("  sentrith usage baseline stop");
+        } else {
+            println!(
+                "collect {} more standard task(s) ({}/{}); just keep working normally.",
+                min - std_n,
+                std_n,
+                min
+            );
+        }
+    } else {
+        println!("comparable ({base_n} baseline / {std_n} standard). Compare with:");
+        println!("  sentrith usage report --compare");
+        println!("  sentrith usage report --tasks");
+        println!("  sentrith usage report --churn");
+    }
+
+    let decided: usize = counts.values().map(|c| c.1 + c.2).sum();
+    let unknown: usize = counts.values().map(|c| c.3).sum();
+    if unknown > decided && unknown > 0 {
+        println!(
+            "\nNote: {unknown} task(s) are `unknown` (no commit, or no test run observed)."
+        );
+        println!("Success rate uses decided tasks only; commit your work so tasks can be scored.");
+    }
+    Ok(())
+}
+
+/// File paths from `git … --numstat` output. Binary files are reported as
+/// `-\t-\tpath` and are skipped: line counts are the churn signal here.
+fn parse_numstat_files(text: &str) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    for line in text.lines() {
+        let mut parts = line.split('\t');
+        if let (Some(a), Some(_d), Some(path)) = (parts.next(), parts.next(), parts.next()) {
+            if a.trim().parse::<u64>().is_ok() && !path.trim().is_empty() {
+                set.insert(path.trim().to_string());
+            }
+        }
+    }
+    set
+}
+
+/// File-level churn: how many files of `sha` were modified again by later
+/// commits within `days`. A rework proxy computable retroactively from git.
+fn churn_for_commit(sha: &str, days: f64) -> Option<(usize, usize)> {
+    let files = parse_numstat_files(&git(&["show", "--numstat", "--format=", sha]));
+    if files.is_empty() {
+        return None;
+    }
+    let t0: f64 = git(&["show", "-s", "--format=%ct", sha]).trim().parse().ok()?;
+    let range = format!("{sha}..HEAD");
+    let log = git(&["log", "--numstat", "--format=COMMIT %ct", range.as_str()]);
+    let mut touched = BTreeSet::new();
+    let mut in_window = false;
+    for line in log.lines() {
+        if let Some(rest) = line.strip_prefix("COMMIT ") {
+            in_window = rest
+                .trim()
+                .parse::<f64>()
+                .map(|t| t <= t0 + days * 86400.0)
+                .unwrap_or(false);
+        } else if in_window {
+            for path in parse_numstat_files(line) {
+                touched.insert(path);
+            }
+        }
+    }
+    let changed = files.iter().filter(|f| touched.contains(*f)).count();
+    Some((changed, files.len()))
+}
+
+fn usage_report_churn(file: &Path, opts: &BTreeMap<String, String>) -> Result<(), String> {
+    let days: f64 = opts.get("days").and_then(|x| x.parse().ok()).unwrap_or(14.0);
+    let rows = load_usage_rows(file, opts.get("agent").map(String::as_str), None)?;
+    // Only commits observed to be created mid-session (a head_sha transition)
+    // are attributed to recorded work; pre-existing HEADs are skipped.
+    let mut last: BTreeMap<String, String> = BTreeMap::new();
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    let mut per_phase: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for r in &rows {
+        let sid = r.get("session_id").cloned().unwrap_or_default();
+        let sha = r.get("head_sha").cloned().unwrap_or_default();
+        if sha.is_empty() {
+            continue;
+        }
+        let is_new_commit = last.get(&sid).map(|p| p != &sha).unwrap_or(false);
+        last.insert(sid, sha.clone());
+        if !is_new_commit || !done.insert(sha.clone()) {
+            continue;
+        }
+        if let Some((changed, total)) = churn_for_commit(&sha, days) {
+            let phase = r.get("phase").cloned().unwrap_or_default();
+            per_phase
+                .entry(phase)
+                .or_default()
+                .push(changed as f64 / total as f64 * 100.0);
+        }
+    }
+    if per_phase.is_empty() {
+        println!("SENTRITH-CHURN: no recorded commits found in usage data");
+        return Ok(());
+    }
+    for (phase, rates) in per_phase {
+        let avg = rates.iter().sum::<f64>() / rates.len() as f64;
+        println!(
+            "SENTRITH-CHURN [{phase}]: commits={} avg share of files re-modified within {:.0} days: {:.1}%",
+            rates.len(),
+            days,
+            avg
+        );
+    }
+    println!("File-level churn is a rework proxy computed retroactively from git history.");
+    Ok(())
 }
 
 fn print_summary(label: &str, s: &BTreeMap<&'static str, Option<f64>>) {
@@ -659,12 +1608,20 @@ fn sum_field(rows: &[&BTreeMap<String, String>], key: &str) -> Option<f64> {
     if vals.is_empty() { None } else { Some(vals.iter().sum::<f64>()) }
 }
 
+/// Success rate over decided rows only (`yes` / (`yes` + `no`)).
+/// `unknown`/blank rows are undecidable evidence, not failures.
+fn decided_success_rate(rows: &[&BTreeMap<String, String>]) -> Option<f64> {
+    let yes = rows.iter().filter(|r| r.get("success").map(String::as_str) == Some("yes")).count();
+    let no = rows.iter().filter(|r| r.get("success").map(String::as_str) == Some("no")).count();
+    if yes + no == 0 { None } else { Some(yes as f64 / (yes + no) as f64 * 100.0) }
+}
+
 fn publish_stats(rows: &[&BTreeMap<String, String>]) -> PublishStats {
     let successes = rows.iter()
         .filter(|r| r.get("success").map(String::as_str) == Some("yes"))
         .count();
     let tasks = rows.len();
-    let success_rate = if tasks == 0 { None } else { Some(successes as f64 / tasks as f64 * 100.0) };
+    let success_rate = decided_success_rate(rows);
     let total_credits = sum_field(rows, "credits");
     let credits_per_success = match (total_credits, successes) {
         (Some(c), n) if n > 0 => Some(c / n as f64),
@@ -909,6 +1866,210 @@ fn ensure_usage_file(path: &Path) -> Result<(), String> {
     }
     if !path.exists() {
         fs::write(path, USAGE_HEADER).map_err(|e| e.to_string())?;
+    } else {
+        migrate_usage_file_if_needed(path)?;
+    }
+    Ok(())
+}
+
+/// Upgrade a schema-v1 usage file in place by rewriting the header and padding
+/// old rows with empty `head_sha`/`verification` columns. Unknown headers are
+/// left untouched.
+fn migrate_usage_file_if_needed(path: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else { return Ok(()); };
+    if header.trim_end() == USAGE_HEADER.trim_end() {
+        return Ok(());
+    }
+    if header.trim_end() != USAGE_HEADER_V1.trim_end() {
+        return Ok(());
+    }
+    let mut out = String::from(USAGE_HEADER);
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str(",,");
+        out.push('\n');
+    }
+    let tmp = path.with_extension("csv.migrate");
+    fs::write(&tmp, out).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn phase_marker_path() -> PathBuf {
+    PathBuf::from(".ai-usage/phase")
+}
+
+/// Phase precedence: explicit flag > `.ai-usage/phase` marker > SENTRITH_PHASE
+/// > "standard".
+///
+/// The marker outranks the environment variable because hooks are spawned by
+/// the agent process: a variable exported after the agent started never reaches
+/// them, while `usage baseline start` writes a marker every hook can read.
+fn resolve_phase_value(
+    explicit: Option<&str>,
+    marker: Option<&str>,
+    env_value: Option<&str>,
+) -> String {
+    for candidate in [explicit, marker, env_value] {
+        if let Some(p) = candidate {
+            if !p.trim().is_empty() {
+                return p.trim().to_string();
+            }
+        }
+    }
+    "standard".to_string()
+}
+
+fn resolve_phase(explicit: Option<&str>) -> String {
+    let marker = fs::read_to_string(phase_marker_path()).ok();
+    resolve_phase_value(
+        explicit,
+        marker.as_deref(),
+        env::var("SENTRITH_PHASE").ok().as_deref(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// usage baseline
+//
+// A baseline must be measured with the Sentrith contract inactive, which is
+// otherwise a manual and error-prone step. These commands stash the agent
+// instruction files and restore them, so the measurement is reversible.
+// Hook configuration and `.ai-usage/` are deliberately left in place: they are
+// what performs the measurement.
+// ---------------------------------------------------------------------------
+
+const BASELINE_STASH_PATHS: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".github/copilot-instructions.md",
+    ".github/prompts",
+    ".agents",
+    ".claude/skills",
+];
+
+fn baseline_stash_dir() -> PathBuf {
+    PathBuf::from(".sentrith-private/baseline-stash")
+}
+
+fn usage_baseline(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage baseline requires start, stop, or status".into());
+    }
+    match args[0].as_str() {
+        "start" => baseline_start(),
+        "stop" => baseline_stop(),
+        "status" => baseline_status(),
+        x => Err(format!("unknown usage baseline command: {x}")),
+    }
+}
+
+fn baseline_active() -> bool {
+    baseline_stash_dir().exists()
+}
+
+fn baseline_status() -> Result<(), String> {
+    let phase = fs::read_to_string(phase_marker_path())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "standard (no marker)".into());
+    if baseline_active() {
+        println!("SENTRITH-BASELINE: active; contract stashed in {}", baseline_stash_dir().display());
+    } else {
+        println!("SENTRITH-BASELINE: inactive");
+    }
+    println!("SENTRITH-BASELINE: recorded phase = {phase}");
+    Ok(())
+}
+
+fn baseline_start() -> Result<(), String> {
+    if baseline_active() {
+        return Err(format!(
+            "baseline already active ({} exists); run `sentrith usage baseline stop` first",
+            baseline_stash_dir().display()
+        ));
+    }
+    let stash = baseline_stash_dir();
+    fs::create_dir_all(&stash).map_err(|e| e.to_string())?;
+
+    let mut moved = Vec::new();
+    for path in BASELINE_STASH_PATHS {
+        let src = repo_file(path);
+        if !src.exists() {
+            continue;
+        }
+        let dst = stash.join(path);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::rename(&src, &dst).map_err(|e| format!("failed to stash {path}: {e}"))?;
+        moved.push((*path).to_string());
+    }
+
+    if moved.is_empty() {
+        let _ = fs::remove_dir_all(&stash);
+        return Err("no Sentrith contract files found to stash; is this a Sentrith project?".into());
+    }
+
+    fs::create_dir_all(".ai-usage").map_err(|e| e.to_string())?;
+    fs::write(phase_marker_path(), "baseline\n").map_err(|e| e.to_string())?;
+    fs::write(stash.join("STASHED.txt"), moved.join("\n") + "\n").map_err(|e| e.to_string())?;
+
+    println!("SENTRITH-BASELINE: started. Stashed {} path(s):", moved.len());
+    for m in &moved {
+        println!("  {m}");
+    }
+    println!("Measurement hooks and .ai-usage/ were left active; new turns record phase=baseline.");
+    println!("Git will show these paths as deleted until you run `sentrith usage baseline stop`.");
+    println!("Start a NEW agent session so the stashed instructions are not still in its context.");
+    println!("When you have enough baseline tasks: sentrith usage baseline stop");
+    Ok(())
+}
+
+fn baseline_stop() -> Result<(), String> {
+    let stash = baseline_stash_dir();
+    if !stash.exists() {
+        return Err("no active baseline to stop".into());
+    }
+    let list = read_text(&stash.join("STASHED.txt"));
+    let mut restored = 0;
+    let mut failed = Vec::new();
+    for path in list.lines().filter(|l| !l.trim().is_empty()) {
+        let src = stash.join(path);
+        let dst = repo_file(path);
+        if !src.exists() {
+            continue;
+        }
+        if dst.exists() {
+            failed.push(format!("{path} (already exists in the working tree)"));
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        match fs::rename(&src, &dst) {
+            Ok(_) => restored += 1,
+            Err(e) => failed.push(format!("{path} ({e})")),
+        }
+    }
+
+    let _ = fs::remove_file(phase_marker_path());
+
+    if failed.is_empty() {
+        let _ = fs::remove_file(stash.join("STASHED.txt"));
+        let _ = fs::remove_dir_all(&stash);
+        println!("SENTRITH-BASELINE: stopped. Restored {restored} path(s); phase is standard again.");
+        println!("Start a NEW agent session so the contract is loaded before your next task.");
+    } else {
+        println!("SENTRITH-BASELINE: restored {restored} path(s), but these need manual attention:");
+        for f in &failed {
+            println!("  {f}");
+        }
+        println!("Stash kept at {} so nothing is lost.", stash.display());
     }
     Ok(())
 }
@@ -931,6 +2092,8 @@ struct AutoUsage {
     source: String,
     session_id: String,
     notes: String,
+    head_sha: String,
+    verification: String,
 }
 
 fn num_cell(v: Option<f64>) -> String {
@@ -959,6 +2122,8 @@ fn append_auto_usage(path: &Path, u: &AutoUsage) -> Result<(), String> {
         u.source.clone(),
         u.session_id.clone(),
         u.notes.clone(),
+        u.head_sha.clone(),
+        u.verification.clone(),
     ];
     let row = values.iter().map(|x| csv_escape(x)).collect::<Vec<_>>().join(",");
     let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
@@ -986,7 +2151,7 @@ fn usage_run_codex(args: &[String]) -> Result<(), String> {
     let (front, passthrough) = split_double_dash(args);
     let (opts, positional) = parse_options(&front)?;
     let task = opts.get("task").cloned().or_else(|| positional.first().cloned()).ok_or("missing --task")?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
 
     let mut cmd = Command::new("codex");
@@ -1052,7 +2217,7 @@ fn usage_run_copilot(args: &[String]) -> Result<(), String> {
     let (front, passthrough) = split_double_dash(args);
     let (opts, positional) = parse_options(&front)?;
     let task = opts.get("task").cloned().or_else(|| positional.first().cloned()).ok_or("missing --task")?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
 
     let mut cmd = Command::new("copilot");
@@ -1116,6 +2281,187 @@ fn read_kv(path: &Path) -> BTreeMap<String,String> {
     m
 }
 
+fn git_head() -> String {
+    git(&["rev-parse", "HEAD"]).trim().to_string()
+}
+
+fn verif_path(agent: &str, session: &str) -> PathBuf {
+    live_dir().join(format!("{agent}-{session}.verif"))
+}
+
+/// Aggregated usage and verification signals from one turn's slice of a
+/// provider transcript. Transcript formats are not stable vendor contracts;
+/// all parsing here is best-effort and must degrade to `seen == false`.
+#[derive(Default)]
+struct TranscriptWindow {
+    input_tokens: f64,
+    cache_creation_tokens: f64,
+    cached_input_tokens: f64,
+    output_tokens: f64,
+    model: String,
+    seen: bool,
+    /// Some(true)=last test command in the window passed, Some(false)=failed.
+    verification: Option<bool>,
+}
+
+/// Return the characters following `marker` up to the next `"`.
+fn extract_id_after(line: &str, marker: &str) -> Option<String> {
+    let pos = line.find(marker)?;
+    let rest = &line[pos + marker.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Word-boundary match of known test-runner invocations inside a shell command.
+fn is_test_command(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    let bytes = lower.as_bytes();
+    for pat in TEST_COMMAND_PATTERNS {
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(pat) {
+            let abs = start + pos;
+            let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+            let after = abs + pat.len();
+            let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + pat.len();
+        }
+    }
+    false
+}
+
+/// Parse the Claude Code transcript JSONL lines after `skip_lines`.
+///
+/// - Token usage is summed once per distinct assistant message id (one API
+///   message is serialized as one transcript line per content block, each
+///   repeating the same usage object).
+/// - `input_tokens` and `cache_creation_input_tokens` are collected separately;
+///   the caller decides how to combine them.
+/// - Test-like Bash `tool_use` blocks are matched to their `tool_result` by
+///   tool id; failure is only observable through `"is_error":true`.
+fn parse_claude_transcript_window(text: &str, skip_lines: usize) -> TranscriptWindow {
+    let mut w = TranscriptWindow::default();
+    let mut counted: BTreeSet<String> = BTreeSet::new();
+    let mut pending_tests: BTreeSet<String> = BTreeSet::new();
+
+    for line in text.lines().skip(skip_lines) {
+        if line.contains("\"type\":\"assistant\"") {
+            if w.model.is_empty() {
+                if let Some(m) = json_string_field(line, "model") {
+                    w.model = m;
+                }
+            }
+            if let Some(id) = extract_id_after(line, "\"id\":\"msg_") {
+                if counted.insert(id) {
+                    // Prefer the structural usage object (assistant content can
+                    // legitimately contain the literal string "usage").
+                    let upos = line
+                        .rfind("\"usage\":{\"input_tokens\"")
+                        .or_else(|| line.rfind("\"usage\""));
+                    if let Some(p) = upos {
+                        let u = &line[p..];
+                        w.seen = true;
+                        w.input_tokens += json_number_field(u, "input_tokens").unwrap_or(0.0);
+                        w.cache_creation_tokens +=
+                            json_number_field(u, "cache_creation_input_tokens").unwrap_or(0.0);
+                        w.cached_input_tokens +=
+                            json_number_field(u, "cache_read_input_tokens").unwrap_or(0.0);
+                        w.output_tokens += json_number_field(u, "output_tokens").unwrap_or(0.0);
+                    }
+                }
+            }
+            if line.contains("\"name\":\"Bash\"") {
+                if let Some(cmd) = json_string_field(line, "command") {
+                    if is_test_command(&cmd) {
+                        if let Some(tid) = extract_id_after(line, "\"id\":\"toolu_") {
+                            pending_tests.insert(format!("toolu_{tid}"));
+                        }
+                    }
+                }
+            }
+        } else if line.contains("\"tool_use_id\":\"") {
+            if let Some(tid) = extract_id_after(line, "\"tool_use_id\":\"") {
+                if pending_tests.contains(&tid) {
+                    let failed = line.contains("\"is_error\":true")
+                        || line.contains("\"is_error\": true");
+                    w.verification = Some(!failed);
+                }
+            }
+        }
+    }
+    w
+}
+
+/// Best-effort scan of a Codex transcript window for test-command outcomes.
+/// Codex rollout entries carry `command` and, in exec-result entries,
+/// `exit_code`; the two may or may not share a line.
+fn scan_codex_window_for_tests(text: &str, skip_lines: usize) -> Option<bool> {
+    let mut result = None;
+    let mut awaiting = false;
+    for line in text.lines().skip(skip_lines) {
+        if line.contains("\"command\"") {
+            if let Some(cmd) = json_string_field(line, "command") {
+                if is_test_command(&cmd) {
+                    if let Some(c) = json_number_field(line, "exit_code") {
+                        result = Some(c == 0.0);
+                        awaiting = false;
+                    } else {
+                        awaiting = true;
+                    }
+                    continue;
+                }
+            }
+        }
+        if awaiting && line.contains("\"exit_code\"") {
+            if let Some(c) = json_number_field(line, "exit_code") {
+                result = Some(c == 0.0);
+            }
+            awaiting = false;
+        }
+    }
+    result
+}
+
+/// Carry the latest verification outcome across turns of a session, then
+/// derive the objective success value for a row.
+///
+/// Success semantics (documented in docs/metrics/MEASUREMENT_ARCHITECTURE.*):
+/// commit reached + last verification pass => "yes";
+/// commit reached + last verification fail => "no";
+/// otherwise => "unknown".
+fn update_and_resolve_success(
+    agent: &str,
+    session: &str,
+    window_verification: Option<bool>,
+    committed: bool,
+) -> String {
+    let vpath = verif_path(agent, session);
+    if let Some(pass) = window_verification {
+        if let Some(parent) = vpath.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&vpath, if pass { "pass" } else { "fail" });
+    }
+    let carried = fs::read_to_string(&vpath)
+        .ok()
+        .map(|s| s.trim().to_string());
+    let success = if committed {
+        match carried.as_deref() {
+            Some("pass") => "yes",
+            Some("fail") => "no",
+            _ => "unknown",
+        }
+    } else {
+        "unknown"
+    };
+    if committed {
+        let _ = fs::remove_file(&vpath);
+    }
+    success.to_string()
+}
+
 fn usage_claude_status(_args: &[String]) -> Result<(), String> {
     let input = read_stdin_all()?;
     let session = json_string_field(&input, "session_id").unwrap_or_else(|| "unknown".into());
@@ -1153,45 +2499,118 @@ fn usage_hook(args: &[String]) -> Result<(), String> {
 
 fn usage_hook_claude(args: &[String]) -> Result<(), String> {
     let (opts, _) = parse_options(args)?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
     let input = read_stdin_all()?;
     let event = json_string_field(&input, "hook_event_name").unwrap_or_default();
     let session = json_string_field(&input, "session_id").unwrap_or_else(|| "unknown".into());
+    let transcript = json_string_field(&input, "transcript_path").unwrap_or_default();
 
     if event == "UserPromptSubmit" {
         let prompt = json_string_field(&input, "prompt").unwrap_or_else(|| "Claude turn".into());
         let snap = read_kv(&snapshot_path("claude", &session));
+        let transcript_lines = if transcript.is_empty() {
+            0
+        } else {
+            fs::read_to_string(&transcript).map(|s| s.lines().count()).unwrap_or(0)
+        };
         write_kv(&task_path("claude", &session), &[
             ("phase", phase),
             ("task", prompt.chars().take(160).collect()),
             ("start_cost", snap.get("cost_usd").cloned().unwrap_or_else(|| "0".into())),
             ("start_duration_ms", snap.get("duration_ms").cloned().unwrap_or_else(|| "0".into())),
             ("model", snap.get("model").cloned().unwrap_or_default()),
+            ("transcript", transcript),
+            ("transcript_lines", transcript_lines.to_string()),
+            ("start_head", git_head()),
         ])?;
     } else if event == "Stop" {
         let task = read_kv(&task_path("claude", &session));
+        if task.is_empty() {
+            return Ok(());
+        }
         let snap = read_kv(&snapshot_path("claude", &session));
-        if !task.is_empty() && !snap.is_empty() {
+
+        let tp = task
+            .get("transcript")
+            .cloned()
+            .filter(|x| !x.is_empty())
+            .unwrap_or(transcript);
+        let skip: usize = task
+            .get("transcript_lines")
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0);
+        let window = if tp.is_empty() {
+            TranscriptWindow::default()
+        } else {
+            fs::read_to_string(&tp)
+                .map(|s| parse_claude_transcript_window(&s, skip))
+                .unwrap_or_default()
+        };
+
+        let start_head = task.get("start_head").cloned().unwrap_or_default();
+        let head = git_head();
+        let committed = !start_head.is_empty() && !head.is_empty() && head != start_head;
+        let success = update_and_resolve_success("claude", &session, window.verification, committed);
+
+        // statusLine snapshot stays as the cost/duration fallback; it may lag
+        // the turn end, which is why tokens now come from the transcript.
+        let cost = if snap.is_empty() {
+            None
+        } else {
             let sc: f64 = task.get("start_cost").and_then(|x| x.parse().ok()).unwrap_or(0.0);
             let ec: f64 = snap.get("cost_usd").and_then(|x| x.parse().ok()).unwrap_or(sc);
+            Some((ec - sc).max(0.0))
+        };
+        let duration = if snap.is_empty() {
+            None
+        } else {
             let sd: f64 = task.get("start_duration_ms").and_then(|x| x.parse().ok()).unwrap_or(0.0);
             let ed: f64 = snap.get("duration_ms").and_then(|x| x.parse().ok()).unwrap_or(sd);
-            let u = AutoUsage {
-                agent: "claude".into(),
-                model: task.get("model").cloned().unwrap_or_default(),
-                phase: task.get("phase").cloned().unwrap_or_else(|| "standard".into()),
-                task: task.get("task").cloned().unwrap_or_else(|| "Claude turn".into()),
-                cost_usd: Some((ec-sc).max(0.0)),
-                duration_seconds: Some(((ed-sd)/1000.0).max(0.0)),
-                source: "claude-statusline-hooks".into(),
-                session_id: session.clone(),
-                notes: "Estimated session-cost delta from official Claude Code statusLine JSON.".into(),
-                ..Default::default()
-            };
-            append_auto_usage(&file, &u)?;
-            let _ = fs::remove_file(task_path("claude", &session));
-        }
+            Some(((ed - sd) / 1000.0).max(0.0))
+        };
+
+        let u = AutoUsage {
+            agent: "claude".into(),
+            model: if !window.model.is_empty() {
+                window.model.clone()
+            } else {
+                task.get("model").cloned().unwrap_or_default()
+            },
+            phase: task.get("phase").cloned().unwrap_or_else(|| "standard".into()),
+            task: task.get("task").cloned().unwrap_or_else(|| "Claude turn".into()),
+            // input includes cache-writes; cache reads are reported separately.
+            input_tokens: if window.seen {
+                Some(window.input_tokens + window.cache_creation_tokens)
+            } else {
+                None
+            },
+            cached_input_tokens: if window.seen { Some(window.cached_input_tokens) } else { None },
+            output_tokens: if window.seen { Some(window.output_tokens) } else { None },
+            cost_usd: cost,
+            duration_seconds: duration,
+            success,
+            source: if window.seen {
+                "claude-transcript-hooks".into()
+            } else {
+                "claude-statusline-hooks".into()
+            },
+            session_id: session.clone(),
+            notes: if window.seen {
+                "Tokens summed from transcript window (input includes cache creation); cost is statusLine session delta when available. Transcript format is not a stable vendor contract.".into()
+            } else {
+                "Transcript unavailable; estimated session-cost delta from statusLine JSON only.".into()
+            },
+            head_sha: head,
+            verification: match window.verification {
+                Some(true) => "pass".into(),
+                Some(false) => "fail".into(),
+                None => String::new(),
+            },
+            ..Default::default()
+        };
+        append_auto_usage(&file, &u)?;
+        let _ = fs::remove_file(task_path("claude", &session));
     }
     Ok(())
 }
@@ -1212,7 +2631,7 @@ fn latest_token_usage_from_codex_transcript(path: &Path) -> (Option<f64>,Option<
 
 fn usage_hook_codex(args: &[String]) -> Result<(), String> {
     let (opts, _) = parse_options(args)?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
     let input = read_stdin_all()?;
     let event = json_string_field(&input, "hook_event_name").unwrap_or_default();
@@ -1223,11 +2642,18 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
     if event == "UserPromptSubmit" {
         let prompt = json_string_field(&input, "prompt").unwrap_or_else(|| "Codex turn".into());
         let (i,c,o) = if transcript.is_empty() {(None,None,None)} else {latest_token_usage_from_codex_transcript(Path::new(&transcript))};
+        let transcript_lines = if transcript.is_empty() {
+            0
+        } else {
+            fs::read_to_string(&transcript).map(|s| s.lines().count()).unwrap_or(0)
+        };
         write_kv(&task_path("codex", &session), &[
             ("phase", phase),
             ("task", prompt.chars().take(160).collect()),
             ("model", model),
             ("transcript", transcript),
+            ("transcript_lines", transcript_lines.to_string()),
+            ("start_head", git_head()),
             ("start_input", num_cell(i)),
             ("start_cached", num_cell(c)),
             ("start_output", num_cell(o)),
@@ -1235,10 +2661,28 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
     } else if event == "Stop" {
         let task = read_kv(&task_path("codex", &session));
         if !task.is_empty() {
-            let tp = task.get("transcript").cloned().unwrap_or(transcript);
+            let tp = task
+                .get("transcript")
+                .cloned()
+                .filter(|x| !x.is_empty())
+                .unwrap_or(transcript);
             let (ei,ec,eo) = if tp.is_empty() {(None,None,None)} else {latest_token_usage_from_codex_transcript(Path::new(&tp))};
             let parse = |k:&str| task.get(k).and_then(|x| x.parse::<f64>().ok());
             let delta = |end:Option<f64>, start:Option<f64>| match (end,start) {(Some(e),Some(s))=>Some((e-s).max(0.0)),(Some(e),None)=>Some(e),_=>None};
+
+            let skip: usize = task.get("transcript_lines").and_then(|x| x.parse().ok()).unwrap_or(0);
+            let verification = if tp.is_empty() {
+                None
+            } else {
+                fs::read_to_string(&tp)
+                    .ok()
+                    .and_then(|s| scan_codex_window_for_tests(&s, skip))
+            };
+            let start_head = task.get("start_head").cloned().unwrap_or_default();
+            let head = git_head();
+            let committed = !start_head.is_empty() && !head.is_empty() && head != start_head;
+            let success = update_and_resolve_success("codex", &session, verification, committed);
+
             let u = AutoUsage {
                 agent: "codex".into(),
                 model: task.get("model").cloned().unwrap_or_default(),
@@ -1247,9 +2691,16 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
                 input_tokens: delta(ei, parse("start_input")),
                 cached_input_tokens: delta(ec, parse("start_cached")),
                 output_tokens: delta(eo, parse("start_output")),
+                success,
                 source: "codex-hook-transcript-best-effort".into(),
                 session_id: session.clone(),
                 notes: "Best-effort interactive capture: Codex documents transcript_path but warns transcript format is not a stable hook interface. Prefer usage run codex for stable JSON usage.".into(),
+                head_sha: head,
+                verification: match verification {
+                    Some(true) => "pass".into(),
+                    Some(false) => "fail".into(),
+                    None => String::new(),
+                },
                 ..Default::default()
             };
             append_auto_usage(&file, &u)?;
@@ -1342,7 +2793,7 @@ fn usage_task_start(args: &[String]) -> Result<(), String> {
     let (opts, _) = parse_options(args)?;
     let agent = require(&opts, "agent")?;
     let task = require(&opts, "task")?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let model = opts.get("model").cloned().unwrap_or_default();
     let category = opts.get("category").cloned().unwrap_or_else(|| "unspecified".into());
 
@@ -1492,10 +2943,8 @@ fn usage_contribute(args: &[String]) -> Result<(), String> {
     let bps = metric_per_success(&baseline, metric).unwrap();
     let sps = metric_per_success(&standard, metric).unwrap();
     let change = if bps != 0.0 { (sps-bps)/bps*100.0 } else { 0.0 };
-    let bs = baseline.iter().filter(|r| r.get("success").map(String::as_str)==Some("yes")).count();
-    let ss = standard.iter().filter(|r| r.get("success").map(String::as_str)==Some("yes")).count();
-    let bsr = if baseline.is_empty(){0.0}else{bs as f64/baseline.len() as f64*100.0};
-    let ssr = if standard.is_empty(){0.0}else{ss as f64/standard.len() as f64*100.0};
+    let bsr = decided_success_rate(&baseline).unwrap_or(0.0);
+    let ssr = decided_success_rate(&standard).unwrap_or(0.0);
     let quality = if baseline.len() >= 10 && standard.len() >= 10 { "qualified" } else { "experimental" };
     let model_name = model.unwrap_or("mixed/unspecified");
     let id = format!("{}-{}-{}", agent, now_unix(), std::process::id());
@@ -1635,5 +3084,320 @@ mod tests {
     #[test]
     fn pct_change_formats() {
         assert_eq!(pct_text(Some(100.0), Some(75.0)), "-25.0%");
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = env::temp_dir().join(format!(
+            "sentrith-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    fn assistant_line(msg_id: &str, input: u64, cache_read: u64, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"model":"claude-fable-5","id":"{msg_id}","type":"message","role":"assistant","content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":{input},"cache_creation_input_tokens":0,"cache_read_input_tokens":{cache_read},"output_tokens":{output},"output_tokens_details":{{"thinking_tokens":1}}}}}}}}"#
+        )
+    }
+
+    fn bash_line(msg_id: &str, tool_id: &str, command: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"model":"claude-fable-5","id":"{msg_id}","type":"message","role":"assistant","content":[{{"type":"tool_use","id":"{tool_id}","name":"Bash","input":{{"command":"{command}","description":"run"}}}}],"usage":{{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}}}}"#
+        )
+    }
+
+    fn tool_result_line(tool_id: &str, is_error: bool) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"tool_use_id":"{tool_id}","type":"tool_result","content":"output","is_error":{is_error}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn transcript_window_sums_tokens_once_per_message_id() {
+        // One API message is serialized as several transcript lines that all
+        // repeat the same usage object; it must be counted once.
+        let text = [
+            assistant_line("msg_old", 999, 999, 999),
+            assistant_line("msg_a", 10, 100, 5),
+            assistant_line("msg_a", 10, 100, 5),
+            assistant_line("msg_b", 20, 200, 7),
+        ]
+        .join("\n");
+
+        let w = parse_claude_transcript_window(&text, 1);
+        assert!(w.seen);
+        assert_eq!(w.input_tokens, 30.0);
+        assert_eq!(w.cached_input_tokens, 300.0);
+        assert_eq!(w.output_tokens, 12.0);
+        assert_eq!(w.model, "claude-fable-5");
+    }
+
+    #[test]
+    fn transcript_window_skips_lines_before_the_turn() {
+        let text = [
+            assistant_line("msg_before", 500, 500, 500),
+            assistant_line("msg_after", 1, 2, 3),
+        ]
+        .join("\n");
+
+        let w = parse_claude_transcript_window(&text, 1);
+        assert_eq!(w.input_tokens, 1.0);
+        assert_eq!(w.output_tokens, 3.0);
+    }
+
+    #[test]
+    fn transcript_window_detects_test_failure_then_pass() {
+        let text = [
+            bash_line("msg_1", "toolu_fail", "cargo test --manifest-path x"),
+            tool_result_line("toolu_fail", true),
+            bash_line("msg_2", "toolu_pass", "cargo test --manifest-path x"),
+            tool_result_line("toolu_pass", false),
+        ]
+        .join("\n");
+
+        assert_eq!(parse_claude_transcript_window(&text, 0).verification, Some(true));
+
+        let only_failure = [
+            bash_line("msg_1", "toolu_fail", "pytest -q"),
+            tool_result_line("toolu_fail", true),
+        ]
+        .join("\n");
+        assert_eq!(
+            parse_claude_transcript_window(&only_failure, 0).verification,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn non_test_commands_do_not_set_verification() {
+        let text = [
+            bash_line("msg_1", "toolu_ls", "ls -la"),
+            tool_result_line("toolu_ls", false),
+        ]
+        .join("\n");
+        assert_eq!(parse_claude_transcript_window(&text, 0).verification, None);
+    }
+
+    #[test]
+    fn test_command_matching_respects_word_boundaries() {
+        assert!(is_test_command("cargo test --manifest-path tools/sentrith/Cargo.toml"));
+        assert!(is_test_command("uv run pytest tests/"));
+        assert!(is_test_command("npm test"));
+        assert!(!is_test_command("git log --oneline"));
+        // `contest` must not match `go test`, `pytest-cov` must not match bare `pytest`
+        assert!(!is_test_command("echo pytestcov"));
+        assert!(!is_test_command("cargo testbench"));
+    }
+
+    #[test]
+    fn codex_window_reads_exit_code_on_following_line() {
+        let same_line = r#"{"command":"cargo test","exit_code":0}"#;
+        assert_eq!(scan_codex_window_for_tests(same_line, 0), Some(true));
+
+        let split = [
+            r#"{"type":"exec","command":"pytest -q"}"#,
+            r#"{"type":"exec_result","exit_code":1}"#,
+        ]
+        .join("\n");
+        assert_eq!(scan_codex_window_for_tests(&split, 0), Some(false));
+
+        let unrelated = r#"{"command":"ls","exit_code":1}"#;
+        assert_eq!(scan_codex_window_for_tests(unrelated, 0), None);
+    }
+
+    #[test]
+    fn v1_usage_file_migrates_to_v2_preserving_rows() {
+        let path = temp_path("usage.csv");
+        let v1_row = "1,claude,m,standard,\"task, with comma\",1,2,3,,,,,yes,0,manual,sess,note";
+        fs::write(&path, format!("{}{}\n", USAGE_HEADER_V1, v1_row)).unwrap();
+
+        ensure_usage_file(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next().unwrap(), USAGE_HEADER.trim_end());
+        let cols = parse_csv_line(lines.next().unwrap());
+        assert_eq!(cols.len(), USAGE_HEADER.trim_end().split(',').count());
+        assert_eq!(cols[4], "task, with comma");
+        assert_eq!(cols[12], "yes");
+        assert_eq!(cols[17], "");
+        assert_eq!(cols[18], "");
+
+        // Migration must be idempotent.
+        ensure_usage_file(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn phase_precedence_flag_then_marker_then_env_then_default() {
+        assert_eq!(
+            resolve_phase_value(Some("other"), Some("baseline"), Some("standard")),
+            "other"
+        );
+        // The marker outranks the environment: a variable exported after the
+        // agent started never reaches the hook process.
+        assert_eq!(
+            resolve_phase_value(None, Some("baseline"), Some("standard")),
+            "baseline"
+        );
+        assert_eq!(resolve_phase_value(None, None, Some("baseline")), "baseline");
+        assert_eq!(resolve_phase_value(None, None, None), "standard");
+        assert_eq!(
+            resolve_phase_value(Some("  "), None, Some("baseline")),
+            "baseline"
+        );
+        assert_eq!(
+            resolve_phase_value(None, Some("baseline\n"), None),
+            "baseline"
+        );
+    }
+
+    #[test]
+    fn json_round_trips_and_preserves_key_order() {
+        let src = r#"{"b":1,"a":[true,false,null,"x\ny"],"n":-1.5e3,"o":{},"e":[]}"#;
+        let v = json_parse(src).unwrap();
+        let rendered = json_to_string(&v);
+        let again = json_parse(&rendered).unwrap();
+        assert_eq!(v, again);
+        if let Json::Obj(entries) = &v {
+            let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, vec!["b", "a", "n", "o", "e"]);
+        } else {
+            panic!("expected object");
+        }
+        assert_eq!(v.get("n").unwrap(), &Json::Num("-1.5e3".into()));
+    }
+
+    #[test]
+    fn json_handles_unicode_and_escapes() {
+        let v = json_parse(r#"{"k":"日本語 é \" \\ tab\there"}"#).unwrap();
+        assert_eq!(v.get("k").unwrap().as_str().unwrap(), "日本語 é \" \\ tab\there");
+        let again = json_parse(&json_to_string(&v)).unwrap();
+        assert_eq!(v, again);
+    }
+
+    #[test]
+    fn json_rejects_malformed_input() {
+        assert!(json_parse("{").is_err());
+        assert!(json_parse(r#"{"a":1}}"#).is_err());
+        assert!(json_parse(r#"{"a" 1}"#).is_err());
+        assert!(json_parse("").is_err());
+    }
+
+    #[test]
+    fn hook_merge_is_idempotent_and_keeps_foreign_hooks() {
+        let example = json_parse(
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#,
+        )
+        .unwrap();
+        let mut settings = json_parse(
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"my-linter"}]}]}}"#,
+        )
+        .unwrap();
+
+        let mut first = String::new();
+        for pass in 0..3 {
+            let mut hooks = settings.get("hooks").cloned().unwrap();
+            strip_sentrith_hooks(&mut hooks);
+            let added = merge_sentrith_hooks(&mut hooks, example.get("hooks").unwrap());
+            assert_eq!(added, 1, "pass {pass}");
+            settings.set("hooks", hooks);
+            let rendered = json_to_string(&settings);
+            if pass == 0 {
+                first = rendered;
+            } else {
+                assert_eq!(rendered, first, "install must be idempotent");
+            }
+        }
+        assert_eq!(first.matches("my-linter").count(), 1);
+        assert_eq!(first.matches("sentrith guard").count(), 1);
+    }
+
+    #[test]
+    fn stripping_removes_empty_groups_and_events() {
+        let mut hooks = json_parse(
+            r#"{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith guard"}]}],"Other":[{"matcher":"","hooks":[{"type":"command","command":"keep-me"}]}]}"#,
+        )
+        .unwrap();
+        strip_sentrith_hooks(&mut hooks);
+        assert!(hooks.get("Stop").is_none(), "event with only Sentrith hooks is removed");
+        assert!(hooks.get("Other").is_some(), "foreign event is kept");
+    }
+
+    fn row(session: &str, sha: &str, success: &str, phase: &str) -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        m.insert("session_id".into(), session.into());
+        m.insert("head_sha".into(), sha.into());
+        m.insert("success".into(), success.into());
+        m.insert("phase".into(), phase.into());
+        m
+    }
+
+    #[test]
+    fn tasks_split_on_head_sha_transitions() {
+        let rows = vec![
+            row("s1", "aaa", "unknown", "standard"),
+            row("s1", "aaa", "unknown", "standard"),
+            row("s1", "bbb", "yes", "standard"),
+            row("s1", "bbb", "unknown", "standard"),
+        ];
+        let tasks = group_tasks(&rows);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].len(), 3, "commit-closing turn ends the first task");
+        assert_eq!(tasks[1].len(), 1);
+    }
+
+    #[test]
+    fn success_rate_excludes_unknown_from_denominator() {
+        let a = row("s", "x", "yes", "standard");
+        let b = row("s", "x", "no", "standard");
+        let c = row("s", "x", "unknown", "standard");
+        let d = row("s", "x", "", "standard");
+        let rows: Vec<&BTreeMap<String, String>> = vec![&a, &b, &c, &d];
+        assert_eq!(decided_success_rate(&rows), Some(50.0));
+
+        let undecided: Vec<&BTreeMap<String, String>> = vec![&c, &d];
+        assert_eq!(decided_success_rate(&undecided), None);
+    }
+
+    #[test]
+    fn numstat_parsing_collects_changed_paths() {
+        let text = "3\t1\tsrc/a.rs\n0\t0\tsrc/b.rs\n-\t-\tbin/blob\n";
+        let files = parse_numstat_files(text);
+        assert!(files.contains("src/a.rs"));
+        assert!(files.contains("src/b.rs"));
+        assert!(!files.contains("bin/blob"), "binary rows have no numeric counts");
+    }
+
+    #[test]
+    fn success_resolution_requires_commit_and_verification() {
+        let session = format!("t{}", std::process::id());
+        let dir = live_dir();
+        let _ = fs::create_dir_all(&dir);
+
+        // No commit yet: undecidable even though tests passed.
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, Some(true), false),
+            "unknown"
+        );
+        // Commit arrives in a later turn; the earlier pass is carried forward.
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, None, true),
+            "yes"
+        );
+        // State is cleared after the commit closes the task.
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, None, true),
+            "unknown"
+        );
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, Some(false), true),
+            "no"
+        );
+        let _ = fs::remove_file(verif_path("testagent", &session));
     }
 }

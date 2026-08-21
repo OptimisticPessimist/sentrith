@@ -87,6 +87,35 @@ A non-critical measurement hook should not corrupt or block unrelated engineerin
 
 A safety-critical hook may block only when the policy says independent evidence is required.
 
+## Installing hooks
+
+`sentrith hooks install` merges only Sentrith's own entries into the agent's settings file, idempotently:
+
+```bash
+sentrith hooks install                 # claude + codex
+sentrith hooks install --agent claude
+sentrith hooks install --dry-run
+sentrith hooks status
+```
+
+Your other settings, other tools' hooks, and a custom statusLine are preserved. On Windows the commands are rewritten to `bin\sentrith.exe`. The previous file is kept as `*.json.sentrith-bak`.
+
+Manual merging from the example files still works.
+
 ## Portability
 
 Hook examples are adapters. The canonical project rules live in repository documents and `.agents/skills`, not in one vendor's hook syntax.
+
+### Windows note
+
+On native Windows, hook commands may be executed via `cmd.exe`, where `./bin/sentrith` does not resolve.
+
+Use one of:
+
+```text
+bin\sentrith.exe preflight
+```
+
+or an absolute path. The binary name is `sentrith.exe` (see `bin/README.md`).
+
+Under WSL or Git Bash, `./bin/sentrith` works as-is.

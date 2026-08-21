@@ -25,7 +25,7 @@ The main evolution was:
 11. Add anonymized Community Benchmark contributions.
 12. Add adaptive Engineering Profiles for Web, AI/ML, Data, and Game/Interactive 3D.
 
-## Sentrith v1.0.0 — First public release
+## Sentrith 0.x — Start of the public series
 
 Core message:
 
@@ -38,4 +38,4 @@ Four pillars:
 - **Guard**
 - **Measure**
 
-Public version history starts at **Sentrith v1.0.0**.
+Public version history starts at **Sentrith 0.x**. The series stays at 0.x until the contract and the usage CSV schema are considered stable.

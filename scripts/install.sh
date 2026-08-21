@@ -3,11 +3,13 @@ set -eu
 
 SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 FORCE=0
+UPDATE=0
 TARGET_DIR="."
 
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
+    --update) UPDATE=1 ;;
     *) TARGET_DIR="$arg" ;;
   esac
 done
@@ -17,35 +19,41 @@ if [ ! -d "$TARGET_DIR" ]; then
   exit 1
 fi
 
-PATHS_FILE=$(mktemp)
-trap 'rm -f "$PATHS_FILE"' EXIT HUP INT TERM
-cat > "$PATHS_FILE" <<'EOF'
+# Contract paths are owned by Sentrith and are replaced on update.
+CONTRACT_FILE=$(mktemp)
+# Seed paths are owned by the project after installation. They are created when
+# missing and never overwritten, so project memory survives an update.
+SEED_FILE=$(mktemp)
+trap 'rm -f "$CONTRACT_FILE" "$SEED_FILE"' EXIT HUP INT TERM
+
+cat > "$CONTRACT_FILE" <<'EOF'
 AGENTS.md
 CLAUDE.md
 .github/copilot-instructions.md
 .github/prompts
-.claude
-.codex
-docs/ai
+.agents
+.claude/skills
+.claude/settings.hooks.example.json
+.codex/hooks.example.json
+docs/ai/BOOTSTRAP.md
+docs/ai/MEMORY_POLICY.md
+docs/ai/MEMORY_AUDIT.md
+docs/ai/TASK_PROTOCOL.md
+docs/ai/TASK_CLOSEOUT.md
 docs/development
-docs/specs
+docs/profiles
+docs/specs/README.md
+docs/specs/_templates
 docs/rfcs
 EOF
 
-if [ "$FORCE" -ne 1 ]; then
-  conflicts=""
-  while IFS= read -r path; do
-    if [ -e "$TARGET_DIR/$path" ]; then
-      conflicts="$conflicts
-  $path"
-    fi
-  done < "$PATHS_FILE"
-  if [ -n "$conflicts" ]; then
-    printf '%s\n' "Sentrith install stopped: target already contains:$conflicts" >&2
-    echo "Review/merge those files manually, or rerun with --force only if replacement is intentional." >&2
-    exit 2
-  fi
-fi
+cat > "$SEED_FILE" <<'EOF'
+docs/ai/PROJECT.md
+docs/ai/STATE.md
+docs/ai/PROFILE.md
+docs/ai/DECISIONS.md
+docs/ai/KNOWN_ISSUES.md
+EOF
 
 copy_path() {
   src="$SOURCE_DIR/$1"
@@ -60,13 +68,61 @@ copy_path() {
   fi
 }
 
-while IFS= read -r path; do
-  copy_path "$path"
-done < "$PATHS_FILE"
+if [ "$UPDATE" -eq 1 ]; then
+  while IFS= read -r path; do
+    copy_path "$path"
+  done < "$CONTRACT_FILE"
+
+  added=""
+  while IFS= read -r path; do
+    if [ ! -e "$TARGET_DIR/$path" ]; then
+      copy_path "$path"
+      added="$added
+  $path"
+    fi
+  done < "$SEED_FILE"
+
+  printf '%s\n' "Sentrith contract updated in: $TARGET_DIR"
+  printf '%s\n' "Project-owned memory was not modified."
+  if [ -n "$added" ]; then
+    printf '%s\n' "New memory files added as uninitialized templates:$added"
+    printf '%s\n' "Ask your agent to fill them (see docs/ai/BOOTSTRAP.md)."
+  fi
+  printf '%s\n' \
+    "Review: git diff -- AGENTS.md docs/development docs/profiles" \
+    "See docs/guide/UPDATING.md before your next task."
+  exit 0
+fi
+
+# Fresh install: refuse to clobber anything already present.
+if [ "$FORCE" -ne 1 ]; then
+  conflicts=""
+  for listfile in "$CONTRACT_FILE" "$SEED_FILE"; do
+    while IFS= read -r path; do
+      if [ -e "$TARGET_DIR/$path" ]; then
+        conflicts="$conflicts
+  $path"
+      fi
+    done < "$listfile"
+  done
+  if [ -n "$conflicts" ]; then
+    printf '%s\n' "Sentrith install stopped: target already contains:$conflicts" >&2
+    echo "If Sentrith is already installed, run with --update instead: it replaces contract files and preserves project memory." >&2
+    echo "Use --force only when full replacement is intentional; it overwrites project memory." >&2
+    exit 2
+  fi
+fi
+
+for listfile in "$CONTRACT_FILE" "$SEED_FILE"; do
+  while IFS= read -r path; do
+    copy_path "$path"
+  done < "$listfile"
+done
 
 printf '%s\n' \
   "Sentrith repository contract copied to: $TARGET_DIR" \
   "Next:" \
   "1. Ask your coding agent to read docs/ai/BOOTSTRAP.md and bootstrap Project Memory." \
-  "2. Review docs/ai/PROJECT.md and docs/ai/STATE.md once." \
-  "3. Run 'sentrith preflight' if the CLI is installed."
+  "2. Review docs/ai/PROJECT.md, docs/ai/STATE.md, and docs/ai/PROFILE.md once." \
+  "3. Optional: ./scripts/get-sentrith.sh $TARGET_DIR  (downloads the prebuilt CLI into bin/)" \
+  "4. Run 'sentrith preflight' if the CLI is installed."

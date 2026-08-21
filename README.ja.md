@@ -62,17 +62,19 @@ Sentrithの狙いは、Vibe Codingを重くすることではありません。
 
 Sentrithは「DDDを使いますか？」「CQRSにしますか？」とは聞きません。
 
-プロジェクトの複雑さ、失敗時の影響、AI/Data/Platform依存などを数問の選択式で確認し、必要なProfileだけを有効化します。
+bootstrap時に、失敗時の影響・外部contract・AI/Data/Platform依存・既存の検証手段を数問確認し、必要なProfileだけを有効化します。結果は `docs/ai/PROFILE.md` に一度だけ記録します。
 
 ```mermaid
 flowchart TD
-    P["Project"] --> Q["5〜10問の選択式質問"]
-    Q --> E["Engineering Profile"]
+    P["Project"] --> Q["Bootstrap質問"]
+    Q --> E["docs/ai/PROFILE.md"]
     E --> W["Web / Backend"]
     E --> A["AI / ML"]
     E --> D["Data"]
     E --> G["Game / 3D"]
 ```
+
+Profileは排他モードではなく**加算的なoverlay**です。RAG付きAPIならWeb/BackendとAI/MLの両方を有効化し、両方に合致する変更は和集合で検証します。
 
 対応領域:
 
@@ -85,9 +87,13 @@ flowchart TD
   - Godot
   - Unreal Engine
 
-必要ならDDD Lite / Full、Threat Modeling、Property-Based Testing、Ports & Adapters、Statistical Review、Visual Regression、Formal Methods、CQRS、Event Sourcingなどを選択します。
+各Profileは**技法ゲート**を持ちます: DDD Lite / Full、Ports & Adapters、CQRS、Event Sourcing、Threat Modeling、Property-Based Testing、Golden Eval、Statistical Review、Data Contract Test、Visual Acceptance。
+
+技法は文書化された適用条件を満たしたときだけ有効化し、迷う場合は適用しません。
 
 **手法を使うことを目的にしない。問題に必要な手法だけ使う。**
+
+[Engineering Profiles →](docs/profiles/README.ja.md)
 
 ---
 
@@ -246,7 +252,21 @@ sentrith guard
 
 効果を測る場合は、workflow変更**前**にbaselineを取ります。
 
-[詳細なInstallation →](docs/guide/INSTALLATION.ja.md)
+### 導入済みprojectを更新する
+
+```bash
+./scripts/install.sh --update /path/to/your-project
+```
+
+```powershell
+./scripts/install.ps1 -Target C:\path\to\your-project -Update
+```
+
+`--update` はContract fileだけを置換し、**Project Memory(`docs/ai/PROJECT.md` 等)とfeature specは保持します**。
+
+`--force` はProject Memoryごと上書きするため、更新には使わないでください。
+
+[Installation →](docs/guide/INSTALLATION.ja.md) ｜ [Updating →](docs/guide/UPDATING.ja.md)
 
 対応Agent:
 
@@ -262,6 +282,7 @@ sentrith guard
 
 - [やりたいことから探す](docs/README.ja.md)
 - [Installation](docs/guide/INSTALLATION.ja.md)
+- [Updating](docs/guide/UPDATING.ja.md)
 - [Quickstart](docs/guide/QUICKSTART.ja.md)
 - [Development Method](docs/development/DEVELOPMENT_METHOD.md)
 - [Safety Gates](docs/development/SAFETY_GATES.md)
@@ -284,4 +305,4 @@ AI Codingはもう十分速い。
 
 ---
 
-**Sentrith v1.0.0 — first public release.**
+**Sentrith v0.2.0** — 0.x系列。Contractは今後も変わります。[Versioning](docs/meta/VERSIONING.md) を参照してください。

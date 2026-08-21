@@ -32,16 +32,26 @@ AGENTS.md
 CLAUDE.md
 .github/copilot-instructions.md
 .github/prompts/
-.claude/
-.codex/
+.agents/            # canonical cross-agent skills
+.claude/skills/     # thin adapters
+.claude/settings.hooks.example.json
+.codex/hooks.example.json
 docs/ai/
 docs/development/
+docs/profiles/
 docs/specs/
 docs/rfcs/
 ```
 
 Application source codeは変更しません。
-> 対象repoに同名のSentrith管理pathがある場合、installerは上書きせず停止します。意図的にmergeするか、置換が明確な場合だけ `--force` / `-Force` を使ってください。
+
+`.agents/` は必須です。`.claude/skills/` のadapterはここを参照します。
+
+> 対象repoに同名のSentrith管理pathがある場合、installerは上書きせず停止します。
+> **すでにSentrithを導入済みで新versionへ上げる場合は `--update` を使ってください。** Contract fileだけを置換し、Project Memoryを保持します。
+> `--force` はProject Memoryごと置換するため、導入をやり直す場合にのみ使用します。
+
+更新手順の詳細: [Updating](UPDATING.ja.md)
 
 
 ## Project MemoryをBootstrapする
@@ -66,7 +76,21 @@ docs/ai/STATE.md
 
 Release assetが用意されている場合、利用者はprebuilt `sentrith` binaryを使うのが基本です。
 
-Maintainerはlocal buildできます。
+取得スクリプトで、最新Releaseから現在のOS向けbinaryを対象repositoryの `bin/` へダウンロードできます(SHA256検証つき)。
+
+```bash
+./scripts/get-sentrith.sh /path/to/your-project
+```
+
+Windows PowerShell:
+
+```powershell
+./scripts/get-sentrith.ps1 -Target C:\path\to\your-project
+```
+
+Rust toolchainは不要です。
+
+Maintainerはlocal buildもできます。
 
 ```bash
 cargo build --release --manifest-path tools/sentrith/Cargo.toml
@@ -78,6 +102,14 @@ cargo build --release --manifest-path tools/sentrith/Cargo.toml
 sentrith preflight
 sentrith guard
 ```
+
+計測hookを有効にする場合は、手動のJSON編集ではなく次を実行します。
+
+```bash
+sentrith hooks install
+```
+
+既存の `.claude/settings.json` は保持され、Sentrithのhookだけが冪等にmergeされます。
 
 ## 最初の実タスク
 
