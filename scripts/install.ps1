@@ -48,6 +48,10 @@ function Copy-SentrithPath {
   if (-not (Test-Path $Src)) { return }
   New-Item -ItemType Directory -Force -Path (Split-Path $Dst -Parent) | Out-Null
   if ((Get-Item $Src).PSIsContainer) {
+    if (Test-Path $Dst) {
+      $Backup = "$Dst.sentrith-update-backup.$([Guid]::NewGuid().ToString('N'))"
+      Move-Item -Force $Dst $Backup
+    }
     New-Item -ItemType Directory -Force -Path $Dst | Out-Null
     Copy-Item -Recurse -Force (Join-Path $Src "*") $Dst
   } else {
