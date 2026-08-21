@@ -62,6 +62,11 @@ copy_path() {
   [ -e "$src" ] || return 0
   mkdir -p "$(dirname "$dst")"
   if [ -d "$src" ]; then
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+      backup_dir=$(mktemp -d "$(dirname "$dst")/.sentrith-update-backup.XXXXXX")
+      rmdir "$backup_dir"
+      mv "$dst" "$backup_dir"
+    fi
     mkdir -p "$dst"
     cp -R "$src"/. "$dst"/
   else
