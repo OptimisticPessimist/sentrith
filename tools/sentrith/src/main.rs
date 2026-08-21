@@ -10,13 +10,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const USAGE_HEADER_V1: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes\n";
 const USAGE_HEADER: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes,head_sha,verification\n";
 
-const TEST_COMMAND_PATTERNS: &[&str] = &[
-    "cargo test", "pytest", "npm test", "npm run test", "yarn test", "pnpm test",
-    "go test", "dotnet test", "mvn test", "gradle test", "./gradlew test",
-    "rspec", "phpunit", "vitest", "jest", "mix test", "ctest", "tox",
-    "make test", "rake test", "unittest",
-];
-
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
@@ -699,11 +692,38 @@ fn diff_budget() -> Result<(), String> {
 /// Sentrith owns hooks whose command starts with one of the executable forms it
 /// installs. Matching only the command token keeps an unrelated path such as
 /// /workspace/sentrith/scripts/run-linter in the user's settings.
+fn first_shell_token(command: &str) -> Option<String> {
+    let mut token = String::new();
+    let mut quote = None;
+
+    for ch in command.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                // Keep backslashes inside quotes. This matters for Windows
+                // paths such as "C:\\Program Files\\sentrith.exe".
+                token.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            c if c.is_whitespace() || matches!(c, ';' | '&' | '|') => break,
+            _ => token.push(ch),
+        }
+    }
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
 fn is_sentrith_command(cmd: &str) -> bool {
-    let Some(token) = cmd.split_whitespace().next() else {
+    let Some(token) = first_shell_token(cmd) else {
         return false;
     };
-    let token = token.trim_matches(|c: char| matches!(c, '"' | '\'' | ';' | '&' | '|'));
     let normalized = token.replace('\\', "/").to_ascii_lowercase();
     normalized == "sentrith"
         || normalized == "sentrith.exe"
@@ -922,8 +942,12 @@ fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> R
 fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+
     #[link(name = "kernel32")]
     extern "system" {
+        fn GetFileAttributesW(file_name: *const u16) -> u32;
         fn GetLastError() -> u32;
         fn ReplaceFileW(
             replaced_file_name: *const u16,
@@ -933,6 +957,7 @@ fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> R
             exclude: *mut std::ffi::c_void,
             reserved: *mut std::ffi::c_void,
         ) -> i32;
+        fn SetFileAttributesW(file_name: *const u16, attributes: u32) -> i32;
     }
 
     let replaced: Vec<u16> = destination
@@ -945,6 +970,28 @@ fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> R
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    let original_attributes = unsafe { GetFileAttributesW(replaced.as_ptr()) };
+    if original_attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(format!(
+            "GetFileAttributesW failed with OS error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let was_readonly = original_attributes & FILE_ATTRIBUTE_READONLY != 0;
+    if was_readonly
+        && unsafe {
+            SetFileAttributesW(
+                replaced.as_ptr(),
+                original_attributes & !FILE_ATTRIBUTE_READONLY,
+            )
+        } == 0
+    {
+        return Err(format!(
+            "SetFileAttributesW failed with OS error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+
     let ok = unsafe {
         ReplaceFileW(
             replaced.as_ptr(),
@@ -956,12 +1003,33 @@ fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> R
         )
     };
     if ok == 0 {
-        Err(format!("ReplaceFileW failed with OS error {}", unsafe {
-            GetLastError()
-        }))
-    } else {
-        Ok(())
+        let error = unsafe { GetLastError() };
+        if was_readonly {
+            let _ = unsafe { SetFileAttributesW(replaced.as_ptr(), original_attributes) };
+        }
+        return Err(format!("ReplaceFileW failed with OS error {error}"));
     }
+
+    if was_readonly {
+        let new_attributes = unsafe { GetFileAttributesW(replaced.as_ptr()) };
+        if new_attributes == INVALID_FILE_ATTRIBUTES {
+            return Err(format!(
+                "GetFileAttributesW failed after replacement with OS error {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        if unsafe {
+            SetFileAttributesW(replaced.as_ptr(), new_attributes | FILE_ATTRIBUTE_READONLY)
+        } == 0
+        {
+            return Err(format!(
+                "SetFileAttributesW failed after replacement with OS error {}",
+                unsafe { GetLastError() }
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
@@ -1280,7 +1348,7 @@ fn usage_report(args: &[String]) -> Result<(), String> {
     // summarizing raw rows divides each metric by however many turns happened
     // to precede a commit, which makes phases with different turn counts
     // incomparable.
-    let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str), None)?;
+    let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str))?;
     if rows.is_empty() {
         println!("SENTRITH-USAGE: no matching rows");
         return Ok(());
@@ -1349,8 +1417,14 @@ fn phase_summary(tasks: &[Vec<&BTreeMap<String, String>>]) -> BTreeMap<&'static 
 fn tasks_by_phase<'a>(
     rows: &[&'a BTreeMap<String, String>],
 ) -> BTreeMap<String, Vec<Vec<&'a BTreeMap<String, String>>>> {
+    tasks_by_phase_from_tasks(group_tasks(rows))
+}
+
+fn tasks_by_phase_from_tasks<'a>(
+    tasks: Vec<Vec<&'a BTreeMap<String, String>>>,
+) -> BTreeMap<String, Vec<Vec<&'a BTreeMap<String, String>>>> {
     let mut by_phase: BTreeMap<String, Vec<Vec<&'a BTreeMap<String, String>>>> = BTreeMap::new();
-    for task in group_tasks(rows) {
+    for task in tasks {
         let phase = task
             .last()
             .and_then(|r| r.get("phase"))
@@ -1359,6 +1433,32 @@ fn tasks_by_phase<'a>(
         by_phase.entry(phase).or_default().push(task);
     }
     by_phase
+}
+
+/// Apply a model filter after task grouping so a task that changes models is
+/// never split into multiple partial tasks. Mixed-model tasks are excluded
+/// from model-specific metrics because assigning their totals to one model
+/// would be misleading.
+fn filter_tasks_by_model<'a>(
+    tasks: Vec<Vec<&'a BTreeMap<String, String>>>,
+    model: Option<&str>,
+) -> Vec<Vec<&'a BTreeMap<String, String>>> {
+    let Some(wanted) = model else {
+        return tasks;
+    };
+
+    tasks
+        .into_iter()
+        .filter(|task| {
+            let models: BTreeSet<String> = task
+                .iter()
+                .filter_map(|row| row.get("model"))
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .collect();
+            models.len() == 1 && models.contains(wanted)
+        })
+        .collect()
 }
 
 /// Group turn rows into tasks: rows without a session id stand alone;
@@ -1402,7 +1502,7 @@ fn group_tasks<'a>(rows: &[&'a BTreeMap<String, String>]) -> Vec<Vec<&'a BTreeMa
 }
 
 fn usage_report_tasks(file: &Path, opts: &BTreeMap<String, String>) -> Result<(), String> {
-    let rows = load_usage_rows(file, opts.get("agent").map(String::as_str), None)?;
+    let rows = load_usage_rows(file, opts.get("agent").map(String::as_str))?;
     if rows.is_empty() {
         println!("SENTRITH-USAGE: no matching rows");
         return Ok(());
@@ -1507,7 +1607,7 @@ fn usage_status(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str), None)?;
+    let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str))?;
     let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
     let by_phase = tasks_by_phase(&refs);
     let mut counts: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
@@ -1617,7 +1717,7 @@ fn churn_for_commit(sha: &str, days: f64) -> Option<(usize, usize)> {
 
 fn usage_report_churn(file: &Path, opts: &BTreeMap<String, String>) -> Result<(), String> {
     let days: f64 = opts.get("days").and_then(|x| x.parse().ok()).unwrap_or(14.0);
-    let rows = load_usage_rows(file, opts.get("agent").map(String::as_str), None)?;
+    let rows = load_usage_rows(file, opts.get("agent").map(String::as_str))?;
     // A recorded `head_sha` is by construction a commit observed during that
     // turn, so every one counts. Requiring a transition from a previous SHA
     // would drop each session's first commit, including sessions that contain
@@ -1700,7 +1800,7 @@ struct PublishStats {
     credits_per_success: Option<f64>,
 }
 
-fn load_usage_rows(path: &Path, agent_filter: Option<&str>, model_filter: Option<&str>) -> Result<Vec<BTreeMap<String, String>>, String> {
+fn load_usage_rows(path: &Path, agent_filter: Option<&str>) -> Result<Vec<BTreeMap<String, String>>, String> {
     let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let records = split_csv_records(&text);
     let mut records = records.iter();
@@ -1717,9 +1817,6 @@ fn load_usage_rows(path: &Path, agent_filter: Option<&str>, model_filter: Option
         }
         if let Some(a) = agent_filter {
             if row.get("agent").map(String::as_str).unwrap_or("") != a { continue; }
-        }
-        if let Some(m) = model_filter {
-            if row.get("model").map(String::as_str).unwrap_or("") != m { continue; }
         }
         rows.push(row);
     }
@@ -1855,9 +1952,10 @@ fn usage_publish(args: &[String]) -> Result<(), String> {
     let force = opts.contains_key("force");
     let dry_run = opts.contains_key("dry-run");
 
-    let rows = load_usage_rows(&file, Some(agent), model)?;
+    let rows = load_usage_rows(&file, Some(agent))?;
     let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
-    let by_phase = tasks_by_phase(&refs);
+    let tasks = filter_tasks_by_model(group_tasks(&refs), model);
+    let by_phase = tasks_by_phase_from_tasks(tasks);
     let baseline_tasks = by_phase.get("baseline").map(Vec::as_slice).unwrap_or(&[]);
     let standard_tasks = by_phase.get("standard").map(Vec::as_slice).unwrap_or(&[]);
 
@@ -2761,24 +2859,117 @@ fn extract_id_after(line: &str, marker: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Word-boundary match of known test-runner invocations inside a shell command.
-fn is_test_command(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
-    let bytes = lower.as_bytes();
-    for pat in TEST_COMMAND_PATTERNS {
-        let mut start = 0;
-        while let Some(pos) = lower[start..].find(pat) {
-            let abs = start + pos;
-            let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
-            let after = abs + pat.len();
-            let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                return true;
+fn shell_command_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments = vec![Vec::new()];
+    let mut token = String::new();
+    let mut quote = None;
+
+    let flush_token = |segments: &mut Vec<Vec<String>>, token: &mut String| {
+        if !token.is_empty() {
+            segments.last_mut().unwrap().push(std::mem::take(token));
+        }
+    };
+
+    for ch in command.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                token.push(ch);
             }
-            start = abs + pat.len();
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            c if c.is_whitespace() => flush_token(&mut segments, &mut token),
+            ';' | '|' | '&' => {
+                flush_token(&mut segments, &mut token);
+                if !segments.last().unwrap().is_empty() {
+                    segments.push(Vec::new());
+                }
+            }
+            _ => token.push(ch),
         }
     }
-    false
+    flush_token(&mut segments, &mut token);
+    segments.retain(|segment| !segment.is_empty());
+    segments
+}
+
+fn executable_name(token: &str) -> String {
+    token
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or(token)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase()
+}
+
+fn first_non_option_arg(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(String::as_str)
+        .find(|arg| !arg.starts_with('-'))
+}
+
+fn is_test_invocation(tokens: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(token) = tokens.get(index) {
+        if token == "env" || token == "command" {
+            index += 1;
+            continue;
+        }
+        if token
+            .split_once('=')
+            .map(|(name, _)| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            })
+            .unwrap_or(false)
+        {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    let Some(executable) = tokens.get(index) else {
+        return false;
+    };
+    let args = &tokens[index + 1..];
+    let name = executable_name(executable);
+    let first = first_non_option_arg(args);
+
+    match name.as_str() {
+        "cargo" | "go" | "dotnet" | "mvn" | "gradle" | "gradlew" | "make" | "rake" | "mix" => {
+            first == Some("test")
+        }
+        "npm" | "yarn" | "pnpm" => {
+            first == Some("test") || (first == Some("run") && args.iter().any(|arg| arg == "test"))
+        }
+        "uv" => {
+            let Some(run) = args.iter().position(|arg| arg == "run") else {
+                return false;
+            };
+            is_test_invocation(&args[run + 1..])
+        }
+        "python" | "python3" | "py" => args
+            .windows(2)
+            .any(|window| window[0] == "-m" && matches!(window[1].as_str(), "pytest" | "unittest")),
+        "pytest" | "rspec" | "phpunit" | "vitest" | "jest" | "ctest" | "tox" | "unittest" => true,
+        _ => false,
+    }
+}
+
+/// Recognize an actual test-runner executable in a shell command. Text that
+/// merely mentions a test command, such as `echo "cargo test"` or `rg`,
+/// must not mark verification as successful.
+fn is_test_command(cmd: &str) -> bool {
+    shell_command_segments(cmd)
+        .iter()
+        .any(|segment| is_test_invocation(segment))
 }
 
 /// Parse the Claude Code transcript JSONL lines after `skip_lines`.
@@ -3383,9 +3574,10 @@ fn usage_contribute(args: &[String]) -> Result<(), String> {
     let agent = require(&opts, "agent")?;
     let model = opts.get("model").map(String::as_str);
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
-    let rows = load_usage_rows(&file, Some(agent), model)?;
+    let rows = load_usage_rows(&file, Some(agent))?;
     let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
-    let by_phase = tasks_by_phase(&refs);
+    let tasks = filter_tasks_by_model(group_tasks(&refs), model);
+    let by_phase = tasks_by_phase_from_tasks(tasks);
     let baseline_tasks = by_phase.get("baseline").map(Vec::as_slice).unwrap_or(&[]);
     let standard_tasks = by_phase.get("standard").map(Vec::as_slice).unwrap_or(&[]);
 
@@ -3665,6 +3857,10 @@ mod tests {
         // `contest` must not match `go test`, `pytest-cov` must not match bare `pytest`
         assert!(!is_test_command("echo pytestcov"));
         assert!(!is_test_command("cargo testbench"));
+        assert!(!is_test_command(r#"echo "cargo test""#));
+        assert!(!is_test_command(r#"rg "cargo test" docs"#));
+        assert!(is_test_command("env CI=1 cargo test"));
+        assert!(is_test_command(r#""/opt/project/bin/cargo" test"#));
     }
 
     #[test]
@@ -4023,6 +4219,7 @@ mod tests {
     fn hook_matching_does_not_remove_foreign_paths_containing_sentrith() {
         assert!(is_sentrith_command("./bin/sentrith guard"));
         assert!(is_sentrith_command("bin\\sentrith.exe guard"));
+        assert!(is_sentrith_command(r#""C:\Program Files\project\bin\sentrith.exe" guard"#));
         assert!(!is_sentrith_command("/workspace/sentrith/scripts/run-linter"));
         assert!(!is_sentrith_command("echo sentrith"));
 
@@ -4098,6 +4295,23 @@ mod tests {
         m.insert("input_tokens".into(), input.into());
         m.insert("credits".into(), "3".into());
         m
+    }
+
+    #[test]
+    fn model_filter_groups_before_filtering() {
+        let mut first = turn("s1", "", "unknown", "10");
+        first.insert("model".into(), "model-a".into());
+        let mut second = turn("s1", "sha", "yes", "20");
+        second.insert("model".into(), "model-b".into());
+        let owned = vec![first, second];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+
+        let tasks = group_tasks(&rows);
+        assert_eq!(tasks.len(), 1, "the model change is still one task");
+        assert!(
+            filter_tasks_by_model(tasks, Some("model-a")).is_empty(),
+            "mixed-model tasks must not be attributed to either model"
+        );
     }
 
     #[test]
