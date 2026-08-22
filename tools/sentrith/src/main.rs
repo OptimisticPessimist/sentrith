@@ -845,7 +845,12 @@ fn map_commands(v: &mut Json) {
 /// Drop Sentrith-owned entries from a hooks object, leaving other tools' hooks
 /// in place. Empty matcher groups and empty events are removed so repeated
 /// installs do not accumulate husks.
-fn strip_sentrith_hooks(hooks: &mut Json) {
+/// Remove hook entries whose `command` matches `predicate`, then drop any
+/// matcher group and any event left with no hooks. Shared by
+/// `strip_sentrith_hooks` (drop all Sentrith entries, for idempotent
+/// reinstall) and `is_workflow_check_command` (drop only the advisory
+/// checks, keeping usage capture, for baseline measurement).
+fn strip_hooks_matching(hooks: &mut Json, predicate: impl Fn(&str) -> bool) {
     let Json::Obj(events) = hooks else { return };
     for (_, groups) in events.iter_mut() {
         if let Json::Arr(group_list) = groups {
@@ -856,7 +861,7 @@ fn strip_sentrith_hooks(hooks: &mut Json) {
                         .filter(|h| {
                             !h.get("command")
                                 .and_then(|c| c.as_str())
-                                .map(is_sentrith_command)
+                                .map(&predicate)
                                 .unwrap_or(false)
                         })
                         .collect();
@@ -867,6 +872,33 @@ fn strip_sentrith_hooks(hooks: &mut Json) {
         }
     }
     events.retain(|(_, groups)| !matches!(groups, Json::Arr(v) if v.is_empty()));
+}
+
+fn strip_sentrith_hooks(hooks: &mut Json) {
+    strip_hooks_matching(hooks, is_sentrith_command);
+}
+
+/// Sentrith's SessionStart/Stop advisory checks (preflight, closeout-check,
+/// guard, review-hint, diff-budget). They print Sentrith-flavored text into
+/// the agent's context on every turn, which would contaminate a baseline
+/// session that is supposed to measure work without Sentrith active. This is
+/// deliberately narrower than `is_sentrith_command`: usage capture
+/// (`usage hook ...`) must keep running during a baseline, since it is what
+/// records the baseline turns at all.
+const WORKFLOW_CHECK_SUBCOMMANDS: &[&str] =
+    &["preflight", "closeout-check", "guard", "review-hint", "diff-budget"];
+
+fn is_workflow_check_command(cmd: &str) -> bool {
+    if !is_sentrith_command(cmd) {
+        return false;
+    }
+    let Some((tokens, _)) = shell_command_segments(cmd).into_iter().next() else {
+        return false;
+    };
+    tokens
+        .get(1)
+        .map(|sub| WORKFLOW_CHECK_SUBCOMMANDS.contains(&sub.as_str()))
+        .unwrap_or(false)
 }
 
 /// Append the example's Sentrith groups into the target hooks object.
@@ -1735,6 +1767,14 @@ fn usage_status(args: &[String]) -> Result<(), String> {
 enum NumstatZItem {
     Commit(f64),
     Path(String),
+    /// A rename record. Kept separate from `Path` because the two callers of
+    /// `parse_numstat_z` need different halves of it: the measured commit's
+    /// file set uses only `new` (that is the file's identity going forward,
+    /// and counting both names would double-count one logical file in the
+    /// churn denominator); scanning later history for touches must check
+    /// both `old` and `new`, since a later commit may rename the measured
+    /// file again before ever touching it under the newer name.
+    Rename { old: String, new: String },
 }
 
 /// Parse `-z`-delimited numstat output, optionally interleaved with
@@ -1771,11 +1811,13 @@ fn parse_numstat_z(text: &str) -> Vec<NumstatZItem> {
             // above) only if renames were ever reported for `-`/`-` rows,
             // which git does not do, so this branch is reached only for text
             // renames.
-            let _old_path = fields.next();
-            if let Some(new_path) = fields.next() {
-                if !new_path.is_empty() {
-                    items.push(NumstatZItem::Path(new_path.to_string()));
-                }
+            let Some(old_path) = fields.next() else { continue };
+            let Some(new_path) = fields.next() else { continue };
+            if !old_path.is_empty() && !new_path.is_empty() {
+                items.push(NumstatZItem::Rename {
+                    old: old_path.to_string(),
+                    new: new_path.to_string(),
+                });
             }
         } else {
             items.push(NumstatZItem::Path(path.to_string()));
@@ -1795,10 +1837,14 @@ fn within_churn_window(t: f64, t0: f64, days: f64) -> bool {
 /// File-level churn: how many files of `sha` were modified again by later
 /// commits within `days`. A rework proxy computable retroactively from git.
 fn churn_for_commit(sha: &str, days: f64) -> Option<(usize, usize)> {
+    // A rename in the measured commit records only its destination: that is
+    // the file's identity going forward, and counting the old name too would
+    // count one logical file twice in the denominator below.
     let files: BTreeSet<String> = parse_numstat_z(&git(&["show", "--numstat", "-z", "--format=", sha]))
         .into_iter()
         .filter_map(|item| match item {
             NumstatZItem::Path(p) => Some(p),
+            NumstatZItem::Rename { new, .. } => Some(new),
             NumstatZItem::Commit(_) => None,
         })
         .collect();
@@ -1816,6 +1862,15 @@ fn churn_for_commit(sha: &str, days: f64) -> Option<(usize, usize)> {
             NumstatZItem::Path(p) => {
                 if in_window {
                     touched.insert(p);
+                }
+            }
+            // A later rename touches the file under both names: the measured
+            // commit's file set may hold either one, depending on whether the
+            // measured commit itself renamed the file.
+            NumstatZItem::Rename { old, new } => {
+                if in_window {
+                    touched.insert(old);
+                    touched.insert(new);
                 }
             }
         }
@@ -2392,8 +2447,87 @@ const BASELINE_STASH_PATHS: &[&str] = &[
     ".claude/skills",
 ];
 
+/// Hook-settings files whose advisory-check entries (see
+/// `WORKFLOW_CHECK_SUBCOMMANDS`) are edited out, not moved, for the duration
+/// of a baseline. Unlike `BASELINE_STASH_PATHS`, the live file keeps
+/// existing throughout: usage capture still needs it.
+const BASELINE_HOOK_SETTINGS_PATHS: &[&str] = &[".claude/settings.json", ".codex/hooks.json"];
+
 fn baseline_stash_dir() -> PathBuf {
     PathBuf::from(".sentrith-private/baseline-stash")
+}
+
+/// Strip a hook-settings file's advisory-check entries for the duration of a
+/// baseline, backing up the original so `baseline stop` can restore it
+/// verbatim rather than reconstructing it from the shipped example (which
+/// may not match what the user actually has). Returns `Ok(false)` when there
+/// is nothing to do: no file, empty file, no `hooks` field, or no entry
+/// actually matched.
+/// `rel_path` is only a naming key for the backup under `stash`; `live` is the
+/// file actually read and written. Kept separate (rather than deriving `live`
+/// from `rel_path` via `repo_file` internally) so this is testable with an
+/// arbitrary temp-directory path instead of depending on the process's
+/// current directory, the same reasoning that shaped `inspect_stash`.
+fn reduce_hook_settings_for_baseline(
+    rel_path: &str,
+    live: &Path,
+    stash: &Path,
+) -> Result<bool, String> {
+    if !live.exists() {
+        return Ok(false);
+    }
+    let original = read_text(live);
+    if original.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut settings = json_parse(&original).map_err(|e| {
+        format!(
+            "{} is not valid JSON ({e}); left untouched for baseline",
+            live.display()
+        )
+    })?;
+    let Some(mut hooks) = settings.get("hooks").cloned() else {
+        return Ok(false);
+    };
+    let before = json_to_string(&hooks);
+    strip_hooks_matching(&mut hooks, is_workflow_check_command);
+    if json_to_string(&hooks) == before {
+        return Ok(false);
+    }
+    if matches!(&hooks, Json::Obj(e) if e.is_empty()) {
+        settings.remove("hooks");
+    } else {
+        settings.set("hooks", hooks);
+    }
+    let reduced = json_to_string(&settings);
+    // Never write output we cannot read back.
+    json_parse(&reduced).map_err(|e| {
+        format!(
+            "internal: reduced {} would be invalid JSON ({e})",
+            live.display()
+        )
+    })?;
+
+    let backup = stash.join("hook-settings-backup").join(rel_path);
+    if let Some(parent) = backup.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&backup, &original)
+        .map_err(|e| format!("failed to back up {}: {e}", live.display()))?;
+    fs::write(live, &reduced)
+        .map_err(|e| format!("failed to write reduced {}: {e}", live.display()))?;
+    Ok(true)
+}
+
+/// Restore a hook-settings file from its baseline backup, removing the
+/// backup. A no-op if there is no backup for this path (nothing was reduced,
+/// or it was already restored).
+fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Result<(), String> {
+    let backup = stash.join("hook-settings-backup").join(rel_path);
+    if !backup.exists() {
+        return Ok(());
+    }
+    fs::rename(&backup, live).map_err(|e| format!("failed to restore {}: {e}", live.display()))
 }
 
 fn usage_baseline(args: &[String]) -> Result<(), String> {
@@ -2418,6 +2552,13 @@ fn baseline_status() -> Result<(), String> {
         .unwrap_or_else(|_| "standard (no marker)".into());
     if baseline_active() {
         println!("SENTRITH-BASELINE: active; contract stashed in {}", baseline_stash_dir().display());
+        let edited = read_text(&baseline_stash_dir().join("HOOK_EDITS.txt"))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        if edited > 0 {
+            println!("SENTRITH-BASELINE: advisory-check hooks reduced in {edited} path(s); usage capture unaffected");
+        }
     } else {
         println!("SENTRITH-BASELINE: inactive");
     }
@@ -2481,16 +2622,7 @@ fn baseline_start() -> Result<(), String> {
     if let Some(err) = failure {
         // Roll back so a partial stash never leaves the project without its
         // contract files, and never leaves files only inside the stash.
-        let mut rollback_failed = Vec::new();
-        for path in moved.iter().rev() {
-            let src = stash.join(path);
-            let dst = repo_file(path);
-            if src.exists() && !dst.exists() {
-                if let Err(e) = fs::rename(&src, &dst) {
-                    rollback_failed.push(format!("{path} ({e})"));
-                }
-            }
-        }
+        let rollback_failed = rollback_moved_paths(&moved, &stash);
         if rollback_failed.is_empty() {
             let _ = fs::remove_file(&manifest);
             let _ = fs::remove_dir_all(&stash);
@@ -2511,15 +2643,84 @@ fn baseline_start() -> Result<(), String> {
         return Err("no Sentrith contract files found to stash; is this a Sentrith project?".into());
     }
 
+    // Reduce advisory-check hooks (preflight/guard/etc.) so a baseline session
+    // does not see Sentrith-flavored Stop/SessionStart output reacting to the
+    // paths this just stashed; usage capture keeps running unmodified. A
+    // malformed hook-settings file is reported but does not abort a baseline
+    // whose contract files are already safely stashed. If recording which
+    // files were edited fails partway, everything rolls back so baseline
+    // start stays all-or-nothing.
+    let mut hook_edits: Vec<String> = Vec::new();
+    let hook_edits_manifest = stash.join("HOOK_EDITS.txt");
+    let mut hook_edit_failure: Option<String> = None;
+    for path in BASELINE_HOOK_SETTINGS_PATHS {
+        match reduce_hook_settings_for_baseline(path, &repo_file(path), &stash) {
+            Ok(true) => {
+                hook_edits.push((*path).to_string());
+                if let Err(e) = fs::write(&hook_edits_manifest, hook_edits.join("\n") + "\n") {
+                    hook_edit_failure = Some(format!("failed to record hook-edit manifest: {e}"));
+                    break;
+                }
+            }
+            Ok(false) => {}
+            Err(e) => println!("SENTRITH-BASELINE: warning: {e}"),
+        }
+    }
+    if let Some(err) = hook_edit_failure {
+        for path in hook_edits.iter().rev() {
+            let _ = restore_hook_settings_backup(path, &repo_file(path), &stash);
+        }
+        let rollback_failed = rollback_moved_paths(&moved, &stash);
+        if rollback_failed.is_empty() {
+            let _ = fs::remove_file(&hook_edits_manifest);
+            let _ = fs::remove_file(&manifest);
+            let _ = fs::remove_dir_all(&stash);
+            let _ = fs::remove_file(phase_marker_path());
+            return Err(format!("{err}; rolled back, the working tree is unchanged"));
+        }
+        return Err(format!(
+            "{err}; rollback incomplete for: {}. Files are still in {} — restore them manually.",
+            rollback_failed.join(", "),
+            stash.display()
+        ));
+    }
+
     println!("SENTRITH-BASELINE: started. Stashed {} path(s):", moved.len());
     for m in &moved {
         println!("  {m}");
+    }
+    if !hook_edits.is_empty() {
+        println!(
+            "Reduced advisory-check hooks in {} path(s) (usage capture unaffected):",
+            hook_edits.len()
+        );
+        for h in &hook_edits {
+            println!("  {h}");
+        }
     }
     println!("Measurement hooks and .ai-usage/ were left active; new turns record phase=baseline.");
     println!("Git will show these paths as deleted until you run `sentrith usage baseline stop`.");
     println!("Start a NEW agent session so the stashed instructions are not still in its context.");
     println!("When you have enough baseline tasks: sentrith usage baseline stop");
     Ok(())
+}
+
+/// Move stashed paths back to their live locations for as many `moved`
+/// entries as possible, in reverse order. Returns the entries that could not
+/// be restored, so the caller can decide whether the stash is safe to
+/// delete. Shared by `baseline_start`'s two rollback points.
+fn rollback_moved_paths(moved: &[String], stash: &Path) -> Vec<String> {
+    let mut failed = Vec::new();
+    for path in moved.iter().rev() {
+        let src = stash.join(path);
+        let dst = repo_file(path);
+        if src.exists() && !dst.exists() {
+            if let Err(e) = fs::rename(&src, &dst) {
+                failed.push(format!("{path} ({e})"));
+            }
+        }
+    }
+    failed
 }
 
 enum StashState {
@@ -2546,7 +2747,10 @@ fn inspect_stash(stash: &Path) -> Result<StashState, String> {
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n != "STASHED.txt")
+        // Tracked by HOOK_EDITS.txt, a separate manifest for a separate
+        // restore mechanism (edit-in-place, not move); not a sign of an
+        // unattributable stash on its own.
+        .filter(|n| n != "STASHED.txt" && n != "HOOK_EDITS.txt" && n != "hook-settings-backup")
         .collect();
     if leftovers.is_empty() {
         Ok(StashState::Empty)
@@ -2594,8 +2798,15 @@ fn finish_baseline_stop_cleanup(
     manifest: &Path,
     marker: &Path,
     entries: &[String],
+    hook_edits: &[String],
 ) -> Result<(), String> {
     remove_empty_stash_parents(stash, entries)?;
+    let hook_backup_entries: Vec<String> = hook_edits
+        .iter()
+        .map(|p| format!("hook-settings-backup/{p}"))
+        .collect();
+    remove_empty_stash_parents(stash, &hook_backup_entries)?;
+    let _ = fs::remove_file(stash.join("HOOK_EDITS.txt"));
     match fs::remove_file(manifest) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -2642,10 +2853,22 @@ fn baseline_stop() -> Result<(), String> {
         return Err("no active baseline to stop".into());
     }
     let manifest = stash.join("STASHED.txt");
+    let hook_edits: Vec<String> = read_text(&stash.join("HOOK_EDITS.txt"))
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    for path in &hook_edits {
+        if let Err(e) = restore_hook_settings_backup(path, &repo_file(path), &stash) {
+            println!("SENTRITH-BASELINE: warning: {e}");
+        }
+    }
+
     let entries = match inspect_stash(&stash)? {
         StashState::Listed(paths) => paths,
         StashState::Empty => {
-            finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path(), &[])?;
+            finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path(), &[], &hook_edits)?;
             println!("SENTRITH-BASELINE: stopped; the stash was empty. Phase is standard again.");
             return Ok(());
         }
@@ -2695,8 +2918,11 @@ fn baseline_stop() -> Result<(), String> {
         return Err(msg);
     }
 
-    finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path(), &entries)?;
+    finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path(), &entries, &hook_edits)?;
     println!("SENTRITH-BASELINE: stopped. Restored {restored} path(s); phase is standard again.");
+    if !hook_edits.is_empty() {
+        println!("Restored advisory-check hooks in {} path(s).", hook_edits.len());
+    }
     println!("Start a NEW agent session so the contract is loaded before your next task.");
     Ok(())
 }
@@ -4561,6 +4787,113 @@ mod tests {
         assert!(hooks.get("Other").is_some(), "foreign event is kept");
     }
 
+    #[test]
+    fn workflow_check_detection_distinguishes_advisory_checks_from_capture() {
+        assert!(is_workflow_check_command("./bin/sentrith preflight"));
+        assert!(is_workflow_check_command("./bin/sentrith closeout-check"));
+        assert!(is_workflow_check_command("bin\\sentrith.exe guard"));
+        assert!(is_workflow_check_command("./bin/sentrith review-hint"));
+        assert!(is_workflow_check_command("./bin/sentrith diff-budget"));
+        // Usage capture must keep running during a baseline: it is what
+        // records the baseline turns at all.
+        assert!(!is_workflow_check_command("./bin/sentrith usage hook claude"));
+        assert!(!is_workflow_check_command("./bin/sentrith usage hook codex"));
+        assert!(!is_workflow_check_command("./bin/sentrith usage claude-status"));
+        // A foreign command that happens to contain one of the words must not
+        // match; the binary itself must be Sentrith's.
+        assert!(!is_workflow_check_command("my-own-guard-script"));
+        assert!(!is_workflow_check_command("echo preflight"));
+    }
+
+    #[test]
+    fn baseline_hook_reduction_strips_advisory_checks_and_keeps_capture() {
+        let stash = temp_path("stash-reduce");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{
+  "hooks": {
+    "SessionStart": [{"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith preflight"}]}],
+    "Stop": [
+      {"matcher":"","hooks":[
+        {"type":"command","command":"./bin/sentrith closeout-check"},
+        {"type":"command","command":"./bin/sentrith guard"},
+        {"type":"command","command":"./bin/sentrith review-hint"},
+        {"type":"command","command":"./bin/sentrith diff-budget"}
+      ]},
+      {"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith usage hook claude","timeout":5}]}
+    ],
+    "UserPromptSubmit": [{"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith usage hook claude","timeout":5}]}]
+  },
+  "statusLine": {"type":"command","command":"./bin/sentrith usage claude-status","padding":1}
+}"#).unwrap();
+
+        let changed = reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap();
+        assert!(changed);
+
+        let reduced = read_text(&live);
+        let parsed = json_parse(&reduced).unwrap();
+        assert!(parsed.get("hooks").unwrap().get("SessionStart").is_none(), "preflight's only event is dropped entirely");
+        assert!(reduced.contains("usage hook claude"), "capture hooks must survive");
+        assert!(!reduced.contains("closeout-check"));
+        assert!(!reduced.contains("\"guard\""));
+        assert!(reduced.contains("statusLine"), "statusLine is a terminal display, not agent context; left alone");
+
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert!(backup.exists());
+        let original = read_text(&backup);
+        assert!(original.contains("preflight"), "the original is preserved verbatim for restore");
+    }
+
+    #[test]
+    fn baseline_hook_reduction_round_trips_back_to_the_original() {
+        let stash = temp_path("stash-roundtrip");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("hooks.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook codex"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".codex/hooks.json", &live, &stash).unwrap());
+        assert_ne!(read_text(&live), original, "the live file is reduced while active");
+
+        restore_hook_settings_backup(".codex/hooks.json", &live, &stash).unwrap();
+        assert_eq!(read_text(&live), original, "stop restores the exact original, not a reconstruction");
+        assert!(
+            !stash.join("hook-settings-backup").join(".codex/hooks.json").exists(),
+            "the backup is consumed on restore"
+        );
+    }
+
+    #[test]
+    fn baseline_hook_reduction_is_a_noop_when_nothing_matches() {
+        let stash = temp_path("stash-noop");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("no-workflow-checks.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(!reduce_hook_settings_for_baseline("x", &live, &stash).unwrap());
+        assert_eq!(read_text(&live), original, "nothing to strip means the file is left untouched");
+
+        let missing = temp_path("does-not-exist.json");
+        assert!(!reduce_hook_settings_for_baseline("y", &missing, &stash).unwrap());
+
+        let empty = temp_path("empty.json");
+        fs::write(&empty, "").unwrap();
+        assert!(!reduce_hook_settings_for_baseline("z", &empty, &stash).unwrap());
+    }
+
+    #[test]
+    fn baseline_hook_reduction_reports_malformed_json_without_writing() {
+        let stash = temp_path("stash-malformed");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("broken.json");
+        fs::write(&live, "{not valid json").unwrap();
+
+        let result = reduce_hook_settings_for_baseline("w", &live, &stash);
+        assert!(result.is_err());
+        assert_eq!(read_text(&live), "{not valid json", "a malformed file is left exactly as found");
+    }
+
     fn row(session: &str, sha: &str, success: &str, phase: &str) -> BTreeMap<String, String> {
         let mut m = BTreeMap::new();
         m.insert("session_id".into(), session.into());
@@ -4784,7 +5117,7 @@ mod tests {
             .into_iter()
             .filter_map(|item| match item {
                 NumstatZItem::Path(p) => Some(p),
-                NumstatZItem::Commit(_) => None,
+                _ => None,
             })
             .collect();
         assert!(paths.contains(&"src/a.rs".to_string()));
@@ -4793,19 +5126,20 @@ mod tests {
     }
 
     #[test]
-    fn numstat_z_records_a_rename_by_its_destination_path() {
+    fn numstat_z_records_a_rename_with_both_names() {
         // Byte layout verified against a real repo: `git show --numstat -z`
         // for a rename is `added\tdeleted\t` + an empty NUL-terminated field
-        // (the rename marker), then the old path, then the new path.
+        // (the rename marker), then the old path, then the new path. Both
+        // names are kept on the item; which one(s) a caller uses depends on
+        // whether it is building the measured commit's file set (new only)
+        // or scanning later history for touches (both).
         let text = "0\t0\t\0old.txt\0new.txt\0";
-        let paths: Vec<String> = parse_numstat_z(text)
-            .into_iter()
-            .filter_map(|item| match item {
-                NumstatZItem::Path(p) => Some(p),
-                NumstatZItem::Commit(_) => None,
-            })
-            .collect();
-        assert_eq!(paths, vec!["new.txt".to_string()], "only the destination is recorded");
+        let items = parse_numstat_z(text);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            NumstatZItem::Rename { old, new } if old == "old.txt" && new == "new.txt"
+        ));
     }
 
     #[test]
@@ -4822,6 +5156,37 @@ mod tests {
         assert!(matches!(&items[3], NumstatZItem::Path(p) if p == "other.txt"));
     }
 
+    /// Mirrors how `churn_for_commit` itself flattens `parse_numstat_z`
+    /// output, so these tests exercise the exact asymmetry the fix relies on
+    /// rather than a simplified stand-in for it.
+    fn measured_files(text: &str) -> BTreeSet<String> {
+        parse_numstat_z(text)
+            .into_iter()
+            .filter_map(|item| match item {
+                NumstatZItem::Path(p) => Some(p),
+                NumstatZItem::Rename { new, .. } => Some(new),
+                NumstatZItem::Commit(_) => None,
+            })
+            .collect()
+    }
+
+    fn touched_paths(text: &str) -> BTreeSet<String> {
+        let mut touched = BTreeSet::new();
+        for item in parse_numstat_z(text) {
+            match item {
+                NumstatZItem::Path(p) => {
+                    touched.insert(p);
+                }
+                NumstatZItem::Rename { old, new } => {
+                    touched.insert(old);
+                    touched.insert(new);
+                }
+                NumstatZItem::Commit(_) => {}
+            }
+        }
+        touched
+    }
+
     #[test]
     fn churn_matches_a_renamed_file_by_its_destination_path() {
         // The bug this fixes: a rename with a common-prefix path renders as
@@ -4829,25 +5194,27 @@ mod tests {
         // line-based tab-splitting stored as one literal, unmatchable path,
         // so a later edit of the file under its new name never intersected
         // it and churn was always undercounted across a rename.
-        let measured_commit = "0\t0\t\0old.txt\0new.txt\0";
-        let files: BTreeSet<String> = parse_numstat_z(measured_commit)
-            .into_iter()
-            .filter_map(|item| match item {
-                NumstatZItem::Path(p) => Some(p),
-                NumstatZItem::Commit(_) => None,
-            })
-            .collect();
-
-        let later_log = "COMMIT 200\01\t0\tnew.txt\0";
-        let touched: BTreeSet<String> = parse_numstat_z(later_log)
-            .into_iter()
-            .filter_map(|item| match item {
-                NumstatZItem::Path(p) => Some(p),
-                NumstatZItem::Commit(_) => None,
-            })
-            .collect();
-
+        let files = measured_files("0\t0\t\0old.txt\0new.txt\0");
+        let touched = touched_paths("COMMIT 200\01\t0\tnew.txt\0");
         assert_eq!(files.intersection(&touched).count(), 1, "new.txt must match on both sides of the rename");
+    }
+
+    #[test]
+    fn churn_matches_a_file_later_renamed_by_its_original_name() {
+        // The opposite direction: the measured commit is a plain edit (no
+        // rename), and a later commit renames the file. The old name must
+        // still be recognized as touched, or churn stays 0% across a rename
+        // that happens after measurement instead of within the measured
+        // commit itself.
+        let files = measured_files("2\t1\ta.txt\0");
+        let touched = touched_paths("COMMIT 200\00\t0\t\0a.txt\0b.txt\0");
+        assert_eq!(files.intersection(&touched).count(), 1, "a.txt must match its own later rename");
+
+        // The measured file set itself must not double-count a rename: only
+        // the destination is a "file" from the measured commit's own
+        // perspective, so a rename there keeps the denominator at 1.
+        let rename_as_measured = measured_files("0\t0\t\0old.txt\0new.txt\0");
+        assert_eq!(rename_as_measured.len(), 1);
     }
 
     #[test]
@@ -4868,7 +5235,7 @@ mod tests {
             ".github/copilot-instructions.md".to_string(),
             ".claude/skills".to_string(),
         ];
-        finish_baseline_stop_cleanup(&stash, &manifest, &marker, &entries).unwrap();
+        finish_baseline_stop_cleanup(&stash, &manifest, &marker, &entries, &[]).unwrap();
 
         assert!(
             !stash.exists(),
@@ -4890,7 +5257,7 @@ mod tests {
         fs::write(&manifest, "AGENTS.md\n").unwrap();
         fs::write(stash.join("unexpected"), "keep me").unwrap();
 
-        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[]).unwrap_err();
+        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[], &[]).unwrap_err();
         assert!(error.contains("baseline stash"));
         assert!(marker.exists(), "the phase marker must remain active");
         assert!(stash.exists(), "the stash must remain recoverable");
@@ -4906,7 +5273,7 @@ mod tests {
         let manifest = stash.join("STASHED.txt");
         fs::write(&manifest, "AGENTS.md\n").unwrap();
 
-        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[]).unwrap_err();
+        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[], &[]).unwrap_err();
         assert!(error.contains("phase marker"));
         assert!(marker.is_dir());
         assert!(stash.exists(), "an empty stash keeps baseline_active true");
