@@ -1497,20 +1497,40 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
             replace_file_preserving_security(&tmp, &settings_path, None)?;
         } else {
             // A fresh install has nothing pre-existing to protect --
-            // `rendered` is only Sentrith's own default hooks -- so this
-            // writes directly with ordinary default/inherited permissions,
-            // rather than routing through write_secure_temp_file's narrow,
-            // owner-only creation the way the `existed` branch does. Nothing
-            // widens a brand-new file's permissions afterward the way
-            // copy_file_permissions does for an existing one, so that narrow
-            // creation would become this file's *permanent* permissions --
-            // which has broken environments where a different account also
-            // needs to read it (e.g. a sandboxed agent process running as
-            // another user), confirmed empirically: a fresh install locked
-            // the file to Owner/SYSTEM/Administrators only on Windows, where
-            // normal new files in the same directory inherit access for
-            // several other accounts.
-            fs::write(&settings_path, &rendered).map_err(|e| e.to_string())?;
+            // `rendered` is only Sentrith's own default hooks -- so this uses
+            // ordinary default/inherited permissions rather than
+            // write_secure_temp_file's narrow, owner-only creation the way
+            // the `existed` branch does. Nothing widens a brand-new file's
+            // permissions afterward the way copy_file_permissions does for
+            // an existing one, so that narrow creation would become this
+            // file's *permanent* permissions -- confirmed empirically: it
+            // locked the file to Owner/SYSTEM/Administrators only on
+            // Windows, where normal new files in the same directory inherit
+            // access for several other accounts (breaking a sandboxed agent
+            // process running as one of them).
+            //
+            // Still staged through an exclusively created temp file and
+            // renamed into place, rather than a single fs::write straight to
+            // settings_path: an interrupted or partial write to the final
+            // path directly would leave truncated JSON there, and a retry
+            // would then see an "existing" file it can't parse, requiring
+            // manual deletion to recover from an install that itself
+            // reported failure. create_new refuses to reuse or follow
+            // anything already at the temp path, same reasoning as
+            // write_secure_temp_file, just without forcing owner-only
+            // permissions on what becomes the final file.
+            let tmp = settings_path.with_extension("json.sentrith-tmp");
+            let _ = fs::remove_file(&tmp);
+            {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+                    .map_err(|e| e.to_string())?;
+                file.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
+            }
+            fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
         }
         touched += 1;
 
@@ -2930,6 +2950,24 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
         }
     }
 
+    // Read `live` fallibly, up front, before touching the backup or digest
+    // at all: a failure here (a transient sharing violation, a permission
+    // glitch) is not evidence of a conflict -- it just means this attempt
+    // cannot tell either way. Returning early on it, rather than folding it
+    // into the divergence check below the way `read_text` would, keeps a
+    // retry able to tell a real conflict from a transient one once the
+    // failure clears; folding it in would treat "can't read" the same as
+    // "confirmed different" and permanently move the backup to
+    // baseline-hook-conflicts for something never actually verified to be
+    // an edit.
+    let live_content = fs::read_to_string(live).map_err(|e| {
+        format!(
+            "failed to read {} to check for changes made during baseline: {e}; \
+             left the backup and digest in place so this can be retried",
+            live.display()
+        )
+    })?;
+
     // Fail closed: a missing, unreadable, or malformed digest means there is
     // no way to tell whether `live` was edited during baseline, and treating
     // that as "not diverged" would silently overwrite a genuine edit with
@@ -2940,7 +2978,7 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     let diverged = read_text(&digest_path)
         .trim()
         .parse::<u64>()
-        .map(|expected| expected != content_digest(&read_text(live)))
+        .map(|expected| expected != content_digest(&live_content))
         .unwrap_or(true);
     if diverged {
         // Move the conflict out of the stash entirely (rather than leaving it
@@ -3445,20 +3483,56 @@ fn baseline_stop() -> Result<(), String> {
     }
     let manifest = stash.join("STASHED.txt");
     // Restore by scanning the fixed candidate list -- the same one `start`
-    // reduces from -- rather than trusting HOOK_EDITS.txt. That manifest is
-    // written only after a path's live file has already been reduced, so an
-    // interruption in between would otherwise leave a reduced file with
-    // nothing telling `stop` to restore it. `restore_hook_settings_backup`
-    // already no-ops when a path has no backup, so scanning every candidate
-    // is safe regardless of whether it was ever actually reduced.
+    // reduces from -- rather than *only* trusting HOOK_EDITS.txt. That
+    // manifest is written only after a path's live file has already been
+    // reduced, so an interruption in between would otherwise leave a
+    // reduced file with nothing telling `stop` to restore it.
+    // `restore_hook_settings_backup` already no-ops when a path has no
+    // backup, so scanning every candidate is safe regardless of whether it
+    // was ever actually recorded.
+    //
+    // The journal is still cross-checked, in the other direction: `Ok(false)`
+    // ("nothing to restore") is only actually safe for a path the journal
+    // never claimed was reduced. For a path it *does* name, `Ok(false)`
+    // means the expected backup is missing without ever having been
+    // restored -- external cleanup, a partial manual recovery -- and
+    // treating that the same as "never reduced" would report success while
+    // `live` is still silently sitting in its reduced state.
+    let journaled: Vec<String> = read_text(&stash.join("HOOK_EDITS.txt"))
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
     let hook_edits: Vec<String> = BASELINE_HOOK_SETTINGS_PATHS.iter().map(|s| s.to_string()).collect();
     let mut hook_edits_restored = 0;
+    let mut hook_restore_failed: Vec<String> = Vec::new();
     for path in &hook_edits {
         match restore_hook_settings_backup(path, &repo_file(path), &stash) {
             Ok(true) => hook_edits_restored += 1,
-            Ok(false) => {}
+            Ok(false) => {
+                if journaled.iter().any(|p| p == path) {
+                    hook_restore_failed.push(format!(
+                        "{path} (journaled as reduced during this baseline, but no backup was found to restore from)"
+                    ));
+                }
+            }
             Err(e) => println!("SENTRITH-BASELINE: warning: {e}"),
         }
+    }
+    if !hook_restore_failed.is_empty() {
+        // Keep the baseline active rather than reporting success: the
+        // journal says these paths' hooks were reduced, and there is no
+        // evidence they were ever restored. Clearing the phase marker here
+        // would silently label following turns `standard` while Sentrith's
+        // advisory hooks are still missing for these paths.
+        return Err(format!(
+            "baseline stop found reduced hook settings it could not confirm were restored: {}. \
+             The stash is kept at {} and the phase marker still reads `baseline`. \
+             Resolve manually, then run `sentrith usage baseline stop` again.",
+            hook_restore_failed.join(", "),
+            stash.display()
+        ));
     }
 
     let entries = match inspect_stash(&stash)? {
@@ -5655,6 +5729,40 @@ mod tests {
 
         assert!(result.is_err(), "must not silently treat two unreadable files as an already-completed restore: {result:?}");
         assert_eq!(fs::read(&live).unwrap(), live_bytes, "live must be left untouched");
+    }
+
+    #[test]
+    fn restore_leaves_the_backup_in_place_when_live_is_only_transiently_unreadable() {
+        // A read failure on `live` (invalid UTF-8 here, standing in for any
+        // transient failure such as a sharing violation) must not be folded
+        // into the divergence check and treated as a confirmed edit: that
+        // would permanently move the backup out to baseline-hook-conflicts
+        // for something that was never actually verified to differ, instead
+        // of letting a retry re-check once the failure clears.
+        let stash = temp_path("stash-live-unreadable");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        let reduced_bytes = fs::read(&live).unwrap();
+
+        // Corrupt only `live`; `backup` stays perfectly readable, so the
+        // retry-cleanup fast path correctly does not apply here either.
+        fs::write(&live, [0x7b, 0xff, 0xfe, 0x7d]).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+
+        assert!(result.is_err(), "an unreadable live must not be treated as safe to overwrite: {result:?}");
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert!(backup.exists(), "the backup must stay at its known path for a retry to find, not be moved to baseline-hook-conflicts");
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        assert!(digest.exists(), "the digest must survive too, so a retry can still tell a real conflict from this transient one");
+        assert!(
+            !stash.parent().unwrap().join("baseline-hook-conflicts").exists(),
+            "nothing was ever confirmed to be a conflict, so nothing should be filed as one"
+        );
+        assert_ne!(fs::read(&live).unwrap(), reduced_bytes, "live is left exactly as this attempt found it, still corrupted");
     }
 
     #[test]
