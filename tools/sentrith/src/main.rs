@@ -2607,6 +2607,24 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
         return Ok(false);
     }
     let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
+
+    // A retry after an earlier attempt: the live replacement below already
+    // succeeded, but a later step (removing the backup or digest) failed and
+    // the function returned Err. `live` now holds the *restored* original,
+    // not the reduced content the digest describes, so comparing it against
+    // the digest here would misread this state as a conflict and bury an
+    // already-correct file's backup for no reason. `reduce_hook_settings_for_baseline`
+    // only ever creates a backup when the reduction actually changed
+    // something, so `live` cannot legitimately equal `backup`'s content
+    // unless the replacement already happened -- that equality is what
+    // distinguishes this case from a genuinely fresh restore, without
+    // needing any separate persisted state. Once detected, skip straight to
+    // cleanup rather than touching `live` or running divergence detection
+    // again.
+    if fs::metadata(live).is_ok() && read_text(live) == read_text(&backup) {
+        return finish_hook_restore_cleanup(&backup, &digest_path, live);
+    }
+
     let diverged = read_text(&digest_path)
         .trim()
         .parse::<u64>()
@@ -2684,10 +2702,18 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // file's security descriptor was, instead of silently adopting the
     // backup's.
     replace_file_preserving_security(&tmp, live, None)?;
+    finish_hook_restore_cleanup(&backup, &digest_path, live)
+}
 
+/// Remove a hook-settings backup and its digest once `live` already holds
+/// the restored content, whether that replacement just happened or was
+/// confirmed on a retry (see the equality check at the top of
+/// `restore_hook_settings_backup`). Split out so both paths share the same
+/// cleanup and the same failure handling.
+fn finish_hook_restore_cleanup(backup: &Path, digest_path: &Path, live: &Path) -> Result<bool, String> {
     // Defensive: on Windows, a read-only file refuses to delete. In this
-    // codebase the backup created above does not currently end up read-only
-    // even from a read-only original -- `replace_file_preserving_security`
+    // codebase the backup created during reduce does not currently end up
+    // read-only even from a read-only original -- `replace_file_preserving_security`
     // clears the destination's read-only attribute before ReplaceFileW runs,
     // so ReplaceFileW's backup is made from the already-cleared file -- but
     // clearing it here anyway (rather than assuming that stays true) costs
@@ -2696,20 +2722,23 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // unremovable backup keeps `hook-settings-backup` non-empty, which later
     // fails the stash directory's removal and strands the phase marker at
     // `baseline`.
-    if let Ok(metadata) = fs::metadata(&backup) {
+    if let Ok(metadata) = fs::metadata(backup) {
         let mut perms = metadata.permissions();
         if perms.readonly() {
             perms.set_readonly(false);
-            let _ = fs::set_permissions(&backup, perms);
+            let _ = fs::set_permissions(backup, perms);
         }
     }
-    fs::remove_file(&backup).map_err(|e| {
+    fs::remove_file(backup).map_err(|e| {
         format!("restored {} but could not remove its backup {}: {e}", live.display(), backup.display())
     })?;
-    // Only removed once the backup is confirmed gone: as long as the digest
-    // survives, a retry after an interruption here still finds a backup with
-    // its digest intact and can safely retry the whole restore.
-    fs::remove_file(&digest_path).map_err(|e| {
+    // Only removed once the backup is confirmed gone. If this step or the one
+    // above fails, the digest may still describe the pre-restore reduced
+    // content while `live` already holds the restored original -- exactly
+    // the mismatch the equality check at the top of the caller exists to
+    // recognize, so a retry still finds its way back here rather than
+    // running divergence detection against a digest that no longer applies.
+    fs::remove_file(digest_path).map_err(|e| {
         format!("restored {} but could not remove its digest {}: {e}", live.display(), digest_path.display())
     })?;
     Ok(true)
@@ -5109,6 +5138,37 @@ mod tests {
         assert!(
             !stash.join("hook-settings-backup").join(".codex/hooks.json").exists(),
             "the backup is consumed on restore"
+        );
+    }
+
+    #[test]
+    fn restore_hook_settings_backup_retries_cleanup_without_a_false_conflict() {
+        // Simulates an earlier restore attempt whose live replacement
+        // already succeeded, but whose cleanup (removing the backup or
+        // digest) failed and left them behind -- e.g. a transient sharing
+        // violation on Windows. A retry must recognize that `live` already
+        // holds the restored original and finish cleanup, not compare it
+        // against the reduced-content digest and misreport a conflict.
+        let stash = temp_path("stash-retry-cleanup");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        // The earlier attempt's live replacement already committed.
+        fs::write(&live, original).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        assert!(result.is_ok(), "a retry after live was already restored must not report a conflict: {result:?}");
+        assert_eq!(read_text(&live), original, "the already-restored content must be left as is");
+        assert!(
+            !stash.join("hook-settings-backup").join(".claude/settings.json").exists(),
+            "the leftover backup must still be cleaned up"
+        );
+        assert!(
+            !stash.parent().unwrap().join("baseline-hook-conflicts").exists(),
+            "no conflict must be filed for a file that was already correctly restored"
         );
     }
 
