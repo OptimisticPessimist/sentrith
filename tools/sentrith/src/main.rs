@@ -2621,7 +2621,24 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
         // path, so it lands next to the stash wherever that actually is
         // (matters for tests, and keeps the eventual rename on one volume).
         let conflict_root = stash.parent().unwrap_or(stash);
-        let conflict = conflict_root.join("baseline-hook-conflicts").join(rel_path);
+        let conflict_dir = conflict_root.join("baseline-hook-conflicts");
+        // A conflict from an *earlier* baseline may still be sitting here
+        // unresolved -- nothing blocks starting a new baseline while one is
+        // pending. Never rename onto it: that would silently destroy the
+        // only copy of the original the user was told to merge by hand.
+        // Walk numbered variants until an unused path is found instead.
+        let mut conflict = conflict_dir.join(rel_path);
+        if conflict.exists() {
+            let mut n = 1u32;
+            loop {
+                let candidate = conflict_dir.join(format!("{rel_path}.conflict-{n}"));
+                if !candidate.exists() {
+                    conflict = candidate;
+                    break;
+                }
+                n += 1;
+            }
+        }
         if let Some(parent) = conflict.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -2649,13 +2666,52 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     fs::copy(&backup, &tmp).map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
     #[cfg(not(windows))]
     copy_file_permissions(live, &tmp)?;
+    // `fs::copy` on Windows carries the source's attributes, so `tmp` inherits
+    // `backup`'s read-only bit if it has one; ReplaceFileW consumes (deletes)
+    // its replacement file as part of the swap, and a read-only replacement
+    // makes that fail. `tmp` is a disposable scratch file either way, so it
+    // must never stay read-only regardless of what `backup` was.
+    #[cfg(windows)]
+    if let Ok(metadata) = fs::metadata(&tmp) {
+        let mut perms = metadata.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&tmp, perms);
+        }
+    }
     // As in `reduce`: on Windows, replacing through `ReplaceFileW` (rather
     // than a raw rename) is what actually preserves whatever the reduced
     // file's security descriptor was, instead of silently adopting the
     // backup's.
     replace_file_preserving_security(&tmp, live, None)?;
-    let _ = fs::remove_file(&backup);
-    let _ = fs::remove_file(&digest_path);
+
+    // Defensive: on Windows, a read-only file refuses to delete. In this
+    // codebase the backup created above does not currently end up read-only
+    // even from a read-only original -- `replace_file_preserving_security`
+    // clears the destination's read-only attribute before ReplaceFileW runs,
+    // so ReplaceFileW's backup is made from the already-cleared file -- but
+    // clearing it here anyway (rather than assuming that stays true) costs
+    // nothing and closes the failure mode for good if that ever changes. Not
+    // ignoring the removal failure matters regardless of the cause: an
+    // unremovable backup keeps `hook-settings-backup` non-empty, which later
+    // fails the stash directory's removal and strands the phase marker at
+    // `baseline`.
+    if let Ok(metadata) = fs::metadata(&backup) {
+        let mut perms = metadata.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&backup, perms);
+        }
+    }
+    fs::remove_file(&backup).map_err(|e| {
+        format!("restored {} but could not remove its backup {}: {e}", live.display(), backup.display())
+    })?;
+    // Only removed once the backup is confirmed gone: as long as the digest
+    // survives, a retry after an interruption here still finds a backup with
+    // its digest intact and can safely retry the whole restore.
+    fs::remove_file(&digest_path).map_err(|e| {
+        format!("restored {} but could not remove its digest {}: {e}", live.display(), digest_path.display())
+    })?;
     Ok(true)
 }
 
@@ -2801,10 +2857,20 @@ fn baseline_start() -> Result<(), String> {
         }
     }
     if let Some(err) = hook_edit_failure {
+        // Failures here must block deleting the stash below just as much as a
+        // failed contract-file rollback does: the backup this would discard
+        // is the only copy of that path's original, unreduced hooks, and a
+        // path whose restore failed is still sitting reduced in the working
+        // tree -- deleting the stash on top of that would erase the only way
+        // to recover it while claiming "the working tree is unchanged".
+        let mut hook_restore_failed: Vec<String> = Vec::new();
         for path in hook_edits.iter().rev() {
-            let _ = restore_hook_settings_backup(path, &repo_file(path), &stash);
+            if let Err(e) = restore_hook_settings_backup(path, &repo_file(path), &stash) {
+                hook_restore_failed.push(format!("{path} ({e})"));
+            }
         }
-        let rollback_failed = rollback_moved_paths(&moved, &stash);
+        let mut rollback_failed = rollback_moved_paths(&moved, &stash);
+        rollback_failed.extend(hook_restore_failed);
         if rollback_failed.is_empty() {
             let _ = fs::remove_file(&hook_edits_manifest);
             let _ = fs::remove_file(&manifest);
@@ -5205,6 +5271,63 @@ mod tests {
             .join("baseline-hook-conflicts")
             .join(".claude/settings.json");
         assert!(conflict.exists(), "the pre-baseline original must be preserved at the conflict path");
+    }
+
+    #[test]
+    fn baseline_hook_conflict_never_overwrites_an_earlier_unresolved_conflict() {
+        let stash = temp_path("stash-conflict-unique");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        // An earlier baseline already left an unresolved conflict at the
+        // fixed path this rel_path maps to; nothing blocks starting a new
+        // baseline while it sits there unmerged.
+        let conflict_root = stash.parent().unwrap();
+        let earlier_conflict = conflict_root.join("baseline-hook-conflicts").join(".claude/settings.json");
+        fs::create_dir_all(earlier_conflict.parent().unwrap()).unwrap();
+        fs::write(&earlier_conflict, "EARLIER-UNRESOLVED-ORIGINAL").unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"custom":true}}"#).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        assert!(result.is_err(), "must refuse rather than silently discard the edit");
+
+        assert_eq!(
+            read_text(&earlier_conflict),
+            "EARLIER-UNRESOLVED-ORIGINAL",
+            "an earlier unresolved conflict must never be silently replaced"
+        );
+        let new_conflict = conflict_root.join("baseline-hook-conflicts").join(".claude/settings.json.conflict-1");
+        assert!(new_conflict.exists(), "the new conflict must be preserved at a distinct path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_removes_a_read_only_backup_file() {
+        // Simulates a backup that ended up read-only for any reason (an
+        // inherited directory ACL, a manual edit, or a future change to how
+        // it's created): empirically, a backup created from a read-only
+        // original via the current reduce path does NOT end up read-only
+        // (replace_file_preserving_security clears the destination's
+        // read-only attribute before ReplaceFileW runs, so ReplaceFileW's
+        // own backup is made from the already-cleared file) -- but restore
+        // must not depend on that happening to be true today.
+        let stash = temp_path("stash-readonly-backup");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        let mut perms = fs::metadata(&backup).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&backup, perms).unwrap();
+
+        assert!(restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap());
+        assert!(!backup.exists(), "a read-only backup must still be removed after a successful restore, not left behind");
     }
 
     fn row(session: &str, sha: &str, success: &str, phase: &str) -> BTreeMap<String, String> {
