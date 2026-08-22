@@ -1230,6 +1230,36 @@ fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
     Ok(unsafe { fs::File::from_raw_handle(handle as *mut std::ffi::c_void) })
 }
 
+/// Write `content` to a freshly, exclusively created `tmp`, never exposing
+/// it more broadly than necessary during the window before a caller swaps it
+/// into place: on Unix, created at mode 0600 from the moment `open()`
+/// creates it; on Windows, via `create_file_owner_only`'s narrow DACL.
+/// Either way, `create_new`/`CREATE_NEW` refuses to reuse an existing file
+/// or follow a symlink at this predictable path -- a stale leftover from an
+/// interrupted older run, or one placed there in a shared writable
+/// repository, is removed first rather than written through. Shared by every
+/// caller that stages a full settings file (which may hold content the user
+/// never intended to expose more broadly, such as an unrelated existing
+/// hook's own secrets) before an atomic replace.
+fn write_secure_temp_file(tmp: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    let _ = fs::remove_file(tmp);
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(tmp)
+            .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))?
+    };
+    #[cfg(windows)]
+    let mut file = create_file_owner_only(tmp)?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))
+}
+
 fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
     let dry_run = opts.contains_key("dry-run");
     let mut touched = 0;
@@ -1247,7 +1277,18 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
         let settings_path = repo_file(t.settings);
         let existed = settings_path.exists();
         let mut settings = if existed {
-            let raw = read_text(&settings_path);
+            // Read fallibly rather than through `read_text`, which folds a
+            // read failure (invalid UTF-8, a transient permission error)
+            // into the same empty string as a genuinely empty file --
+            // silently treating the whole existing configuration as
+            // nonexistent and about to be replaced with Sentrith-only
+            // settings, discarding whatever it actually held.
+            let raw = fs::read_to_string(&settings_path).map_err(|e| {
+                format!(
+                    "failed to read {}: {e}; fix or move it before running hooks install",
+                    t.settings
+                )
+            })?;
             if raw.trim().is_empty() {
                 Json::Obj(Vec::new())
             } else {
@@ -1327,7 +1368,12 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
             fs::copy(&settings_path, &backup).map_err(|e| e.to_string())?;
         }
         let tmp = settings_path.with_extension("json.sentrith-tmp");
-        fs::write(&tmp, &rendered).map_err(|e| e.to_string())?;
+        // `rendered` is the full settings file, including whatever the user
+        // already had beyond Sentrith's own hooks; write_secure_temp_file
+        // keeps it from sitting exposed under default/inherited permissions
+        // even briefly, and never reuses or follows a stale file or symlink
+        // left at this predictable path.
+        write_secure_temp_file(&tmp, &rendered)?;
         #[cfg(not(windows))]
         if existed {
             copy_file_permissions(&settings_path, &tmp)?;
@@ -2675,57 +2721,13 @@ fn reduce_hook_settings_for_baseline(
         .map_err(|e| format!("failed to record the baseline snapshot for {}: {e}", live.display()))?;
 
     let tmp = live.with_extension("sentrith-baseline-tmp");
-    // On Unix, create the temp file with restrictive permissions from the
-    // moment it exists rather than tightening them after the fact: a plain
-    // `fs::write` creates it at the process's default mode (commonly 0644
-    // under a typical umask) and only `copy_file_permissions` below narrows
-    // it, leaving a window where another local user can open the file --
-    // holding the full reduced settings, unrelated secrets included -- and
-    // keep read access even after the mode is tightened, since permission
-    // checks happen at open(), not on each read. Requesting 0600 up front
-    // (itself still subject to umask, never loosened by it) closes that
-    // window; copy_file_permissions still runs afterward to match `live`'s
-    // actual mode, which may end up looser or tighter than 0600.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        // `mode(0o600)` only applies when `open()` itself creates the file;
-        // on an existing path (a permissive leftover from an interrupted
-        // older run, or a symlink someone left at this predictable name in a
-        // shared writable repository) `.create(true)` reuses it as-is, mode
-        // and all, and `.truncate(true)` only clears its content, not its
-        // permissions or its symlink-ness. Removing whatever is at `tmp`
-        // first, then creating with `create_new` (which fails rather than
-        // following a symlink or reusing an existing file), guarantees the
-        // sensitive content only ever lands in a file this call itself just
-        // created at exactly the requested mode.
-        let _ = fs::remove_file(&tmp);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
-        file.write_all(reduced.as_bytes())
-            .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
-    }
-    // On Windows, a plain `fs::write` would create the temp file under the
-    // parent directory's inherited DACL, which can be broader than `live`'s
-    // own -- exposing the full reduced settings to anyone that DACL permits,
-    // until the swap below. `create_file_owner_only` creates it fresh with a
-    // fixed, narrow DACL (owner/SYSTEM/Administrators only) instead; stale
-    // leftovers are removed first since CREATE_NEW refuses to reuse or
-    // follow whatever is already at this predictable path, for the same
-    // reason the Unix branch above does.
-    #[cfg(windows)]
-    {
-        use std::io::Write;
-        let _ = fs::remove_file(&tmp);
-        let mut file = create_file_owner_only(&tmp)?;
-        file.write_all(reduced.as_bytes())
-            .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
-    }
+    // `write_secure_temp_file` never lets the full reduced settings --
+    // unrelated secrets included -- sit exposed under default/inherited
+    // permissions even briefly; `copy_file_permissions` below still narrows
+    // (or widens) the result to match `live`'s actual mode on Unix, since
+    // the temp file's own fixed mode is only meant to hold for this window,
+    // not to be the final permissions.
+    write_secure_temp_file(&tmp, &reduced)?;
     #[cfg(not(windows))]
     copy_file_permissions(live, &tmp)?;
     // `backup` is created here, atomically with the live replacement on
@@ -5600,6 +5602,35 @@ mod tests {
             "untouched",
             "the stale symlink's target must never receive the reduced content"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_temp_file_creates_at_restrictive_mode_and_refuses_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The function `hooks_install` now shares with baseline reduction:
+        // exercised directly here (rather than only indirectly, through
+        // reduce's own tests) since it's the exact entry point hooks_install
+        // depends on for the same secure-temp-file guarantee.
+        let tmp = temp_path("secure-temp.json");
+        write_secure_temp_file(&tmp, "content").unwrap();
+        assert_eq!(read_text(&tmp), "content");
+        assert_eq!(
+            fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "must be created at a restrictive mode regardless of which caller uses it"
+        );
+
+        let elsewhere = temp_path("elsewhere.json");
+        fs::write(&elsewhere, "untouched").unwrap();
+        fs::remove_file(&tmp).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
+
+        write_secure_temp_file(&tmp, "new-content").unwrap();
+        assert!(!tmp.is_symlink(), "a stale symlink at the temp path must be replaced, not followed");
+        assert_eq!(read_text(&tmp), "new-content");
+        assert_eq!(read_text(&elsewhere), "untouched", "the stale symlink's target must never receive the content");
     }
 
     #[test]
