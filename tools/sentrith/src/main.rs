@@ -1011,13 +1011,34 @@ fn copy_file_permissions(original: &Path, replacement: &Path) -> Result<(), Stri
     fs::set_permissions(replacement, permissions).map_err(|e| e.to_string())
 }
 
+/// Replace `destination` with `replacement`'s content. When `backup_destination`
+/// is given, a copy of `destination`'s pre-replacement content is written
+/// there first, carrying as much of `destination`'s security metadata as
+/// this platform's tooling supports -- on Windows that copy is made by the OS
+/// as part of the same atomic `ReplaceFileW` call and is documented to carry
+/// the original's full security descriptor, which this project has no other
+/// way to reproduce for a brand-new file without a new dependency; elsewhere
+/// it is a plain copy plus the mode bits `copy_file_permissions` already
+/// knows how to carry over.
 #[cfg(not(windows))]
-fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> Result<(), String> {
+fn replace_file_preserving_security(
+    replacement: &Path,
+    destination: &Path,
+    backup_destination: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(backup) = backup_destination {
+        fs::copy(destination, backup).map_err(|e| e.to_string())?;
+        copy_file_permissions(destination, backup)?;
+    }
     fs::rename(replacement, destination).map_err(|e| e.to_string())
 }
 
 #[cfg(windows)]
-fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> Result<(), String> {
+fn replace_file_preserving_security(
+    replacement: &Path,
+    destination: &Path,
+    backup_destination: Option<&Path>,
+) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
     const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
@@ -1048,6 +1069,14 @@ fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> R
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    let backup_wide: Vec<u16> = backup_destination
+        .map(|p| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect())
+        .unwrap_or_default();
+    let backup_ptr = if backup_destination.is_some() {
+        backup_wide.as_ptr()
+    } else {
+        std::ptr::null()
+    };
     let original_attributes = unsafe { GetFileAttributesW(replaced.as_ptr()) };
     if original_attributes == INVALID_FILE_ATTRIBUTES {
         return Err(format!(
@@ -1074,7 +1103,7 @@ fn replace_file_preserving_security(replacement: &Path, destination: &Path) -> R
         ReplaceFileW(
             replaced.as_ptr(),
             replacement.as_ptr(),
-            std::ptr::null(),
+            backup_ptr,
             0,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -1213,7 +1242,7 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
             copy_file_permissions(&settings_path, &tmp)?;
         }
         if existed {
-            replace_file_preserving_security(&tmp, &settings_path)?;
+            replace_file_preserving_security(&tmp, &settings_path, None)?;
         } else {
             fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
         }
@@ -2390,7 +2419,7 @@ fn migrate_usage_file_if_needed(path: &Path) -> Result<(), String> {
     fs::write(&tmp, out).map_err(|e| e.to_string())?;
     #[cfg(not(windows))]
     copy_file_permissions(path, &tmp)?;
-    replace_file_preserving_security(&tmp, path)?;
+    replace_file_preserving_security(&tmp, path, None)?;
     Ok(())
 }
 
@@ -2457,6 +2486,18 @@ fn baseline_stash_dir() -> PathBuf {
     PathBuf::from(".sentrith-private/baseline-stash")
 }
 
+/// A cheap, non-cryptographic content digest used purely to detect whether a
+/// file changed between two points in time on this machine -- not a security
+/// boundary, so `std::hash`'s built-in hasher (no dependency needed) is
+/// entirely adequate; nothing here defends against a motivated adversary
+/// crafting a collision, only against accidentally comparing stale bytes.
+fn content_digest(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Strip a hook-settings file's advisory-check entries for the duration of a
 /// baseline, backing up the original so `baseline stop` can restore it
 /// verbatim rather than reconstructing it from the shipped example (which
@@ -2473,6 +2514,19 @@ fn reduce_hook_settings_for_baseline(
     live: &Path,
     stash: &Path,
 ) -> Result<bool, String> {
+    // A symlinked settings file (common under dotfile managers) must not be
+    // touched: `fs::write` follows the link and would reduce whatever it
+    // points at -- possibly shared across other projects -- and restoring by
+    // rename would later replace the symlink itself with a plain file,
+    // permanently breaking the link. Skipping is reported like a malformed
+    // file: the caller treats it as a warning and this path is simply not
+    // reduced for this baseline.
+    if live.is_symlink() {
+        return Err(format!(
+            "{} is a symlink; leaving it untouched for baseline rather than rewriting or breaking whatever it points at",
+            live.display()
+        ));
+    }
     if !live.exists() {
         return Ok(false);
     }
@@ -2508,41 +2562,37 @@ fn reduce_hook_settings_for_baseline(
         )
     })?;
 
-    // Capture the live file's permissions before creating anything. Both the
-    // backup and the reduced live file get it applied explicitly below: a
-    // fresh `fs::write` always uses the process's default create-mode, which
-    // for a restricted file (e.g. `.claude/settings.json` at 0600 under the
-    // usual 022 umask) is looser than the original -- and the backup holds
-    // the *complete* original content, unreduced, for as long as the
-    // baseline runs, so leaving it at the default mode would expose whatever
-    // the original permissions were restricting for that whole window.
-    let perms = fs::metadata(live)
-        .map_err(|e| format!("failed to read permissions of {}: {e}", live.display()))?
-        .permissions();
-
     let backup_dir = stash.join("hook-settings-backup");
     let backup = backup_dir.join(rel_path);
     if let Some(parent) = backup.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(&backup, &original)
-        .map_err(|e| format!("failed to back up {}: {e}", live.display()))?;
-    fs::set_permissions(&backup, perms.clone())
-        .map_err(|e| format!("backed up {} but could not restrict its permissions: {e}", live.display()))?;
 
-    fs::write(live, &reduced)
-        .map_err(|e| format!("failed to write reduced {}: {e}", live.display()))?;
-    fs::set_permissions(live, perms)
-        .map_err(|e| format!("wrote reduced {} but could not restore its permissions: {e}", live.display()))?;
-
-    // A snapshot of the reduced content baseline actually wrote, so `restore`
-    // can tell a legitimate edit made *during* baseline (a different hook
-    // installed, an unrelated setting changed) from the untouched reduced
-    // file, and refuse to silently discard that edit instead of overwriting
-    // it with the pre-baseline backup.
-    let snapshot = backup_dir.join(format!("{rel_path}.reduced-snapshot"));
-    fs::write(&snapshot, &reduced)
+    // Everything up to here can fail without having touched `live` at all, so
+    // returning `Err` is always safe: the caller skips this path rather than
+    // getting stuck with it silently reduced and never restored (a disk
+    // filling up mid-write, or the process exiting, must not be able to leave
+    // `live` reduced with nothing recording that it needs restoring).
+    //
+    // The digest -- not the full reduced content -- is what `restore` later
+    // compares against; storing only a digest means there is no second copy
+    // of settings content (which may itself hold something sensitive) sitting
+    // at whatever permissions a fresh file gets by default.
+    let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
+    fs::write(&digest_path, content_digest(&reduced).to_string())
         .map_err(|e| format!("failed to record the baseline snapshot for {}: {e}", live.display()))?;
+
+    let tmp = live.with_extension("sentrith-baseline-tmp");
+    fs::write(&tmp, &reduced)
+        .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
+    #[cfg(not(windows))]
+    copy_file_permissions(live, &tmp)?;
+    // `backup` is created here, atomically with the live replacement on
+    // Windows via `ReplaceFileW`'s own backup parameter (the only way this
+    // project can carry over a restricted file's full security descriptor to
+    // a brand-new path without a new dependency), and just before the rename
+    // elsewhere -- either way, before `live` holds anything but the original.
+    replace_file_preserving_security(&tmp, live, Some(&backup))?;
     Ok(true)
 }
 
@@ -2556,8 +2606,13 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     if !backup.exists() {
         return Ok(());
     }
-    let snapshot = backup_dir.join(format!("{rel_path}.reduced-snapshot"));
-    if snapshot.exists() && read_text(&snapshot) != read_text(live) {
+    let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
+    let diverged = read_text(&digest_path)
+        .trim()
+        .parse::<u64>()
+        .map(|expected| expected != content_digest(&read_text(live)))
+        .unwrap_or(false);
+    if diverged {
         // Move the conflict out of the stash entirely (rather than leaving it
         // there and refusing to clean up) so restoring the contract files --
         // the safety-critical half of `baseline stop` -- is never held
@@ -2575,7 +2630,7 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
         } else {
             backup.clone()
         };
-        let _ = fs::remove_file(&snapshot);
+        let _ = fs::remove_file(&digest_path);
         return Err(format!(
             "{} was edited while baseline was active; refusing to overwrite it. \
              The pre-baseline original is kept at {}: merge the change by hand.",
@@ -2584,17 +2639,16 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
         ));
     }
 
-    // Read the reduced file's permissions before the rename replaces its
-    // inode with the backup's, which would otherwise carry whatever
-    // create-mode the backup got when it was written, not the live file's.
-    let perms = fs::metadata(live).ok().map(|m| m.permissions());
-    fs::rename(&backup, live).map_err(|e| format!("failed to restore {}: {e}", live.display()))?;
-    if let Some(perms) = perms {
-        fs::set_permissions(live, perms).map_err(|e| {
-            format!("restored {} but could not reapply its permissions: {e}", live.display())
-        })?;
-    }
-    let _ = fs::remove_file(&snapshot);
+    let tmp = live.with_extension("sentrith-baseline-restore-tmp");
+    fs::rename(&backup, &tmp).map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
+    #[cfg(not(windows))]
+    copy_file_permissions(live, &tmp)?;
+    // As in `reduce`: on Windows, replacing through `ReplaceFileW` (rather
+    // than a raw rename) is what actually preserves whatever the reduced
+    // file's security descriptor was, instead of silently adopting the
+    // backup's.
+    replace_file_preserving_security(&tmp, live, None)?;
+    let _ = fs::remove_file(&digest_path);
     Ok(())
 }
 
@@ -4735,9 +4789,27 @@ mod tests {
         fs::set_permissions(&original, permissions).unwrap();
         fs::write(&replacement, "{}").unwrap();
 
-        replace_file_preserving_security(&replacement, &original).unwrap();
+        replace_file_preserving_security(&replacement, &original, None).unwrap();
 
         assert!(fs::metadata(&original).unwrap().permissions().readonly());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_backup_carries_the_original_security_descriptor() {
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        let backup = temp_path("settings.bak");
+        fs::write(&original, "original-secret").unwrap();
+        let mut permissions = fs::metadata(&original).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&original, permissions).unwrap();
+        fs::write(&replacement, "reduced").unwrap();
+
+        replace_file_preserving_security(&replacement, &original, Some(&backup)).unwrap();
+
+        assert_eq!(read_text(&original), "reduced");
+        assert_eq!(read_text(&backup), "original-secret", "the backup gets the pre-replacement content");
     }
 
     #[cfg(unix)]
@@ -4757,6 +4829,29 @@ mod tests {
 
         let mode = fs::metadata(&replacement).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_replacement_backup_carries_content_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        let backup = temp_path("settings.bak");
+        fs::write(&original, "original-secret").unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&replacement, "reduced").unwrap();
+
+        replace_file_preserving_security(&replacement, &original, Some(&backup)).unwrap();
+
+        assert_eq!(read_text(&original), "reduced");
+        assert_eq!(read_text(&backup), "original-secret");
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the backup must carry the original's mode, not the process default"
+        );
     }
 
     #[test]
@@ -4997,6 +5092,49 @@ mod tests {
             fs::metadata(&live).unwrap().permissions().mode() & 0o777,
             0o600,
             "restoring via rename must not adopt the backup's create-mode instead of the original's"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_hook_reduction_refuses_a_symlinked_settings_file() {
+        let stash = temp_path("stash-symlink");
+        fs::create_dir_all(&stash).unwrap();
+        let target = temp_path("settings-target.json");
+        fs::write(&target, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#).unwrap();
+        let live = temp_path("settings-link.json");
+        std::os::unix::fs::symlink(&target, &live).unwrap();
+
+        let result = reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash);
+        assert!(result.is_err(), "must refuse a symlinked settings file rather than following it");
+        assert_eq!(
+            read_text(&target),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#,
+            "the symlink target must be left untouched"
+        );
+        assert!(live.is_symlink(), "the symlink itself must not be replaced");
+    }
+
+    #[test]
+    fn baseline_hook_reduction_snapshot_does_not_store_full_settings_content() {
+        let stash = temp_path("stash-digest");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        let digest_path = stash
+            .join("hook-settings-backup")
+            .join(".claude/settings.json.reduced-digest");
+        let digest_text = read_text(&digest_path);
+        assert!(
+            digest_text.trim().parse::<u64>().is_ok(),
+            "the on-disk snapshot must be a digest, not settings content: got {digest_text:?}"
+        );
+        assert!(
+            !digest_text.contains("sentrith") && !digest_text.contains("hooks"),
+            "the digest must not leak the reduced settings content"
         );
     }
 
