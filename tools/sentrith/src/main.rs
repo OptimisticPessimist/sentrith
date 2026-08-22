@@ -2603,10 +2603,23 @@ fn reduce_hook_settings_for_baseline(
 fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Result<bool, String> {
     let backup_dir = stash.join("hook-settings-backup");
     let backup = backup_dir.join(rel_path);
+    let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
     if !backup.exists() {
+        // A prior attempt may have removed the backup but been interrupted,
+        // or failed, before removing its digest -- there is no restore work
+        // left (the backup's absence is what signals `live` was already
+        // fully restored), but the orphaned digest still needs clearing:
+        // left behind, it keeps `hook-settings-backup` non-empty, which
+        // later fails the stash directory's removal and strands the phase
+        // marker at `baseline`, the same failure mode fixed for the backup
+        // file itself in `finish_hook_restore_cleanup`.
+        if digest_path.exists() {
+            fs::remove_file(&digest_path).map_err(|e| {
+                format!("could not remove orphaned digest {}: {e}", digest_path.display())
+            })?;
+        }
         return Ok(false);
     }
-    let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
 
     // A retry after an earlier attempt: the live replacement below already
     // succeeded, but a later step (removing the backup or digest) failed and
@@ -5170,6 +5183,38 @@ mod tests {
             !stash.parent().unwrap().join("baseline-hook-conflicts").exists(),
             "no conflict must be filed for a file that was already correctly restored"
         );
+    }
+
+    #[test]
+    fn restore_hook_settings_backup_clears_an_orphaned_digest_with_no_backup() {
+        // Simulates an even later interruption than the retry-cleanup test
+        // above: the backup itself was already removed, but the digest
+        // removal that follows it either failed or never ran. `!backup.exists()`
+        // used to return early without touching the digest at all, leaving it
+        // to keep `hook-settings-backup` non-empty forever -- which later
+        // fails the stash directory's removal on every subsequent
+        // `baseline stop` and strands the phase marker at `baseline`.
+        let stash = temp_path("stash-orphaned-digest");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        // Simulate a completed restore whose backup was removed but whose
+        // digest removal did not happen.
+        fs::write(&live, original).unwrap();
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        fs::remove_file(&backup).unwrap();
+        assert!(digest.exists(), "the digest must still be there for this scenario to be meaningful");
+
+        assert!(
+            !restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap(),
+            "there is no backup, so this must report a no-op, not an actual restore"
+        );
+        assert!(!digest.exists(), "the orphaned digest must be cleaned up even with no backup present");
+        assert_eq!(read_text(&live), original, "live must be left untouched");
     }
 
     #[test]
