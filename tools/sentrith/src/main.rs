@@ -1230,32 +1230,38 @@ fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
     Ok(unsafe { fs::File::from_raw_handle(handle as *mut std::ffi::c_void) })
 }
 
-/// Write `content` to a freshly, exclusively created `tmp`, never exposing
-/// it more broadly than necessary during the window before a caller swaps it
-/// into place: on Unix, created at mode 0600 from the moment `open()`
-/// creates it; on Windows, via `create_file_owner_only`'s narrow DACL.
-/// Either way, `create_new`/`CREATE_NEW` refuses to reuse an existing file
-/// or follow a symlink at this predictable path -- a stale leftover from an
-/// interrupted older run, or one placed there in a shared writable
-/// repository, is removed first rather than written through. Shared by every
-/// caller that stages a full settings file (which may hold content the user
-/// never intended to expose more broadly, such as an unrelated existing
-/// hook's own secrets) before an atomic replace.
-fn write_secure_temp_file(tmp: &Path, content: &str) -> Result<(), String> {
-    use std::io::Write;
-    let _ = fs::remove_file(tmp);
+/// Create `path` fresh and exclusively, never exposing whatever gets written
+/// to it more broadly than necessary: on Unix, at mode 0600 from the moment
+/// `open()` creates it; on Windows, via `create_file_owner_only`'s narrow
+/// DACL. Either way, `create_new`/`CREATE_NEW` refuses to reuse an existing
+/// file or follow a symlink at this (often predictable) path -- a stale
+/// leftover from an interrupted older run, or one placed there in a shared
+/// writable repository or pointing somewhere unexpected, is removed first
+/// rather than written through. Shared by every caller that stages
+/// potentially sensitive content (a full settings file, a backup of one)
+/// before either swapping it into place or leaving it as a standing copy.
+fn create_secure_file(path: &Path) -> Result<fs::File, String> {
+    let _ = fs::remove_file(path);
     #[cfg(unix)]
-    let mut file = {
+    {
         use std::os::unix::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(tmp)
-            .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))?
-    };
+            .open(path)
+            .map_err(|e| format!("failed to prepare {}: {e}", path.display()))
+    }
     #[cfg(windows)]
-    let mut file = create_file_owner_only(tmp)?;
+    {
+        create_file_owner_only(path)
+    }
+}
+
+/// Write `content` to a securely created `tmp` (see `create_secure_file`).
+fn write_secure_temp_file(tmp: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = create_secure_file(tmp)?;
     file.write_all(content.as_bytes())
         .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))
 }
@@ -1275,6 +1281,21 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
         map_commands(&mut example);
 
         let settings_path = repo_file(t.settings);
+        if settings_path.is_symlink() {
+            // Replacing a symlinked settings file (common under dotfile
+            // managers) would remove the link and install a plain file at
+            // the repository path, permanently disconnecting it from
+            // whatever it pointed at -- installation would report success
+            // while silently breaking the managed link. Skipped rather than
+            // resolved-and-written-through: matches how baseline reduction
+            // already refuses a symlinked settings file, and avoids writing
+            // through a link to a target this code has no way to vet.
+            println!(
+                "SENTRITH-HOOKS [{}]: skipped, {} is a symlink (dotfile-managed settings aren't supported by hooks install; edit the link's target directly, or replace the link with a regular file first)",
+                t.agent, t.settings
+            );
+            continue;
+        }
         let existed = settings_path.exists();
         let mut settings = if existed {
             // Read fallibly rather than through `read_text`, which folds a
@@ -1365,7 +1386,21 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
         }
         if existed {
             let backup = settings_path.with_extension("json.sentrith-bak");
-            fs::copy(&settings_path, &backup).map_err(|e| e.to_string())?;
+            // `fs::copy` opens its destination without refusing to follow an
+            // existing symlink there: a `*.json.sentrith-bak` symlink left
+            // at this predictable path (or pointing anywhere else) would
+            // otherwise get silently overwritten with the settings content
+            // instead of the backup itself. `create_secure_file` refuses to
+            // reuse or follow anything already at the path; streaming
+            // through the handle it returns (rather than a second, separate
+            // open via `fs::copy`) means the destination is never reopened
+            // by path after that check.
+            let mut dest = create_secure_file(&backup).map_err(|e| e.to_string())?;
+            let mut src = fs::File::open(&settings_path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut src, &mut dest).map_err(|e| e.to_string())?;
+            drop(dest);
+            #[cfg(not(windows))]
+            copy_file_permissions(&settings_path, &backup)?;
         }
         let tmp = settings_path.with_extension("json.sentrith-tmp");
         // `rendered` is the full settings file, including whatever the user
@@ -5631,6 +5666,36 @@ mod tests {
         assert!(!tmp.is_symlink(), "a stale symlink at the temp path must be replaced, not followed");
         assert_eq!(read_text(&tmp), "new-content");
         assert_eq!(read_text(&elsewhere), "untouched", "the stale symlink's target must never receive the content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_creation_does_not_follow_a_symlink_at_the_destination() {
+        // Reproduces the exact vulnerability: a `*.json.sentrith-bak` symlink
+        // pointing at an unrelated file must not have its target silently
+        // overwritten with the backup content -- exercised at the same
+        // create_secure_file + io::copy shape hooks_install now uses, since
+        // hooks_install itself is cwd-coupled and not unit-testable directly.
+        let source = temp_path("source.json");
+        fs::write(&source, "settings-content").unwrap();
+
+        let victim = temp_path("victim.txt");
+        fs::write(&victim, "victim-must-not-be-touched").unwrap();
+        let backup = temp_path("settings.json.sentrith-bak");
+        std::os::unix::fs::symlink(&victim, &backup).unwrap();
+
+        let mut dest = create_secure_file(&backup).unwrap();
+        let mut src = fs::File::open(&source).unwrap();
+        std::io::copy(&mut src, &mut dest).unwrap();
+        drop(dest);
+
+        assert_eq!(
+            read_text(&victim),
+            "victim-must-not-be-touched",
+            "the symlink target must never receive the backup content"
+        );
+        assert!(!backup.is_symlink(), "the backup path must end up as a regular file, not the stale symlink");
+        assert_eq!(read_text(&backup), "settings-content");
     }
 
     #[test]
