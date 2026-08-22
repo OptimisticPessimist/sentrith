@@ -2901,6 +2901,17 @@ fn reduce_hook_settings_for_baseline(
 /// backup. A no-op if there is no backup for this path (nothing was reduced,
 /// or it was already restored). Refuses to overwrite a file that was edited
 /// since it was reduced, rather than silently discarding that edit.
+/// Restores `live` from its baseline backup if one exists. Returns
+/// `Ok(true)` when `live` is now *confirmed* to hold the pre-baseline
+/// original -- whether that took an actual file replacement in this call, or
+/// this call only finished trailing cleanup (backup and/or digest removal)
+/// left behind by an earlier attempt that already replaced `live` -- and
+/// `Ok(false)` only when there is nothing at all to indicate this path was
+/// ever reduced in the first place (no backup, no digest). Callers that
+/// cross-check this against a journal of paths that *should* have been
+/// reduced rely on that distinction: collapsing every no-file-operation
+/// outcome into `false` would make an already-fully-restored path
+/// indistinguishable from one whose reduction was never followed up on.
 fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Result<bool, String> {
     let backup_dir = stash.join("hook-settings-backup");
     let backup = backup_dir.join(rel_path);
@@ -2918,6 +2929,11 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
             fs::remove_file(&digest_path).map_err(|e| {
                 format!("could not remove orphaned digest {}: {e}", digest_path.display())
             })?;
+            // A backup once existed and is now gone with nothing left to
+            // explain why -- the only way that happens is an earlier attempt
+            // already using it to restore `live`. `true` here means "`live`
+            // is confirmed restored," not "this call restored it."
+            return Ok(true);
         }
         return Ok(false);
     }
@@ -3498,7 +3514,17 @@ fn baseline_stop() -> Result<(), String> {
     // restored -- external cleanup, a partial manual recovery -- and
     // treating that the same as "never reduced" would report success while
     // `live` is still silently sitting in its reduced state.
-    let journaled: Vec<String> = read_text(&stash.join("HOOK_EDITS.txt"))
+    // `restore_hook_settings_backup`'s `Ok(true)` already means "`live` is
+    // confirmed restored" even when this call only finished trailing
+    // cleanup left behind by an earlier attempt, so that alone doesn't
+    // false-positive here -- but the journal itself has to be updated
+    // durably as each path is confirmed, not just once at the very end:
+    // otherwise a later retry, after an unrelated failure elsewhere in this
+    // same run, would see the *original* journal still naming an
+    // already-fully-restored-and-cleaned-up path and misread that renewed
+    // `Ok(false)` (nothing left to do) as the same anomaly all over again.
+    let hook_edits_manifest = stash.join("HOOK_EDITS.txt");
+    let mut journaled: Vec<String> = read_text(&hook_edits_manifest)
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -3509,7 +3535,13 @@ fn baseline_stop() -> Result<(), String> {
     let mut hook_restore_failed: Vec<String> = Vec::new();
     for path in &hook_edits {
         match restore_hook_settings_backup(path, &repo_file(path), &stash) {
-            Ok(true) => hook_edits_restored += 1,
+            Ok(true) => {
+                hook_edits_restored += 1;
+                if journaled.iter().any(|p| p == path) {
+                    journaled.retain(|p| p != path);
+                    let _ = fs::write(&hook_edits_manifest, journaled.join("\n") + "\n");
+                }
+            }
             Ok(false) => {
                 if journaled.iter().any(|p| p == path) {
                     hook_restore_failed.push(format!(
@@ -5790,8 +5822,11 @@ mod tests {
         assert!(digest.exists(), "the digest must still be there for this scenario to be meaningful");
 
         assert!(
-            !restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap(),
-            "there is no backup, so this must report a no-op, not an actual restore"
+            restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap(),
+            "a backup once existed and is now gone with an orphaned digest as the only explanation: \
+             live is confirmed restored, even though this call only finished trailing cleanup \
+             rather than replacing live itself -- callers cross-checking a journal need `true` \
+             here to tell this apart from a path that was never reduced at all"
         );
         assert!(!digest.exists(), "the orphaned digest must be cleaned up even with no backup present");
         assert_eq!(read_text(&live), original, "live must be left untouched");
