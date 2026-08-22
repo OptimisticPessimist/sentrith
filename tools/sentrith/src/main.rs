@@ -1033,6 +1033,44 @@ fn replace_file_preserving_security(
     fs::rename(replacement, destination).map_err(|e| e.to_string())
 }
 
+/// `ReplaceFileW` has already committed (the swap itself succeeded) by the
+/// time a caller might see this Err -- it's only reached when a step *after*
+/// that succeeded call fails. Callers of `replace_file_preserving_security`
+/// rely on `Err` meaning nothing changed (e.g. `baseline_start`'s rollback
+/// only restores hook edits it recorded as `Ok(true)`; a path that returns
+/// `Err` here despite the replacement having actually happened would be
+/// skipped by that rollback, which could then delete the only backup while
+/// leaving the live file reduced). Best-effort restores `destination`'s
+/// content from `backup` before surfacing the original error, so the
+/// function's contract holds even when this specific step fails. Without a
+/// backup to roll back from, the error is annotated instead: there is
+/// nothing this function can do to undo the swap.
+#[cfg(windows)]
+fn roll_back_committed_replacement(
+    destination: &Path,
+    backup: Option<&Path>,
+    original_error: String,
+) -> String {
+    let Some(backup) = backup else {
+        return format!(
+            "{original_error} (the replacement of {} already committed and could not be rolled back: no backup was requested for this call)",
+            destination.display()
+        );
+    };
+    match fs::copy(backup, destination) {
+        Ok(_) => format!(
+            "{original_error} (the replacement was rolled back from {}; {} is unchanged)",
+            backup.display(),
+            destination.display()
+        ),
+        Err(rollback_error) => format!(
+            "{original_error} (the replacement already committed and rolling it back from {} also failed: {rollback_error}; {} may not match its backup -- resolve manually)",
+            backup.display(),
+            destination.display()
+        ),
+    }
+}
+
 #[cfg(windows)]
 fn replace_file_preserving_security(
     replacement: &Path,
@@ -1120,19 +1158,21 @@ fn replace_file_preserving_security(
     if was_readonly {
         let new_attributes = unsafe { GetFileAttributesW(replaced.as_ptr()) };
         if new_attributes == INVALID_FILE_ATTRIBUTES {
-            return Err(format!(
+            let error = format!(
                 "GetFileAttributesW failed after replacement with OS error {}",
                 unsafe { GetLastError() }
-            ));
+            );
+            return Err(roll_back_committed_replacement(destination, backup_destination, error));
         }
         if unsafe {
             SetFileAttributesW(replaced.as_ptr(), new_attributes | FILE_ATTRIBUTE_READONLY)
         } == 0
         {
-            return Err(format!(
+            let error = format!(
                 "SetFileAttributesW failed after replacement with OS error {}",
                 unsafe { GetLastError() }
-            ));
+            );
+            return Err(roll_back_committed_replacement(destination, backup_destination, error));
         }
     }
 
@@ -2691,9 +2731,9 @@ fn reduce_hook_settings_for_baseline(
     // touched: `fs::write` follows the link and would reduce whatever it
     // points at -- possibly shared across other projects -- and restoring by
     // rename would later replace the symlink itself with a plain file,
-    // permanently breaking the link. Skipping is reported like a malformed
-    // file: the caller treats it as a warning and this path is simply not
-    // reduced for this baseline.
+    // permanently breaking the link. The caller aborts and rolls back the
+    // whole baseline start on this Err, rather than proceeding with this
+    // path's hooks silently left active.
     if live.is_symlink() {
         return Err(format!(
             "{} is a symlink; leaving it untouched for baseline rather than rewriting or breaking whatever it points at",
@@ -2703,7 +2743,16 @@ fn reduce_hook_settings_for_baseline(
     if !live.exists() {
         return Ok(false);
     }
-    let original = read_text(live);
+    // Read fallibly rather than through `read_text`, which folds a read
+    // failure (invalid UTF-8, a transient permission error) into the same
+    // empty string as a genuinely empty file. That would make this return
+    // `Ok(false)` -- "nothing to reduce" -- for a file that actually still
+    // holds live Sentrith hooks; `baseline_start` would then report success
+    // while this path's advisory hooks stay active for the whole baseline,
+    // contaminating the very sample the baseline exists to keep contract-free.
+    let original = fs::read_to_string(live).map_err(|e| {
+        format!("failed to read {}: {e}; left untouched for baseline", live.display())
+    })?;
     if original.trim().is_empty() {
         return Ok(false);
     }
@@ -5178,6 +5227,41 @@ mod tests {
         assert_eq!(read_text(&path), "pre-existing", "the pre-existing file must be left untouched");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn roll_back_committed_replacement_restores_content_from_the_backup() {
+        // Callers rely on Err from replace_file_preserving_security meaning
+        // nothing changed; when ReplaceFileW itself already succeeded and
+        // only a later metadata step failed, this is what makes that
+        // guarantee hold anyway by restoring destination from the backup
+        // that was already created.
+        let destination = temp_path("destination.json");
+        let backup = temp_path("destination.bak");
+        fs::write(&destination, "committed-replacement-content").unwrap();
+        fs::write(&backup, "original-content").unwrap();
+
+        let message = roll_back_committed_replacement(&destination, Some(&backup), "metadata step failed".into());
+
+        assert_eq!(read_text(&destination), "original-content", "destination must be restored from the backup");
+        assert!(message.contains("rolled back"), "the error message must say a rollback happened: {message}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn roll_back_committed_replacement_explains_when_no_backup_was_available() {
+        let destination = temp_path("destination-no-backup.json");
+        fs::write(&destination, "committed-replacement-content").unwrap();
+
+        let message = roll_back_committed_replacement(&destination, None, "metadata step failed".into());
+
+        assert_eq!(
+            read_text(&destination),
+            "committed-replacement-content",
+            "with nothing to roll back from, destination is left as the swap left it"
+        );
+        assert!(message.contains("no backup was requested"), "the error message must explain rollback wasn't possible: {message}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn hook_replacement_preserves_restrictive_permissions() {
@@ -5534,6 +5618,24 @@ mod tests {
         let result = reduce_hook_settings_for_baseline("w", &live, &stash);
         assert!(result.is_err());
         assert_eq!(read_text(&live), "{not valid json", "a malformed file is left exactly as found");
+    }
+
+    #[test]
+    fn baseline_hook_reduction_aborts_rather_than_skip_an_unreadable_settings_file() {
+        // `read_text` folds a read failure (invalid UTF-8 here) into the same
+        // empty string as a genuinely empty file, which used to make this
+        // return `Ok(false)` -- "nothing to reduce" -- for a file that still
+        // holds live Sentrith hooks. baseline_start would then report success
+        // while this path's hooks stayed active for the whole baseline,
+        // contaminating the sample. It must now return Err so the caller
+        // aborts and rolls back instead.
+        let stash = temp_path("stash-unreadable");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("invalid-utf8.json");
+        fs::write(&live, [0x7b, 0xff, 0xfe, 0x7d]).unwrap();
+
+        let result = reduce_hook_settings_for_baseline("w", &live, &stash);
+        assert!(result.is_err(), "an unreadable settings file must abort, not silently report nothing-to-reduce");
     }
 
     #[cfg(unix)]
