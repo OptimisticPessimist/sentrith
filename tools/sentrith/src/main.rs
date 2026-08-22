@@ -1826,20 +1826,21 @@ fn parse_numstat_z(text: &str) -> Vec<NumstatZItem> {
             continue;
         }
         let mut parts = field.splitn(3, '\t');
-        let (Some(a), Some(_d), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(_added), Some(_deleted), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
-        // Binary files report a `-` change count; line/word counts are the
-        // churn signal here, so only a numeric change count is a real entry.
-        if a.parse::<u64>().is_err() {
-            continue;
-        }
+        // Binary files report `-\t-\t<path>` instead of numeric counts, but
+        // both callers of this parser (the measured commit's file set, and
+        // later history's touched-path set) use only the path, never the
+        // counts -- so a binary file is exactly as real a churn entry as a
+        // text one. Excluding it here would drop it from both sets
+        // uniformly: an all-binary commit would show no files at all, and a
+        // mixed commit would undercount its denominator, inflating the
+        // reported share of files re-modified.
         if path.is_empty() {
             // Rename: the next two NUL-terminated fields are old and new
-            // paths. A binary rename reaches here too (its `a` is `-`, caught
-            // above) only if renames were ever reported for `-`/`-` rows,
-            // which git does not do, so this branch is reached only for text
-            // renames.
+            // paths. Git does not report renames for binary files as `-`/`-`
+            // rows, so this branch is reached only for text renames.
             let Some(old_path) = fields.next() else { continue };
             let Some(new_path) = fields.next() else { continue };
             if !old_path.is_empty() && !new_path.is_empty() {
@@ -2583,6 +2584,32 @@ fn reduce_hook_settings_for_baseline(
         .map_err(|e| format!("failed to record the baseline snapshot for {}: {e}", live.display()))?;
 
     let tmp = live.with_extension("sentrith-baseline-tmp");
+    // On Unix, create the temp file with restrictive permissions from the
+    // moment it exists rather than tightening them after the fact: a plain
+    // `fs::write` creates it at the process's default mode (commonly 0644
+    // under a typical umask) and only `copy_file_permissions` below narrows
+    // it, leaving a window where another local user can open the file --
+    // holding the full reduced settings, unrelated secrets included -- and
+    // keep read access even after the mode is tightened, since permission
+    // checks happen at open(), not on each read. Requesting 0600 up front
+    // (itself still subject to umask, never loosened by it) closes that
+    // window; copy_file_permissions still runs afterward to match `live`'s
+    // actual mode, which may end up looser or tighter than 0600.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
+        file.write_all(reduced.as_bytes())
+            .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
+    }
+    #[cfg(windows)]
     fs::write(&tmp, &reduced)
         .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
     #[cfg(not(windows))]
@@ -2673,17 +2700,35 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
         if let Some(parent) = conflict.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let preserved_at = if fs::rename(&backup, &conflict).is_ok() {
-            conflict
-        } else {
-            backup.clone()
-        };
-        let _ = fs::remove_file(&digest_path);
+        if fs::rename(&backup, &conflict).is_ok() {
+            // Only safe to drop the digest once the original is confirmed
+            // preserved outside the stash: with the backup gone from its
+            // known path, nothing else records that this path was ever
+            // diverged.
+            let _ = fs::remove_file(&digest_path);
+            return Err(format!(
+                "{} was edited while baseline was active; refusing to overwrite it. \
+                 The pre-baseline original is kept at {}: merge the change by hand.",
+                live.display(),
+                conflict.display()
+            ));
+        }
+        // Preserving the original at `conflict` failed too (e.g. a sharing
+        // violation or an unwritable conflict directory). The backup is
+        // still sitting at its original path -- deliberately NOT removing
+        // the digest here: without it, a retry's divergence check reads a
+        // missing digest as "not diverged" and silently overwrites the edit
+        // with the stale backup, exactly the loss this whole check exists to
+        // prevent. Keeping the digest means a retry re-detects the same
+        // conflict and tries preservation again instead.
         return Err(format!(
             "{} was edited while baseline was active; refusing to overwrite it. \
-             The pre-baseline original is kept at {}: merge the change by hand.",
+             Preserving the pre-baseline original at {} also failed; it remains at {} -- \
+             do not delete it. Resolve whatever is blocking {}, then retry `baseline stop`.",
             live.display(),
-            preserved_at.display()
+            conflict.display(),
+            backup.display(),
+            conflict.display()
         ));
     }
 
@@ -5305,6 +5350,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn reduce_widens_the_temp_file_to_a_less_restrictive_original_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The temp file is now created at a tight 0600 up front (rather than
+        // created loose and chmod'd after) to close a permission-exposure
+        // window; this confirms that when `live` is actually less
+        // restrictive than 0600, copy_file_permissions afterward still
+        // widens the reduced file to match it instead of leaving it stuck
+        // at the tighter creation default.
+        let stash = temp_path("stash-widen-perms");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#).unwrap();
+        fs::set_permissions(&live, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        assert_eq!(
+            fs::metadata(&live).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the reduced file must end up matching the original's actual mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn baseline_hook_reduction_refuses_a_symlinked_settings_file() {
         let stash = temp_path("stash-symlink");
         fs::create_dir_all(&stash).unwrap();
@@ -5406,6 +5476,38 @@ mod tests {
         );
         let new_conflict = conflict_root.join("baseline-hook-conflicts").join(".claude/settings.json.conflict-1");
         assert!(new_conflict.exists(), "the new conflict must be preserved at a distinct path");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflict_preservation_failure_keeps_the_digest_for_a_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // If moving the diverged backup out to baseline-hook-conflicts fails
+        // (simulated here with a read-only conflict root, standing in for a
+        // sharing violation or an unwritable directory), the digest must
+        // survive: without it, a retry's divergence check reads a missing
+        // digest as "not diverged" and silently overwrites the edit with the
+        // stale backup -- exactly the loss this whole mechanism exists to
+        // prevent.
+        let stash = temp_path("stash-conflict-preserve-fail");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"custom":true}}"#).unwrap();
+
+        let conflict_root = stash.parent().unwrap();
+        fs::set_permissions(conflict_root, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        fs::set_permissions(conflict_root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "must still refuse to overwrite the edit even when preservation fails");
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        assert!(digest.exists(), "the digest must survive a failed preservation attempt so a retry can re-detect the conflict");
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert!(backup.exists(), "the backup must remain at its known path when preservation fails");
     }
 
     #[cfg(windows)]
@@ -5650,9 +5752,11 @@ mod tests {
     }
 
     #[test]
-    fn numstat_z_collects_paths_and_skips_binary() {
-        // `-z`-delimited entries; a binary file reports `-\t-\t` and has no
-        // numeric change count, so it must not count as a touched path.
+    fn numstat_z_collects_paths_including_binary() {
+        // `-z`-delimited entries; a binary file reports `-\t-\t<path>` instead
+        // of numeric counts, but the counts are never used by either caller
+        // of this parser, so a binary path is just as real a churn entry as
+        // a text one and must not be silently dropped.
         let text = "3\t1\tsrc/a.rs\00\t0\tsrc/b.rs\0-\t-\tbin/blob\0";
         let paths: Vec<String> = parse_numstat_z(text)
             .into_iter()
@@ -5663,7 +5767,7 @@ mod tests {
             .collect();
         assert!(paths.contains(&"src/a.rs".to_string()));
         assert!(paths.contains(&"src/b.rs".to_string()));
-        assert!(!paths.contains(&"bin/blob".to_string()), "binary rows have no numeric counts");
+        assert!(paths.contains(&"bin/blob".to_string()), "binary rows must still count as a touched path");
     }
 
     #[test]
