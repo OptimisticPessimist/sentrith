@@ -1719,19 +1719,69 @@ fn usage_status(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// File paths from `git … --numstat` output. Binary files are reported as
-/// `-\t-\tpath` and are skipped: line counts are the churn signal here.
-fn parse_numstat_files(text: &str) -> BTreeSet<String> {
-    let mut set = BTreeSet::new();
-    for line in text.lines() {
-        let mut parts = line.split('\t');
-        if let (Some(a), Some(_d), Some(path)) = (parts.next(), parts.next(), parts.next()) {
-            if a.trim().parse::<u64>().is_ok() && !path.trim().is_empty() {
-                set.insert(path.trim().to_string());
+/// One item recovered from `git ... --numstat -z` output: either a commit
+/// header's timestamp (only present when the header format is
+/// `"COMMIT <unix time>"`) or a file path that commit touched.
+///
+/// `-z` matters for correctness, not just convenience: without it, a rename
+/// with a common path prefix is rendered as a single human-readable field
+/// like `old.txt => new.txt` (verified against a real repo), which
+/// line-oriented tab-splitting stores as one literal, unmatchable "path" -
+/// silently breaking churn tracking across the rename. With `-z`, a rename is
+/// added/deleted counts followed by an *empty* NUL-terminated field, then the
+/// old and new paths as two further NUL-terminated fields; a non-renamed
+/// entry is counts plus a single NUL-terminated path. The destination path is
+/// recorded, since that is what a later edit touches.
+enum NumstatZItem {
+    Commit(f64),
+    Path(String),
+}
+
+/// Parse `-z`-delimited numstat output, optionally interleaved with
+/// `COMMIT <unix time>` header lines from a custom `--format`. Git also
+/// inserts a bare newline right after each NUL-terminated header when diff
+/// data follows it; that is a formatting artifact of `-z`, not content, and
+/// is stripped rather than treated as part of the next field.
+fn parse_numstat_z(text: &str) -> Vec<NumstatZItem> {
+    let mut items = Vec::new();
+    let mut fields = text.split('\0').peekable();
+    while let Some(field) = fields.next() {
+        let field = field.trim_start_matches('\n');
+        if field.is_empty() {
+            continue;
+        }
+        if let Some(rest) = field.strip_prefix("COMMIT ") {
+            if let Ok(t) = rest.trim().parse::<f64>() {
+                items.push(NumstatZItem::Commit(t));
             }
+            continue;
+        }
+        let mut parts = field.splitn(3, '\t');
+        let (Some(a), Some(_d), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        // Binary files report a `-` change count; line/word counts are the
+        // churn signal here, so only a numeric change count is a real entry.
+        if a.parse::<u64>().is_err() {
+            continue;
+        }
+        if path.is_empty() {
+            // Rename: the next two NUL-terminated fields are old and new
+            // paths. A binary rename reaches here too (its `a` is `-`, caught
+            // above) only if renames were ever reported for `-`/`-` rows,
+            // which git does not do, so this branch is reached only for text
+            // renames.
+            let _old_path = fields.next();
+            if let Some(new_path) = fields.next() {
+                if !new_path.is_empty() {
+                    items.push(NumstatZItem::Path(new_path.to_string()));
+                }
+            }
+        } else {
+            items.push(NumstatZItem::Path(path.to_string()));
         }
     }
-    set
+    items
 }
 
 /// Whether a commit timestamp `t` counts as later rework of a commit made at
@@ -1745,29 +1795,32 @@ fn within_churn_window(t: f64, t0: f64, days: f64) -> bool {
 /// File-level churn: how many files of `sha` were modified again by later
 /// commits within `days`. A rework proxy computable retroactively from git.
 fn churn_for_commit(sha: &str, days: f64) -> Option<(usize, usize)> {
-    let files = parse_numstat_files(&git(&["show", "--numstat", "--format=", sha]));
+    let files: BTreeSet<String> = parse_numstat_z(&git(&["show", "--numstat", "-z", "--format=", sha]))
+        .into_iter()
+        .filter_map(|item| match item {
+            NumstatZItem::Path(p) => Some(p),
+            NumstatZItem::Commit(_) => None,
+        })
+        .collect();
     if files.is_empty() {
         return None;
     }
     let t0: f64 = git(&["show", "-s", "--format=%ct", sha]).trim().parse().ok()?;
     let range = format!("{sha}..HEAD");
-    let log = git(&["log", "--numstat", "--format=COMMIT %ct", range.as_str()]);
+    let log = git(&["log", "--numstat", "-z", "--format=COMMIT %ct", range.as_str()]);
     let mut touched = BTreeSet::new();
     let mut in_window = false;
-    for line in log.lines() {
-        if let Some(rest) = line.strip_prefix("COMMIT ") {
-            in_window = rest
-                .trim()
-                .parse::<f64>()
-                .map(|t| within_churn_window(t, t0, days))
-                .unwrap_or(false);
-        } else if in_window {
-            for path in parse_numstat_files(line) {
-                touched.insert(path);
+    for item in parse_numstat_z(&log) {
+        match item {
+            NumstatZItem::Commit(t) => in_window = within_churn_window(t, t0, days),
+            NumstatZItem::Path(p) => {
+                if in_window {
+                    touched.insert(p);
+                }
             }
         }
     }
-    let changed = files.iter().filter(|f| touched.contains(*f)).count();
+    let changed = files.iter().filter(|f| touched.contains(f.as_str())).count();
     Some((changed, files.len()))
 }
 
@@ -2150,6 +2203,24 @@ fn json_string_field(s: &str, key: &str) -> Option<String> {
     let mut parser = JsonParser::new(rest[colon + 1..].trim_start());
     match parser.value().ok()? {
         Json::Str(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// The last string element of a JSON array field. Codex's rollout `command`
+/// field is `["/bin/bash", "-lc", "<the actual shell text>"]`; the shell text
+/// to check against test-command patterns is always the final element.
+fn json_string_array_last(s: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let pos = s.find(&needle)?;
+    let rest = &s[pos + needle.len()..];
+    let colon = rest.find(':')?;
+    let mut parser = JsonParser::new(rest[colon + 1..].trim_start());
+    match parser.value().ok()? {
+        Json::Arr(items) => match items.last()? {
+            Json::Str(value) => Some(value.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -3144,30 +3215,29 @@ fn parse_claude_transcript_window(text: &str, skip_lines: usize) -> TranscriptWi
 }
 
 /// Best-effort scan of a Codex transcript window for test-command outcomes.
-/// Codex rollout entries carry `command` and, in exec-result entries,
-/// `exit_code`; the two may or may not share a line.
+///
+/// Verified against a real `~/.codex/sessions/**/rollout-*.jsonl` file: a
+/// completed shell command is a single `event_msg` / `item_completed` line
+/// whose `payload.item.type` is `"CommandExecution"`, carrying `command` (an
+/// argv array — `["/bin/bash", "-lc", "<shell text>"]`, not a plain string),
+/// `exit_code`, and `id`, all on that one line. Command and result are never
+/// split across lines in this format, so matching only within one line — never
+/// via a flag carried over from an earlier line — cannot misattribute one
+/// command's result to another, even when Codex logs commands in parallel.
+/// `codex exec --json`'s flat `{"command":"...","exit_code":N}` shape is also
+/// accepted, as a fallback for older or differently-shaped output, under the
+/// same same-line-only rule. Codex documents that this format is not a stable
+/// interface, so an unrecognized line is simply skipped rather than guessed at.
 fn scan_codex_window_for_tests(text: &str, skip_lines: usize) -> Option<bool> {
     let mut result = None;
-    let mut awaiting = false;
     for line in text.lines().skip(skip_lines) {
-        if line.contains("\"command\"") {
-            if let Some(cmd) = json_string_field(line, "command") {
-                if is_test_command(&cmd) {
-                    if let Some(c) = json_number_field(line, "exit_code") {
-                        result = Some(c == 0.0);
-                        awaiting = false;
-                    } else {
-                        awaiting = true;
-                    }
-                    continue;
-                }
-            }
+        let cmd = json_string_array_last(line, "command").or_else(|| json_string_field(line, "command"));
+        let Some(cmd) = cmd else { continue };
+        if !is_test_command(&cmd) {
+            continue;
         }
-        if awaiting && line.contains("\"exit_code\"") {
-            if let Some(c) = json_number_field(line, "exit_code") {
-                result = Some(c == 0.0);
-            }
-            awaiting = false;
+        if let Some(code) = json_number_field(line, "exit_code") {
+            result = Some(code == 0.0);
         }
     }
     result
@@ -3998,22 +4068,79 @@ mod tests {
     }
 
     #[test]
-    fn codex_window_reads_exit_code_on_following_line() {
+    fn codex_window_matches_command_and_result_on_the_same_line_only() {
         let same_line = r#"{"command":"cargo test","exit_code":0}"#;
         assert_eq!(scan_codex_window_for_tests(same_line, 0), Some(true));
 
+        // A result on a later line is intentionally no longer attributed to an
+        // earlier command; see
+        // `codex_command_result_is_never_borrowed_from_a_different_line` for
+        // why cross-line matching was removed rather than merely narrowed.
         let split = [
             r#"{"type":"exec","command":"pytest -q"}"#,
             r#"{"type":"exec_result","exit_code":1}"#,
         ]
         .join("\n");
-        assert_eq!(scan_codex_window_for_tests(&split, 0), Some(false));
+        assert_eq!(scan_codex_window_for_tests(&split, 0), None);
 
         let unrelated = r#"{"command":"ls","exit_code":1}"#;
         assert_eq!(scan_codex_window_for_tests(unrelated, 0), None);
 
         let multiline = r#"{"command":"cd tools\ncargo test","exit_code":0}"#;
         assert_eq!(scan_codex_window_for_tests(multiline, 0), None);
+    }
+
+    #[test]
+    fn codex_window_reads_the_real_command_execution_shape() {
+        // Structure verified against a real `~/.codex/sessions/**/rollout-
+        // *.jsonl` file: `command` is an argv array, not a plain string, and
+        // `exit_code` sits in the same object.
+        let passing = r#"{"payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-1","command":["/bin/bash","-lc","cargo test"],"exit_code":0,"status":"completed"}}}"#;
+        assert_eq!(scan_codex_window_for_tests(passing, 0), Some(true));
+
+        let failing = r#"{"payload":{"item":{"type":"CommandExecution","command":["/bin/bash","-lc","pytest -q"],"exit_code":1}}}"#;
+        assert_eq!(scan_codex_window_for_tests(failing, 0), Some(false));
+
+        let non_test = r#"{"payload":{"item":{"type":"CommandExecution","command":["/bin/bash","-lc","ls -la"],"exit_code":0}}}"#;
+        assert_eq!(scan_codex_window_for_tests(non_test, 0), None);
+    }
+
+    #[test]
+    fn codex_command_result_is_never_borrowed_from_a_different_line() {
+        // Codex can log commands in parallel, so a later line's exit_code may
+        // belong to a different, unrelated command. Same-line-only matching
+        // must not attribute it to an earlier test command that had none of
+        // its own, rather than guessing via a flag carried over from that
+        // earlier line.
+        let interleaved = [
+            r#"{"command":"cargo test"}"#,
+            r#"{"command":"ls","exit_code":0}"#,
+        ]
+        .join("
+");
+        assert_eq!(
+            scan_codex_window_for_tests(&interleaved, 0),
+            None,
+            "must not borrow ls's exit code for cargo test"
+        );
+
+        let interleaved_real_shape = [
+            r#"{"payload":{"item":{"type":"CommandExecution","command":["/bin/bash","-lc","cargo test"]}}}"#,
+            r#"{"payload":{"item":{"type":"CommandExecution","command":["/bin/bash","-lc","ls"],"exit_code":0}}}"#,
+        ]
+        .join("
+");
+        assert_eq!(scan_codex_window_for_tests(&interleaved_real_shape, 0), None);
+    }
+
+    #[test]
+    fn json_string_array_last_reads_the_final_element() {
+        assert_eq!(
+            json_string_array_last(r#"{"command":["/bin/bash","-lc","cargo test"]}"#, "command"),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(json_string_array_last(r#"{"command":[]}"#, "command"), None);
+        assert_eq!(json_string_array_last(r#"{"command":"cargo test"}"#, "command"), None);
     }
 
     #[test]
@@ -4649,12 +4776,78 @@ mod tests {
     }
 
     #[test]
-    fn numstat_parsing_collects_changed_paths() {
-        let text = "3\t1\tsrc/a.rs\n0\t0\tsrc/b.rs\n-\t-\tbin/blob\n";
-        let files = parse_numstat_files(text);
-        assert!(files.contains("src/a.rs"));
-        assert!(files.contains("src/b.rs"));
-        assert!(!files.contains("bin/blob"), "binary rows have no numeric counts");
+    fn numstat_z_collects_paths_and_skips_binary() {
+        // `-z`-delimited entries; a binary file reports `-\t-\t` and has no
+        // numeric change count, so it must not count as a touched path.
+        let text = "3\t1\tsrc/a.rs\00\t0\tsrc/b.rs\0-\t-\tbin/blob\0";
+        let paths: Vec<String> = parse_numstat_z(text)
+            .into_iter()
+            .filter_map(|item| match item {
+                NumstatZItem::Path(p) => Some(p),
+                NumstatZItem::Commit(_) => None,
+            })
+            .collect();
+        assert!(paths.contains(&"src/a.rs".to_string()));
+        assert!(paths.contains(&"src/b.rs".to_string()));
+        assert!(!paths.contains(&"bin/blob".to_string()), "binary rows have no numeric counts");
+    }
+
+    #[test]
+    fn numstat_z_records_a_rename_by_its_destination_path() {
+        // Byte layout verified against a real repo: `git show --numstat -z`
+        // for a rename is `added\tdeleted\t` + an empty NUL-terminated field
+        // (the rename marker), then the old path, then the new path.
+        let text = "0\t0\t\0old.txt\0new.txt\0";
+        let paths: Vec<String> = parse_numstat_z(text)
+            .into_iter()
+            .filter_map(|item| match item {
+                NumstatZItem::Path(p) => Some(p),
+                NumstatZItem::Commit(_) => None,
+            })
+            .collect();
+        assert_eq!(paths, vec!["new.txt".to_string()], "only the destination is recorded");
+    }
+
+    #[test]
+    fn numstat_z_reads_commit_headers_across_the_artifact_newline() {
+        // `git log -z --format="COMMIT %ct"` NUL-terminates each header, then
+        // inserts a bare `\n` before the numstat block when one follows; that
+        // newline is a formatting artifact, not part of the next path.
+        let text = "COMMIT 100\0\n0\t0\tplain.txt\0COMMIT 90\0\n1\t0\tother.txt\0";
+        let items = parse_numstat_z(text);
+        assert_eq!(items.len(), 4);
+        assert!(matches!(items[0], NumstatZItem::Commit(t) if t == 100.0));
+        assert!(matches!(&items[1], NumstatZItem::Path(p) if p == "plain.txt"));
+        assert!(matches!(items[2], NumstatZItem::Commit(t) if t == 90.0));
+        assert!(matches!(&items[3], NumstatZItem::Path(p) if p == "other.txt"));
+    }
+
+    #[test]
+    fn churn_matches_a_renamed_file_by_its_destination_path() {
+        // The bug this fixes: a rename with a common-prefix path renders as
+        // `old.txt => new.txt` under plain (non-`-z`) `--numstat`, which
+        // line-based tab-splitting stored as one literal, unmatchable path,
+        // so a later edit of the file under its new name never intersected
+        // it and churn was always undercounted across a rename.
+        let measured_commit = "0\t0\t\0old.txt\0new.txt\0";
+        let files: BTreeSet<String> = parse_numstat_z(measured_commit)
+            .into_iter()
+            .filter_map(|item| match item {
+                NumstatZItem::Path(p) => Some(p),
+                NumstatZItem::Commit(_) => None,
+            })
+            .collect();
+
+        let later_log = "COMMIT 200\01\t0\tnew.txt\0";
+        let touched: BTreeSet<String> = parse_numstat_z(later_log)
+            .into_iter()
+            .filter_map(|item| match item {
+                NumstatZItem::Path(p) => Some(p),
+                NumstatZItem::Commit(_) => None,
+            })
+            .collect();
+
+        assert_eq!(files.intersection(&touched).count(), 1, "new.txt must match on both sides of the rename");
     }
 
     #[test]
