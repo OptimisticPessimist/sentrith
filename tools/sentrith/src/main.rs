@@ -1734,6 +1734,14 @@ fn parse_numstat_files(text: &str) -> BTreeSet<String> {
     set
 }
 
+/// Whether a commit timestamp `t` counts as later rework of a commit made at
+/// `t0`, within `days`. Both bounds matter: `sha..HEAD` selects commits by
+/// ancestry, not time, so a side-branch commit merged in later but authored
+/// before `t0` must not be treated as rework that happened after it.
+fn within_churn_window(t: f64, t0: f64, days: f64) -> bool {
+    t >= t0 && t <= t0 + days * 86400.0
+}
+
 /// File-level churn: how many files of `sha` were modified again by later
 /// commits within `days`. A rework proxy computable retroactively from git.
 fn churn_for_commit(sha: &str, days: f64) -> Option<(usize, usize)> {
@@ -1751,7 +1759,7 @@ fn churn_for_commit(sha: &str, days: f64) -> Option<(usize, usize)> {
             in_window = rest
                 .trim()
                 .parse::<f64>()
-                .map(|t| t <= t0 + days * 86400.0)
+                .map(|t| within_churn_window(t, t0, days))
                 .unwrap_or(false);
         } else if in_window {
             for path in parse_numstat_files(line) {
@@ -3017,6 +3025,19 @@ fn is_test_invocation(tokens: &[String]) -> bool {
     if no_test_execution_requested(&name, args) {
         return false;
     }
+    // `cargo +nightly test` / `cargo +1.75 test`: cargo's own `--help`
+    // documents `Usage: cargo [+toolchain] [OPTIONS] [COMMAND]`. The selector
+    // does not start with `-`, so `first_non_option_arg` would otherwise treat
+    // it as the subcommand and miss the following `test`. This is cargo-only
+    // syntax; `+` has no such meaning for the other runners here.
+    let args: &[String] = if name == "cargo" {
+        match args.first() {
+            Some(a) if a.starts_with('+') => &args[1..],
+            _ => args,
+        }
+    } else {
+        args
+    };
     let first = first_non_option_arg(args);
 
     match name.as_str() {
@@ -3959,6 +3980,17 @@ mod tests {
         assert!(!is_test_command("cargo test --no-run"));
         assert!(!is_test_command("cargo test --no-run"));
         assert!(!is_test_command("cargo test -- --list"));
+        // cargo's `Usage: cargo [+toolchain] [OPTIONS] [COMMAND]`: `+nightly`
+        // does not start with `-`, so it must be stripped explicitly or it is
+        // mistaken for the subcommand and the following `test` is missed.
+        assert!(is_test_command("cargo +nightly test"));
+        assert!(is_test_command("cargo +stable test --workspace"));
+        assert!(is_test_command("cargo +1.75.0 test"));
+        assert!(!is_test_command("cargo +nightly test --no-run"));
+        assert!(!is_test_command("cargo +nightly build"));
+        // `+` has no such meaning for other runners; it must not be stripped
+        // there, so this stays unrecognized rather than false-positive.
+        assert!(!is_test_command("npm +nightly test"));
         assert!(!is_test_command("pytest --collect-only"));
         assert!(!is_test_command("python -m pytest --collect-only"));
         assert!(!is_test_command("go test -list ."));
@@ -4560,6 +4592,24 @@ mod tests {
         assert_eq!(task_success(&tasks[0]), "unknown");
         assert_eq!(tasks[1].len(), 2);
         assert_eq!(task_success(&tasks[1]), "yes");
+    }
+
+    #[test]
+    fn churn_window_excludes_commits_before_the_measured_commit() {
+        // `sha..HEAD` selects by ancestry, not time: a side-branch commit
+        // merged in later can still carry a timestamp earlier than `t0`. Only
+        // the upper bound would have wrongly counted it as later rework.
+        let t0 = 1_000_000.0;
+        let days = 14.0;
+
+        assert!(
+            !within_churn_window(t0 - 3600.0, t0, days),
+            "a commit authored before t0 must not count as rework of it"
+        );
+        assert!(within_churn_window(t0, t0, days), "t0 itself is in-window");
+        assert!(within_churn_window(t0 + 3600.0, t0, days));
+        assert!(within_churn_window(t0 + days * 86400.0, t0, days), "the upper bound is inclusive");
+        assert!(!within_churn_window(t0 + days * 86400.0 + 1.0, t0, days));
     }
 
     #[test]
