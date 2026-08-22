@@ -2600,11 +2600,11 @@ fn reduce_hook_settings_for_baseline(
 /// backup. A no-op if there is no backup for this path (nothing was reduced,
 /// or it was already restored). Refuses to overwrite a file that was edited
 /// since it was reduced, rather than silently discarding that edit.
-fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Result<(), String> {
+fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Result<bool, String> {
     let backup_dir = stash.join("hook-settings-backup");
     let backup = backup_dir.join(rel_path);
     if !backup.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
     let diverged = read_text(&digest_path)
@@ -2639,8 +2639,14 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
         ));
     }
 
+    // `backup` is left at its original, already-known path until the
+    // replacement below actually commits: a copy here (not a rename) means an
+    // interruption at any point up to and including a failed replace still
+    // leaves `backup` exactly where a retried restore looks for it, instead
+    // of orphaning the original content at a temp path nothing else knows to
+    // check.
     let tmp = live.with_extension("sentrith-baseline-restore-tmp");
-    fs::rename(&backup, &tmp).map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
+    fs::copy(&backup, &tmp).map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
     #[cfg(not(windows))]
     copy_file_permissions(live, &tmp)?;
     // As in `reduce`: on Windows, replacing through `ReplaceFileW` (rather
@@ -2648,8 +2654,9 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // file's security descriptor was, instead of silently adopting the
     // backup's.
     replace_file_preserving_security(&tmp, live, None)?;
+    let _ = fs::remove_file(&backup);
     let _ = fs::remove_file(&digest_path);
-    Ok(())
+    Ok(true)
 }
 
 fn usage_baseline(args: &[String]) -> Result<(), String> {
@@ -2768,10 +2775,12 @@ fn baseline_start() -> Result<(), String> {
     // Reduce advisory-check hooks (preflight/guard/etc.) so a baseline session
     // does not see Sentrith-flavored Stop/SessionStart output reacting to the
     // paths this just stashed; usage capture keeps running unmodified. A
-    // malformed hook-settings file is reported but does not abort a baseline
-    // whose contract files are already safely stashed. If recording which
-    // files were edited fails partway, everything rolls back so baseline
-    // start stays all-or-nothing.
+    // settings file that cannot be safely reduced (malformed JSON, a symlink)
+    // aborts the whole baseline start instead of merely warning: leaving its
+    // hooks active would silently contaminate every task recorded as
+    // "baseline" with Sentrith still running, which defeats the point of
+    // measuring one. If recording which files were edited fails partway,
+    // everything rolls back so baseline start stays all-or-nothing either way.
     let mut hook_edits: Vec<String> = Vec::new();
     let hook_edits_manifest = stash.join("HOOK_EDITS.txt");
     let mut hook_edit_failure: Option<String> = None;
@@ -2785,7 +2794,10 @@ fn baseline_start() -> Result<(), String> {
                 }
             }
             Ok(false) => {}
-            Err(e) => println!("SENTRITH-BASELINE: warning: {e}"),
+            Err(e) => {
+                hook_edit_failure = Some(e);
+                break;
+            }
         }
     }
     if let Some(err) = hook_edit_failure {
@@ -2975,16 +2987,19 @@ fn baseline_stop() -> Result<(), String> {
         return Err("no active baseline to stop".into());
     }
     let manifest = stash.join("STASHED.txt");
-    let hook_edits: Vec<String> = read_text(&stash.join("HOOK_EDITS.txt"))
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect();
+    // Restore by scanning the fixed candidate list -- the same one `start`
+    // reduces from -- rather than trusting HOOK_EDITS.txt. That manifest is
+    // written only after a path's live file has already been reduced, so an
+    // interruption in between would otherwise leave a reduced file with
+    // nothing telling `stop` to restore it. `restore_hook_settings_backup`
+    // already no-ops when a path has no backup, so scanning every candidate
+    // is safe regardless of whether it was ever actually reduced.
+    let hook_edits: Vec<String> = BASELINE_HOOK_SETTINGS_PATHS.iter().map(|s| s.to_string()).collect();
     let mut hook_edits_restored = 0;
     for path in &hook_edits {
         match restore_hook_settings_backup(path, &repo_file(path), &stash) {
-            Ok(()) => hook_edits_restored += 1,
+            Ok(true) => hook_edits_restored += 1,
+            Ok(false) => {}
             Err(e) => println!("SENTRITH-BASELINE: warning: {e}"),
         }
     }
@@ -5020,12 +5035,34 @@ mod tests {
         assert!(reduce_hook_settings_for_baseline(".codex/hooks.json", &live, &stash).unwrap());
         assert_ne!(read_text(&live), original, "the live file is reduced while active");
 
-        restore_hook_settings_backup(".codex/hooks.json", &live, &stash).unwrap();
+        assert!(
+            restore_hook_settings_backup(".codex/hooks.json", &live, &stash).unwrap(),
+            "an actual restore reports true, distinguishing it from a no-op"
+        );
         assert_eq!(read_text(&live), original, "stop restores the exact original, not a reconstruction");
         assert!(
             !stash.join("hook-settings-backup").join(".codex/hooks.json").exists(),
             "the backup is consumed on restore"
         );
+    }
+
+    #[test]
+    fn restore_hook_settings_backup_is_a_noop_when_the_path_was_never_reduced() {
+        // `baseline_stop` now scans every candidate path unconditionally
+        // (rather than trusting a manifest of what was actually reduced), so
+        // restoring a path with no backup at all must stay a safe, silent
+        // no-op rather than an error.
+        let stash = temp_path("stash-restore-noop");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(
+            !restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap(),
+            "no backup exists for this path, so restore must report false, not error"
+        );
+        assert_eq!(read_text(&live), original, "a path that was never reduced must be left untouched");
     }
 
     #[test]
