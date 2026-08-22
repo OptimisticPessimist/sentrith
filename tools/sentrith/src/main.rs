@@ -3163,8 +3163,18 @@ fn baseline_start() -> Result<(), String> {
         // path whose restore failed is still sitting reduced in the working
         // tree -- deleting the stash on top of that would erase the only way
         // to recover it while claiming "the working tree is unchanged".
+        //
+        // Scans every candidate path, not just `hook_edits`: the path whose
+        // reduction just failed is never in that list (it never reached
+        // `Ok(true)`), but it can still have a real backup on disk -- if
+        // `replace_file_preserving_security` committed the swap on Windows
+        // and then failed a later step, its own best-effort rollback may
+        // have failed too, leaving live reduced with a backup that
+        // `hook_edits` has no record of. `restore_hook_settings_backup`
+        // already no-ops for a path with no backup, so scanning every
+        // candidate is safe regardless of which ones were ever recorded.
         let mut hook_restore_failed: Vec<String> = Vec::new();
-        for path in hook_edits.iter().rev() {
+        for path in BASELINE_HOOK_SETTINGS_PATHS.iter().rev() {
             if let Err(e) = restore_hook_settings_backup(path, &repo_file(path), &stash) {
                 hook_restore_failed.push(format!("{path} ({e})"));
             }
