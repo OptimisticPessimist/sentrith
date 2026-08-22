@@ -1139,6 +1139,97 @@ fn replace_file_preserving_security(
     Ok(())
 }
 
+/// Create `path` fresh, exclusively, with a DACL granting access only to its
+/// owner, SYSTEM, and Administrators -- never the parent directory's
+/// inherited ACL, which may be broader than whatever restriction the file
+/// this is standing in for (e.g. `live`) actually has. Used for temp files
+/// that briefly hold sensitive content before a `ReplaceFileW` swap:
+/// `ReplaceFileW` is documented to retain the *destination's* own security
+/// descriptor after the swap, so this file's DACL only needs to hold for
+/// that window, not to replicate `live`'s exact (possibly complex,
+/// inherited) ACL long-term -- a fixed, deliberately narrow ACL is simpler
+/// and just as effective for that purpose.
+#[cfg(windows)]
+fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        lp_security_descriptor: *mut std::ffi::c_void,
+        b_inherit_handle: i32,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut std::ffi::c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn GetLastError() -> u32;
+        fn CreateFileW(
+            file_name: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *const SecurityAttributes,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+    }
+
+    // D:P protects the DACL from inheriting anything from the parent;
+    // (A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA) grants full access to Owner,
+    // SYSTEM, and Administrators only -- nobody else.
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)\0".encode_utf16().collect();
+    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut())
+    } == 0
+    {
+        return Err(format!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed with OS error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let sa = SecurityAttributes {
+        n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+        lp_security_descriptor: sd,
+        b_inherit_handle: 0,
+    };
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    let create_error = unsafe { GetLastError() };
+    unsafe { LocalFree(sd) };
+    if handle as isize == INVALID_HANDLE_VALUE {
+        return Err(format!("CreateFileW failed for {} with OS error {create_error}", path.display()));
+    }
+    Ok(unsafe { fs::File::from_raw_handle(handle as *mut std::ffi::c_void) })
+}
+
 fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
     let dry_run = opts.contains_key("dry-run");
     let mut touched = 0;
@@ -2599,19 +2690,42 @@ fn reduce_hook_settings_for_baseline(
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        // `mode(0o600)` only applies when `open()` itself creates the file;
+        // on an existing path (a permissive leftover from an interrupted
+        // older run, or a symlink someone left at this predictable name in a
+        // shared writable repository) `.create(true)` reuses it as-is, mode
+        // and all, and `.truncate(true)` only clears its content, not its
+        // permissions or its symlink-ness. Removing whatever is at `tmp`
+        // first, then creating with `create_new` (which fails rather than
+        // following a symlink or reusing an existing file), guarantees the
+        // sensitive content only ever lands in a file this call itself just
+        // created at exactly the requested mode.
+        let _ = fs::remove_file(&tmp);
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)
             .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
         file.write_all(reduced.as_bytes())
             .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
     }
+    // On Windows, a plain `fs::write` would create the temp file under the
+    // parent directory's inherited DACL, which can be broader than `live`'s
+    // own -- exposing the full reduced settings to anyone that DACL permits,
+    // until the swap below. `create_file_owner_only` creates it fresh with a
+    // fixed, narrow DACL (owner/SYSTEM/Administrators only) instead; stale
+    // leftovers are removed first since CREATE_NEW refuses to reuse or
+    // follow whatever is already at this predictable path, for the same
+    // reason the Unix branch above does.
     #[cfg(windows)]
-    fs::write(&tmp, &reduced)
-        .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
+    {
+        use std::io::Write;
+        let _ = fs::remove_file(&tmp);
+        let mut file = create_file_owner_only(&tmp)?;
+        file.write_all(reduced.as_bytes())
+            .map_err(|e| format!("failed to prepare reduced {}: {e}", live.display()))?;
+    }
     #[cfg(not(windows))]
     copy_file_permissions(live, &tmp)?;
     // `backup` is created here, atomically with the live replacement on
@@ -2665,11 +2779,18 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
         return finish_hook_restore_cleanup(&backup, &digest_path, live);
     }
 
+    // Fail closed: a missing, unreadable, or malformed digest means there is
+    // no way to tell whether `live` was edited during baseline, and treating
+    // that as "not diverged" would silently overwrite a genuine edit with
+    // the stale backup -- the retry-cleanup check above already handles the
+    // one case where a missing/mismatched digest is actually safe (`live`
+    // already restored), so anything reaching this line with an unreadable
+    // digest is a genuinely unexplained state, not a known-safe one.
     let diverged = read_text(&digest_path)
         .trim()
         .parse::<u64>()
         .map(|expected| expected != content_digest(&read_text(live)))
-        .unwrap_or(false);
+        .unwrap_or(true);
     if diverged {
         // Move the conflict out of the stash entirely (rather than leaving it
         // there and refusing to clean up) so restoring the contract files --
@@ -4980,6 +5101,40 @@ mod tests {
         assert_eq!(read_text(&backup), "original-secret", "the backup gets the pre-replacement content");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn create_file_owner_only_grants_no_broad_access() {
+        let path = temp_path("owner-only.txt");
+        let mut file = create_file_owner_only(&path).unwrap();
+        use std::io::Write;
+        file.write_all(b"sensitive").unwrap();
+        drop(file);
+        assert_eq!(read_text(&path), "sensitive");
+
+        // Verified empirically (icacls) that this SDDL grants Full Control
+        // to only Owner Rights, SYSTEM, and Administrators -- none of the
+        // broad, commonly-inherited principals below.
+        let out = std::process::Command::new("icacls").arg(&path).output().unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout);
+        for broad in ["Everyone", "Authenticated Users", "BUILTIN\\Users", "\\Users:"] {
+            assert!(
+                !listing.contains(broad),
+                "expected no broad-access principal {broad:?} in icacls output: {listing}"
+            );
+        }
+        assert!(listing.contains("OWNER RIGHTS"), "expected an explicit owner grant in icacls output: {listing}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_file_owner_only_refuses_to_reuse_an_existing_file() {
+        let path = temp_path("owner-only-existing.txt");
+        fs::write(&path, "pre-existing").unwrap();
+        let result = create_file_owner_only(&path);
+        assert!(result.is_err(), "must not silently reuse a file that already exists at this path");
+        assert_eq!(read_text(&path), "pre-existing", "the pre-existing file must be left untouched");
+    }
+
     #[cfg(unix)]
     #[test]
     fn hook_replacement_preserves_restrictive_permissions() {
@@ -5263,6 +5418,32 @@ mod tests {
     }
 
     #[test]
+    fn restore_fails_closed_when_the_digest_is_unreadable() {
+        // A missing, unreadable, or malformed digest while the backup still
+        // exists is not the known-safe retry state (that's `live` already
+        // equaling `backup`, handled separately above) -- it's genuinely
+        // unexplained, and treating it as "not diverged" would silently
+        // overwrite whatever edit `live` may hold with the stale backup.
+        let stash = temp_path("stash-unreadable-digest");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        // A genuine edit made during baseline, distinct from both the
+        // original and the reduced content.
+        let edited = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"custom":true}}"#;
+        fs::write(&live, edited).unwrap();
+        // Corrupt the digest so it can't be parsed.
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        fs::write(&digest, "not-a-number").unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        assert!(result.is_err(), "an unreadable digest must be treated as diverged, not as safe to overwrite");
+        assert_eq!(read_text(&live), edited, "the edit must survive when the digest can't be verified");
+    }
+
+    #[test]
     fn restore_hook_settings_backup_is_a_noop_when_the_path_was_never_reduced() {
         // `baseline_stop` now scans every candidate path unconditionally
         // (rather than trusting a manifest of what was actually reduced), so
@@ -5393,6 +5574,34 @@ mod tests {
         assert!(live.is_symlink(), "the symlink itself must not be replaced");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reduce_does_not_write_through_a_stale_symlink_at_the_temp_path() {
+        // A stale symlink left at the predictable temp path (an interrupted
+        // older run, or placed there deliberately in a shared writable
+        // repository) must never be followed: writing the reduced settings
+        // through it would leak them to wherever the symlink points, not
+        // the intended scratch location.
+        let stash = temp_path("stash-stale-tmp-symlink");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        let elsewhere = temp_path("elsewhere.txt");
+        fs::write(&elsewhere, "untouched").unwrap();
+        let tmp = live.with_extension("sentrith-baseline-tmp");
+        std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        assert!(!live.is_symlink(), "live must end up as a regular reduced file, not a symlink");
+        assert!(!read_text(&live).contains("\"guard\""), "live must actually be reduced");
+        assert_eq!(
+            read_text(&elsewhere),
+            "untouched",
+            "the stale symlink's target must never receive the reduced content"
+        );
+    }
+
     #[test]
     fn baseline_hook_reduction_snapshot_does_not_store_full_settings_content() {
         let stash = temp_path("stash-digest");
@@ -5482,6 +5691,20 @@ mod tests {
     #[test]
     fn conflict_preservation_failure_keeps_the_digest_for_a_retry() {
         use std::os::unix::fs::PermissionsExt;
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+
+        // Root bypasses Unix access checks entirely, so a read-only
+        // directory does not actually block root from renaming into it --
+        // the permission-based failure this test simulates cannot happen
+        // under root, and asserting on it would fail for a reason unrelated
+        // to the behavior under test. Skip rather than assert a premise that
+        // does not hold for this user.
+        if unsafe { geteuid() } == 0 {
+            eprintln!("skipping conflict_preservation_failure_keeps_the_digest_for_a_retry: running as root, where the read-only-directory simulation cannot fail");
+            return;
+        }
 
         // If moving the diverged backup out to baseline-hook-conflicts fails
         // (simulated here with a read-only conflict root, standing in for a
