@@ -2897,22 +2897,28 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // of orphaning the original content at a temp path nothing else knows to
     // check.
     let tmp = live.with_extension("sentrith-baseline-restore-tmp");
-    fs::copy(&backup, &tmp).map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
+    // `fs::copy` opens its destination without refusing to follow an
+    // existing symlink there -- the same class of attack just fixed for the
+    // install-time backup, reachable here too since this predictable path
+    // could already be a symlink: it would silently overwrite the symlink's
+    // target with the backed-up settings, and the rename below would then
+    // move that same symlink onto `live` itself. `create_secure_file`
+    // refuses to reuse or follow anything already at the path; streaming
+    // `backup`'s bytes into the already-open handle it returns (rather than
+    // a second, separate open by path, which is what `fs::copy` does
+    // internally) closes the window entirely. This also means `tmp` is
+    // always a freshly created file with no attributes inherited from
+    // `backup` -- unlike `fs::copy`, so the read-only-attribute workaround
+    // this used to need on Windows no longer applies.
+    let mut dest = create_secure_file(&tmp)
+        .map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
+    let mut src = fs::File::open(&backup)
+        .map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
+    std::io::copy(&mut src, &mut dest)
+        .map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
+    drop(dest);
     #[cfg(not(windows))]
     copy_file_permissions(live, &tmp)?;
-    // `fs::copy` on Windows carries the source's attributes, so `tmp` inherits
-    // `backup`'s read-only bit if it has one; ReplaceFileW consumes (deletes)
-    // its replacement file as part of the swap, and a read-only replacement
-    // makes that fail. `tmp` is a disposable scratch file either way, so it
-    // must never stay read-only regardless of what `backup` was.
-    #[cfg(windows)]
-    if let Ok(metadata) = fs::metadata(&tmp) {
-        let mut perms = metadata.permissions();
-        if perms.readonly() {
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(&tmp, perms);
-        }
-    }
     // As in `reduce`: on Windows, replacing through `ReplaceFileW` (rather
     // than a raw rename) is what actually preserves whatever the reduced
     // file's security descriptor was, instead of silently adopting the
@@ -5696,6 +5702,34 @@ mod tests {
         );
         assert!(!backup.is_symlink(), "the backup path must end up as a regular file, not the stale symlink");
         assert_eq!(read_text(&backup), "settings-content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_does_not_follow_a_symlink_at_the_restore_temp_path() {
+        // Reproduces the reported scenario directly against
+        // restore_hook_settings_backup itself, matching how it was found:
+        // link the restore temp path to an unrelated file after a baseline
+        // reduction, then run restore. Before the fix, fs::copy followed the
+        // symlink (clobbering the victim) and the subsequent rename moved
+        // that same symlink onto `live`.
+        let stash = temp_path("stash-restore-tmp-symlink");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        let victim = temp_path("victim.txt");
+        fs::write(&victim, "victim-must-not-be-touched").unwrap();
+        let restore_tmp = live.with_extension("sentrith-baseline-restore-tmp");
+        std::os::unix::fs::symlink(&victim, &restore_tmp).unwrap();
+
+        assert!(restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap());
+
+        assert_eq!(read_text(&victim), "victim-must-not-be-touched", "the symlink target must never receive the settings content");
+        assert!(!live.is_symlink(), "live must end up as a regular file, not the stale symlink renamed onto it");
+        assert_eq!(read_text(&live), original, "the restore must still succeed correctly despite the stale symlink");
     }
 
     #[test]
