@@ -70,6 +70,10 @@ copy_path() {
     mkdir -p "$dst"
     cp -R "$src"/. "$dst"/
   else
+    if [ -L "$dst" ]; then
+      echo "Refusing to overwrite symlink: $dst (remove it before installing the contract file)" >&2
+      return 2
+    fi
     cp "$src" "$dst"
   fi
 }

@@ -753,6 +753,38 @@ fn count_sentrith_hooks(value: &Json) -> usize {
     }
 }
 
+fn is_usage_hook_command(cmd: &str, agent: &str) -> bool {
+    let segments = shell_command_segments(cmd);
+    let Some((tokens, _)) = segments.first() else {
+        return false;
+    };
+    segments.len() == 1
+        && tokens.first().map(|token| is_sentrith_command(token)).unwrap_or(false)
+        && tokens.get(1).map(String::as_str) == Some("usage")
+        && tokens.get(2).map(String::as_str) == Some("hook")
+        && tokens.get(3).map(String::as_str) == Some(agent)
+}
+
+fn count_usage_hooks(value: &Json, agent: &str) -> usize {
+    match value {
+        Json::Obj(entries) => entries
+            .iter()
+            .map(|(key, value)| {
+                let own = usize::from(
+                    key == "command"
+                        && value
+                            .as_str()
+                            .map(|command| is_usage_hook_command(command, agent))
+                            .unwrap_or(false),
+                );
+                own + count_usage_hooks(value, agent)
+            })
+            .sum(),
+        Json::Arr(items) => items.iter().map(|item| count_usage_hooks(item, agent)).sum(),
+        _ => 0,
+    }
+}
+
 fn sentrith_hook_count(text: &str) -> usize {
     let Ok(settings) = json_parse(text) else {
         return 0;
@@ -760,6 +792,16 @@ fn sentrith_hook_count(text: &str) -> usize {
     settings
         .get("hooks")
         .map(count_sentrith_hooks)
+        .unwrap_or(0)
+}
+
+fn sentrith_usage_hook_count(text: &str, agent: &str) -> usize {
+    let Ok(settings) = json_parse(text) else {
+        return 0;
+    };
+    settings
+        .get("hooks")
+        .map(|hooks| count_usage_hooks(hooks, agent))
         .unwrap_or(0)
 }
 
@@ -915,11 +957,11 @@ fn hooks_status(opts: &BTreeMap<String, String>) -> Result<(), String> {
             println!("SENTRITH-HOOKS [{}]: not installed ({} missing)", t.agent, t.settings);
             continue;
         }
-        let n = sentrith_hook_count(&read_text(&path));
+        let n = sentrith_usage_hook_count(&read_text(&path), t.agent);
         if n == 0 {
-            println!("SENTRITH-HOOKS [{}]: {} exists but has no Sentrith hooks", t.agent, t.settings);
+            println!("SENTRITH-HOOKS [{}]: {} exists but has no capture hook", t.agent, t.settings);
         } else {
-            println!("SENTRITH-HOOKS [{}]: installed ({} Sentrith hooks in {})", t.agent, n, t.settings);
+            println!("SENTRITH-HOOKS [{}]: installed ({} capture hooks in {})", t.agent, n, t.settings);
         }
     }
     Ok(())
@@ -1576,7 +1618,8 @@ fn usage_status(args: &[String]) -> Result<(), String> {
     let mut hooks_ready = false;
     for t in HOOK_TARGETS {
         let path = repo_file(t.settings);
-        let installed = path.exists() && sentrith_hook_count(&read_text(&path)) > 0;
+        let installed =
+            path.exists() && sentrith_usage_hook_count(&read_text(&path), t.agent) > 0;
         if installed {
             hooks_ready = true;
         }
@@ -3012,9 +3055,7 @@ fn is_test_command(cmd: &str) -> bool {
     {
         return false;
     }
-    !segments[test_index + 1..]
-        .iter()
-        .any(|(_, operator)| matches!(operator.as_str(), ";" | "||" | "|" | "&"))
+    segments[test_index + 1..].is_empty()
 }
 
 /// Parse the Claude Code transcript JSONL lines after `skip_lines`.
@@ -3908,7 +3949,7 @@ mod tests {
         assert!(is_test_command(r#""/opt/project/bin/cargo" test"#));
         assert!(is_test_command("cd tools && cargo test"));
         assert!(is_test_command("cd tools\ncargo test"));
-        assert!(is_test_command("cargo test && echo done"));
+        assert!(!is_test_command("cargo test && echo done"));
         assert!(!is_test_command("cargo test || true"));
         assert!(!is_test_command("cargo test; echo done"));
         assert!(!is_test_command("cargo test | tee test.log"));
@@ -4308,6 +4349,18 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn hook_status_requires_a_capture_command() {
+        let guard_only = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#;
+        let claude_hook = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude --phase standard"}]}]}}"#;
+        let codex_hook = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook codex"}]}]}}"#;
+
+        assert_eq!(sentrith_usage_hook_count(guard_only, "claude"), 0);
+        assert_eq!(sentrith_usage_hook_count(claude_hook, "claude"), 1);
+        assert_eq!(sentrith_usage_hook_count(claude_hook, "codex"), 0);
+        assert_eq!(sentrith_usage_hook_count(codex_hook, "codex"), 1);
     }
 
     #[test]
