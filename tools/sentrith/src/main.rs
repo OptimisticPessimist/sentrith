@@ -2508,6 +2508,18 @@ fn reduce_hook_settings_for_baseline(
         )
     })?;
 
+    // Capture the live file's permissions before creating anything. Both the
+    // backup and the reduced live file get it applied explicitly below: a
+    // fresh `fs::write` always uses the process's default create-mode, which
+    // for a restricted file (e.g. `.claude/settings.json` at 0600 under the
+    // usual 022 umask) is looser than the original -- and the backup holds
+    // the *complete* original content, unreduced, for as long as the
+    // baseline runs, so leaving it at the default mode would expose whatever
+    // the original permissions were restricting for that whole window.
+    let perms = fs::metadata(live)
+        .map_err(|e| format!("failed to read permissions of {}: {e}", live.display()))?
+        .permissions();
+
     let backup_dir = stash.join("hook-settings-backup");
     let backup = backup_dir.join(rel_path);
     if let Some(parent) = backup.parent() {
@@ -2515,17 +2527,9 @@ fn reduce_hook_settings_for_baseline(
     }
     fs::write(&backup, &original)
         .map_err(|e| format!("failed to back up {}: {e}", live.display()))?;
+    fs::set_permissions(&backup, perms.clone())
+        .map_err(|e| format!("backed up {} but could not restrict its permissions: {e}", live.display()))?;
 
-    // Capture the live file's permissions before touching it. `fs::write`
-    // over an existing path truncates the same inode and keeps its mode on
-    // Unix, but that is an implementation detail, not a guarantee; setting it
-    // explicitly here (and again after `restore`'s rename, which replaces the
-    // inode outright) is what actually keeps a restrictive mode -- e.g.
-    // `.claude/settings.json` at 0600 -- from silently loosening to whatever
-    // the process's default create-mode is.
-    let perms = fs::metadata(live)
-        .map_err(|e| format!("failed to read permissions of {}: {e}", live.display()))?
-        .permissions();
     fs::write(live, &reduced)
         .map_err(|e| format!("failed to write reduced {}: {e}", live.display()))?;
     fs::set_permissions(live, perms)
@@ -4976,6 +4980,16 @@ mod tests {
             fs::metadata(&live).unwrap().permissions().mode() & 0o777,
             0o600,
             "reducing the file must not loosen its mode"
+        );
+
+        // The backup holds the complete, unreduced original for as long as
+        // the baseline runs; a default-mode copy would expose whatever the
+        // original's permissions were restricting for that whole window.
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the backup must carry the original's restrictive mode, not the process default"
         );
 
         restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap();
