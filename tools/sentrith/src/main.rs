@@ -2508,26 +2508,90 @@ fn reduce_hook_settings_for_baseline(
         )
     })?;
 
-    let backup = stash.join("hook-settings-backup").join(rel_path);
+    let backup_dir = stash.join("hook-settings-backup");
+    let backup = backup_dir.join(rel_path);
     if let Some(parent) = backup.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     fs::write(&backup, &original)
         .map_err(|e| format!("failed to back up {}: {e}", live.display()))?;
+
+    // Capture the live file's permissions before touching it. `fs::write`
+    // over an existing path truncates the same inode and keeps its mode on
+    // Unix, but that is an implementation detail, not a guarantee; setting it
+    // explicitly here (and again after `restore`'s rename, which replaces the
+    // inode outright) is what actually keeps a restrictive mode -- e.g.
+    // `.claude/settings.json` at 0600 -- from silently loosening to whatever
+    // the process's default create-mode is.
+    let perms = fs::metadata(live)
+        .map_err(|e| format!("failed to read permissions of {}: {e}", live.display()))?
+        .permissions();
     fs::write(live, &reduced)
         .map_err(|e| format!("failed to write reduced {}: {e}", live.display()))?;
+    fs::set_permissions(live, perms)
+        .map_err(|e| format!("wrote reduced {} but could not restore its permissions: {e}", live.display()))?;
+
+    // A snapshot of the reduced content baseline actually wrote, so `restore`
+    // can tell a legitimate edit made *during* baseline (a different hook
+    // installed, an unrelated setting changed) from the untouched reduced
+    // file, and refuse to silently discard that edit instead of overwriting
+    // it with the pre-baseline backup.
+    let snapshot = backup_dir.join(format!("{rel_path}.reduced-snapshot"));
+    fs::write(&snapshot, &reduced)
+        .map_err(|e| format!("failed to record the baseline snapshot for {}: {e}", live.display()))?;
     Ok(true)
 }
 
 /// Restore a hook-settings file from its baseline backup, removing the
 /// backup. A no-op if there is no backup for this path (nothing was reduced,
-/// or it was already restored).
+/// or it was already restored). Refuses to overwrite a file that was edited
+/// since it was reduced, rather than silently discarding that edit.
 fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Result<(), String> {
-    let backup = stash.join("hook-settings-backup").join(rel_path);
+    let backup_dir = stash.join("hook-settings-backup");
+    let backup = backup_dir.join(rel_path);
     if !backup.exists() {
         return Ok(());
     }
-    fs::rename(&backup, live).map_err(|e| format!("failed to restore {}: {e}", live.display()))
+    let snapshot = backup_dir.join(format!("{rel_path}.reduced-snapshot"));
+    if snapshot.exists() && read_text(&snapshot) != read_text(live) {
+        // Move the conflict out of the stash entirely (rather than leaving it
+        // there and refusing to clean up) so restoring the contract files --
+        // the safety-critical half of `baseline stop` -- is never held
+        // hostage by an unrelated hook-settings edit made during baseline.
+        // Derived from `stash`'s own parent rather than a fresh cwd-relative
+        // path, so it lands next to the stash wherever that actually is
+        // (matters for tests, and keeps the eventual rename on one volume).
+        let conflict_root = stash.parent().unwrap_or(stash);
+        let conflict = conflict_root.join("baseline-hook-conflicts").join(rel_path);
+        if let Some(parent) = conflict.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let preserved_at = if fs::rename(&backup, &conflict).is_ok() {
+            conflict
+        } else {
+            backup.clone()
+        };
+        let _ = fs::remove_file(&snapshot);
+        return Err(format!(
+            "{} was edited while baseline was active; refusing to overwrite it. \
+             The pre-baseline original is kept at {}: merge the change by hand.",
+            live.display(),
+            preserved_at.display()
+        ));
+    }
+
+    // Read the reduced file's permissions before the rename replaces its
+    // inode with the backup's, which would otherwise carry whatever
+    // create-mode the backup got when it was written, not the live file's.
+    let perms = fs::metadata(live).ok().map(|m| m.permissions());
+    fs::rename(&backup, live).map_err(|e| format!("failed to restore {}: {e}", live.display()))?;
+    if let Some(perms) = perms {
+        fs::set_permissions(live, perms).map_err(|e| {
+            format!("restored {} but could not reapply its permissions: {e}", live.display())
+        })?;
+    }
+    let _ = fs::remove_file(&snapshot);
+    Ok(())
 }
 
 fn usage_baseline(args: &[String]) -> Result<(), String> {
@@ -2859,9 +2923,11 @@ fn baseline_stop() -> Result<(), String> {
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect();
+    let mut hook_edits_restored = 0;
     for path in &hook_edits {
-        if let Err(e) = restore_hook_settings_backup(path, &repo_file(path), &stash) {
-            println!("SENTRITH-BASELINE: warning: {e}");
+        match restore_hook_settings_backup(path, &repo_file(path), &stash) {
+            Ok(()) => hook_edits_restored += 1,
+            Err(e) => println!("SENTRITH-BASELINE: warning: {e}"),
         }
     }
 
@@ -2920,8 +2986,8 @@ fn baseline_stop() -> Result<(), String> {
 
     finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path(), &entries, &hook_edits)?;
     println!("SENTRITH-BASELINE: stopped. Restored {restored} path(s); phase is standard again.");
-    if !hook_edits.is_empty() {
-        println!("Restored advisory-check hooks in {} path(s).", hook_edits.len());
+    if hook_edits_restored > 0 {
+        println!("Restored advisory-check hooks in {hook_edits_restored} path(s).");
     }
     println!("Start a NEW agent session so the contract is loaded before your next task.");
     Ok(())
@@ -4892,6 +4958,64 @@ mod tests {
         let result = reduce_hook_settings_for_baseline("w", &live, &stash);
         assert!(result.is_err());
         assert_eq!(read_text(&live), "{not valid json", "a malformed file is left exactly as found");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_hook_reduction_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stash = temp_path("stash-perms");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#).unwrap();
+        fs::set_permissions(&live, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        assert_eq!(
+            fs::metadata(&live).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "reducing the file must not loosen its mode"
+        );
+
+        restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap();
+        assert_eq!(
+            fs::metadata(&live).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "restoring via rename must not adopt the backup's create-mode instead of the original's"
+        );
+    }
+
+    #[test]
+    fn baseline_stop_refuses_to_discard_an_edit_made_during_baseline() {
+        let stash = temp_path("stash-conflict");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        // Simulate a legitimate edit made while baseline was active.
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"custom":true}}"#).unwrap();
+        let edited = read_text(&live);
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        assert!(result.is_err(), "must refuse rather than silently discard the edit");
+        assert_eq!(read_text(&live), edited, "the edit made during baseline must survive");
+
+        // The conflict must not block the stash from being cleaned up: its
+        // backup is moved out entirely, not left sitting in the stash.
+        let backup_dir = stash.join("hook-settings-backup").join(".claude");
+        assert!(
+            !backup_dir.exists() || fs::read_dir(&backup_dir).unwrap().next().is_none(),
+            "the backup and its snapshot must be moved out of the stash on conflict"
+        );
+        let conflict = stash
+            .parent()
+            .unwrap()
+            .join("baseline-hook-conflicts")
+            .join(".claude/settings.json");
+        assert!(conflict.exists(), "the pre-baseline original must be preserved at the conflict path");
     }
 
     fn row(session: &str, sha: &str, success: &str, phase: &str) -> BTreeMap<String, String> {
