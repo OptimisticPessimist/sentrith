@@ -805,6 +805,10 @@ fn sentrith_usage_hook_count(text: &str, agent: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn hook_target_matches_agent(target_agent: &str, requested_agent: Option<&str>) -> bool {
+    requested_agent.map_or(true, |requested| requested == target_agent)
+}
+
 /// Rewrite the example's ./bin/sentrith invocation for the current platform.
 /// On native Windows, hook commands run through cmd.exe, where ./bin/...
 /// does not resolve.
@@ -1616,11 +1620,12 @@ fn usage_status(args: &[String]) -> Result<(), String> {
 
     println!("== capture ==");
     let mut hooks_ready = false;
+    let requested_agent = opts.get("agent").map(String::as_str);
     for t in HOOK_TARGETS {
         let path = repo_file(t.settings);
         let installed =
             path.exists() && sentrith_usage_hook_count(&read_text(&path), t.agent) > 0;
-        if installed {
+        if installed && hook_target_matches_agent(t.agent, requested_agent) {
             hooks_ready = true;
         }
         println!(
@@ -3049,10 +3054,7 @@ fn is_test_command(cmd: &str) -> bool {
         return false;
     }
     let test_index = matches[0];
-    if segments[..=test_index]
-        .iter()
-        .any(|(_, operator)| matches!(operator.as_str(), "||" | "|" | "&"))
-    {
+    if test_index != 0 {
         return false;
     }
     segments[test_index + 1..].is_empty()
@@ -3947,8 +3949,9 @@ mod tests {
         assert!(!is_test_command(r#"rg "cargo test" docs"#));
         assert!(is_test_command("env CI=1 cargo test"));
         assert!(is_test_command(r#""/opt/project/bin/cargo" test"#));
-        assert!(is_test_command("cd tools && cargo test"));
-        assert!(is_test_command("cd tools\ncargo test"));
+        assert!(!is_test_command("cd tools && cargo test"));
+        assert!(!is_test_command("cd tools\ncargo test"));
+        assert!(!is_test_command("cargo fmt --check && cargo test"));
         assert!(!is_test_command("cargo test && echo done"));
         assert!(!is_test_command("cargo test || true"));
         assert!(!is_test_command("cargo test; echo done"));
@@ -3978,7 +3981,7 @@ mod tests {
         assert_eq!(scan_codex_window_for_tests(unrelated, 0), None);
 
         let multiline = r#"{"command":"cd tools\ncargo test","exit_code":0}"#;
-        assert_eq!(scan_codex_window_for_tests(multiline, 0), Some(true));
+        assert_eq!(scan_codex_window_for_tests(multiline, 0), None);
     }
 
     #[test]
@@ -4361,6 +4364,13 @@ mod tests {
         assert_eq!(sentrith_usage_hook_count(claude_hook, "claude"), 1);
         assert_eq!(sentrith_usage_hook_count(claude_hook, "codex"), 0);
         assert_eq!(sentrith_usage_hook_count(codex_hook, "codex"), 1);
+    }
+
+    #[test]
+    fn usage_status_readiness_scopes_requested_agent() {
+        assert!(hook_target_matches_agent("codex", None));
+        assert!(hook_target_matches_agent("codex", Some("codex")));
+        assert!(!hook_target_matches_agent("claude", Some("codex")));
     }
 
     #[test]
