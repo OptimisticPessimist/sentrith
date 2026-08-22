@@ -850,12 +850,32 @@ fn map_commands(v: &mut Json) {
 /// `strip_sentrith_hooks` (drop all Sentrith entries, for idempotent
 /// reinstall) and `is_workflow_check_command` (drop only the advisory
 /// checks, keeping usage capture, for baseline measurement).
+/// A group or event whose array was already empty before this ran is left
+/// exactly as found -- only an array stripping itself just emptied out gets
+/// pruned. Blanket-pruning any empty array (an earlier version of this
+/// function did) reports a change, and so a "reduction", for a settings file
+/// where nothing actually matched `predicate`; that contradicts what callers
+/// rely on this function's return value change to mean.
 fn strip_hooks_matching(hooks: &mut Json, predicate: impl Fn(&str) -> bool) {
     let Json::Obj(events) = hooks else { return };
-    for (_, groups) in events.iter_mut() {
-        if let Json::Arr(group_list) = groups {
-            for group in group_list.iter_mut() {
-                if let Some(Json::Arr(inner)) = group.get("hooks").cloned() {
+    let new_events: Vec<(String, Json)> = std::mem::take(events)
+        .into_iter()
+        .filter_map(|(name, mut groups)| {
+            let Json::Arr(group_list) = &mut groups else {
+                return Some((name, groups));
+            };
+            if group_list.is_empty() {
+                return Some((name, groups));
+            }
+            let new_groups: Vec<Json> = std::mem::take(group_list)
+                .into_iter()
+                .filter_map(|mut group| {
+                    let Some(Json::Arr(inner)) = group.get("hooks").cloned() else {
+                        return Some(group);
+                    };
+                    if inner.is_empty() {
+                        return Some(group);
+                    }
                     let kept: Vec<Json> = inner
                         .into_iter()
                         .filter(|h| {
@@ -865,13 +885,21 @@ fn strip_hooks_matching(hooks: &mut Json, predicate: impl Fn(&str) -> bool) {
                                 .unwrap_or(false)
                         })
                         .collect();
+                    if kept.is_empty() {
+                        return None;
+                    }
                     group.set("hooks", Json::Arr(kept));
-                }
+                    Some(group)
+                })
+                .collect();
+            if new_groups.is_empty() {
+                return None;
             }
-            group_list.retain(|g| !matches!(g.get("hooks"), Some(Json::Arr(v)) if v.is_empty()));
-        }
-    }
-    events.retain(|(_, groups)| !matches!(groups, Json::Arr(v) if v.is_empty()));
+            *group_list = new_groups;
+            Some((name, groups))
+        })
+        .collect();
+    *events = new_events;
 }
 
 fn strip_sentrith_hooks(hooks: &mut Json) {
@@ -1027,7 +1055,19 @@ fn replace_file_preserving_security(
     backup_destination: Option<&Path>,
 ) -> Result<(), String> {
     if let Some(backup) = backup_destination {
-        fs::copy(destination, backup).map_err(|e| e.to_string())?;
+        // `fs::copy` opens its destination without refusing to follow an
+        // existing symlink there -- the same class of attack fixed for the
+        // `hooks_install` backup and the restore temp file in earlier
+        // rounds; this call is a third, previously-missed spot creating a
+        // backup the identical way. `create_secure_file` refuses to reuse or
+        // follow anything already at the path; streaming through the
+        // already-open handle it returns (rather than a second, separate
+        // open by path, which is what `fs::copy` does internally) closes
+        // the window entirely.
+        let mut dest = create_secure_file(backup)?;
+        let mut src = fs::File::open(destination).map_err(|e| e.to_string())?;
+        std::io::copy(&mut src, &mut dest).map_err(|e| e.to_string())?;
+        drop(dest);
         copy_file_permissions(destination, backup)?;
     }
     fs::rename(replacement, destination).map_err(|e| e.to_string())
@@ -1442,21 +1482,35 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
             #[cfg(not(windows))]
             copy_file_permissions(&settings_path, &backup)?;
         }
-        let tmp = settings_path.with_extension("json.sentrith-tmp");
-        // `rendered` is the full settings file, including whatever the user
-        // already had beyond Sentrith's own hooks; write_secure_temp_file
-        // keeps it from sitting exposed under default/inherited permissions
-        // even briefly, and never reuses or follows a stale file or symlink
-        // left at this predictable path.
-        write_secure_temp_file(&tmp, &rendered)?;
-        #[cfg(not(windows))]
         if existed {
+            let tmp = settings_path.with_extension("json.sentrith-tmp");
+            // `rendered` merges the user's existing configuration -- which
+            // may hold unrelated secrets -- with Sentrith's hooks;
+            // write_secure_temp_file keeps it from sitting exposed under
+            // default/inherited permissions even briefly, and never reuses
+            // or follows a stale file or symlink left at this predictable
+            // path. copy_file_permissions afterward widens or narrows the
+            // temp file to settings_path's actual mode before the swap.
+            write_secure_temp_file(&tmp, &rendered)?;
+            #[cfg(not(windows))]
             copy_file_permissions(&settings_path, &tmp)?;
-        }
-        if existed {
             replace_file_preserving_security(&tmp, &settings_path, None)?;
         } else {
-            fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
+            // A fresh install has nothing pre-existing to protect --
+            // `rendered` is only Sentrith's own default hooks -- so this
+            // writes directly with ordinary default/inherited permissions,
+            // rather than routing through write_secure_temp_file's narrow,
+            // owner-only creation the way the `existed` branch does. Nothing
+            // widens a brand-new file's permissions afterward the way
+            // copy_file_permissions does for an existing one, so that narrow
+            // creation would become this file's *permanent* permissions --
+            // which has broken environments where a different account also
+            // needs to read it (e.g. a sandboxed agent process running as
+            // another user), confirmed empirically: a fresh install locked
+            // the file to Owner/SYSTEM/Administrators only on Windows, where
+            // normal new files in the same directory inherit access for
+            // several other accounts.
+            fs::write(&settings_path, &rendered).map_err(|e| e.to_string())?;
         }
         touched += 1;
 
@@ -2861,8 +2915,19 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // needing any separate persisted state. Once detected, skip straight to
     // cleanup rather than touching `live` or running divergence detection
     // again.
-    if fs::metadata(live).is_ok() && read_text(live) == read_text(&backup) {
-        return finish_hook_restore_cleanup(&backup, &digest_path, live);
+    //
+    // Read both fallibly and require both to succeed: `read_text` folds a
+    // read failure into the same empty string on both sides, which would
+    // otherwise make an unreadable `live` and an unreadable (or genuinely
+    // empty) `backup` compare equal and falsely take this path -- deleting
+    // the backup while `live` was never actually verified to hold the
+    // restored content.
+    if let (Ok(live_content), Ok(backup_content)) =
+        (fs::read_to_string(live), fs::read_to_string(&backup))
+    {
+        if live_content == backup_content {
+            return finish_hook_restore_cleanup(&backup, &digest_path, live);
+        }
     }
 
     // Fail closed: a missing, unreadable, or malformed digest means there is
@@ -3107,7 +3172,7 @@ fn baseline_start() -> Result<(), String> {
     if let Some(err) = failure {
         // Roll back so a partial stash never leaves the project without its
         // contract files, and never leaves files only inside the stash.
-        let rollback_failed = rollback_moved_paths(&moved, &stash);
+        let rollback_failed = rollback_moved_paths(&moved, &stash, Path::new("."));
         if rollback_failed.is_empty() {
             let _ = fs::remove_file(&manifest);
             let _ = fs::remove_dir_all(&stash);
@@ -3179,7 +3244,7 @@ fn baseline_start() -> Result<(), String> {
                 hook_restore_failed.push(format!("{path} ({e})"));
             }
         }
-        let mut rollback_failed = rollback_moved_paths(&moved, &stash);
+        let mut rollback_failed = rollback_moved_paths(&moved, &stash, Path::new("."));
         rollback_failed.extend(hook_restore_failed);
         if rollback_failed.is_empty() {
             let _ = fs::remove_file(&hook_edits_manifest);
@@ -3218,16 +3283,32 @@ fn baseline_start() -> Result<(), String> {
 /// Move stashed paths back to their live locations for as many `moved`
 /// entries as possible, in reverse order. Returns the entries that could not
 /// be restored, so the caller can decide whether the stash is safe to
-/// delete. Shared by `baseline_start`'s two rollback points.
-fn rollback_moved_paths(moved: &[String], stash: &Path) -> Vec<String> {
+/// delete. Shared by `baseline_start`'s two rollback points. `root` is the
+/// live tree's root (production callers pass `.`, via `repo_file`'s own
+/// implicit-cwd convention) -- kept as an explicit parameter rather than
+/// resolved internally so this is testable against an isolated temp
+/// directory instead of the test process's actual working directory.
+fn rollback_moved_paths(moved: &[String], stash: &Path, root: &Path) -> Vec<String> {
     let mut failed = Vec::new();
     for path in moved.iter().rev() {
         let src = stash.join(path);
-        let dst = repo_file(path);
-        if src.exists() && !dst.exists() {
-            if let Err(e) = fs::rename(&src, &dst) {
-                failed.push(format!("{path} ({e})"));
-            }
+        let dst = root.join(path);
+        if !src.exists() {
+            continue;
+        }
+        // Something has already recreated `dst` since it was stashed. Moving
+        // the stashed copy over it would clobber whatever that is; leaving
+        // it silently in place -- without recording this as a failure --
+        // would let the caller believe rollback fully succeeded and delete
+        // the stash, discarding the stashed copy with no record it was ever
+        // there. Matches how `baseline_stop`'s equivalent restore loop
+        // already treats this exact situation.
+        if dst.exists() {
+            failed.push(format!("{path} (already exists in the working tree)"));
+            continue;
+        }
+        if let Err(e) = fs::rename(&src, &dst) {
+            failed.push(format!("{path} ({e})"));
         }
     }
     failed
@@ -5314,6 +5395,32 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_replacement_backup_does_not_follow_a_symlink_at_the_destination() {
+        // The same class of attack fixed for the hooks_install backup and
+        // the restore temp file: this is the third spot that used to create
+        // its backup with a plain fs::copy, which follows an existing
+        // symlink at the destination instead of refusing to reuse or follow
+        // it.
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        fs::write(&original, "original-secret").unwrap();
+        fs::write(&replacement, "reduced").unwrap();
+
+        let victim = temp_path("victim.txt");
+        fs::write(&victim, "victim-must-not-be-touched").unwrap();
+        let backup = temp_path("settings.bak");
+        std::os::unix::fs::symlink(&victim, &backup).unwrap();
+
+        replace_file_preserving_security(&replacement, &original, Some(&backup)).unwrap();
+
+        assert_eq!(read_text(&original), "reduced");
+        assert_eq!(read_text(&victim), "victim-must-not-be-touched", "the symlink target must never receive the backup content");
+        assert!(!backup.is_symlink(), "the backup path must end up as a regular file, not the stale symlink");
+        assert_eq!(read_text(&backup), "original-secret");
+    }
+
     #[test]
     fn hook_merge_is_idempotent_and_keeps_foreign_hooks() {
         let example = json_parse(
@@ -5523,6 +5630,34 @@ mod tests {
     }
 
     #[test]
+    fn restore_does_not_treat_two_unreadable_files_as_a_matching_retry() {
+        // `read_text` folds a read failure into the same empty string
+        // regardless of what the file actually contains. If both `live` and
+        // `backup` happen to be unreadable (invalid UTF-8, here, standing in
+        // for any read failure) for unrelated reasons, comparing their
+        // `read_text` output would falsely treat this as the retry-cleanup
+        // case -- "live already holds the restored content" -- and delete
+        // the backup, even though neither side was ever actually verified.
+        let stash = temp_path("stash-both-unreadable");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        // Both ends become unreadable, with genuinely different bytes.
+        let live_bytes: &[u8] = &[0x7b, 0xff, 0xfe, 0x7d];
+        fs::write(&live, live_bytes).unwrap();
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        fs::write(&backup, [0xff, 0xfe, 0x01]).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+
+        assert!(result.is_err(), "must not silently treat two unreadable files as an already-completed restore: {result:?}");
+        assert_eq!(fs::read(&live).unwrap(), live_bytes, "live must be left untouched");
+    }
+
+    #[test]
     fn restore_hook_settings_backup_clears_an_orphaned_digest_with_no_backup() {
         // Simulates an even later interruption than the retry-cleanup test
         // above: the backup itself was already removed, but the digest
@@ -5616,6 +5751,27 @@ mod tests {
         let empty = temp_path("empty.json");
         fs::write(&empty, "").unwrap();
         assert!(!reduce_hook_settings_for_baseline("z", &empty, &stash).unwrap());
+    }
+
+    #[test]
+    fn baseline_hook_reduction_leaves_a_preexisting_empty_hook_array_alone() {
+        // A group or event whose array was already empty before stripping
+        // ran (e.g. `{"hooks":{"Stop":[]}}`, degenerate but not invalid)
+        // must not be pruned just because it's empty: nothing about it
+        // actually matched the predicate, so this must stay a no-op rather
+        // than reporting a "reduction" that only ever removed a pre-existing
+        // empty entry.
+        let stash = temp_path("stash-preexisting-empty");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("preexisting-empty.json");
+        let original = r#"{"hooks":{"Stop":[]},"other":1}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(
+            !reduce_hook_settings_for_baseline("q", &live, &stash).unwrap(),
+            "a pre-existing empty hooks array must not be reported as a match"
+        );
+        assert_eq!(read_text(&live), original, "nothing actually matched, so the file must be left untouched");
     }
 
     #[test]
@@ -6387,6 +6543,31 @@ mod tests {
         assert!(error.contains("phase marker"));
         assert!(marker.is_dir());
         assert!(stash.exists(), "an empty stash keeps baseline_active true");
+    }
+
+    #[test]
+    fn rollback_moved_paths_reports_a_recreated_destination_as_failed() {
+        // If something has already recreated `dst` since it was stashed
+        // (e.g. another process, or a prior partial rollback), moving the
+        // stashed copy over it would clobber whatever that is. Silently
+        // skipping it -- without recording a failure -- would let the
+        // caller believe rollback fully succeeded and delete the stash,
+        // discarding the stashed copy with no record it was ever there.
+        let root = temp_path("root");
+        fs::create_dir_all(&root).unwrap();
+        let stash = temp_path("stash-for-rollback");
+        fs::create_dir_all(&stash).unwrap();
+
+        fs::write(stash.join("AGENTS.md"), "stashed-contract-content").unwrap();
+        // Something else has already recreated the live path.
+        fs::write(root.join("AGENTS.md"), "recreated-by-something-else").unwrap();
+
+        let failed = rollback_moved_paths(&["AGENTS.md".to_string()], &stash, &root);
+
+        assert_eq!(failed.len(), 1, "the recreated destination must be reported as a failure: {failed:?}");
+        assert!(failed[0].contains("AGENTS.md"));
+        assert!(stash.join("AGENTS.md").exists(), "the stashed copy must survive rather than being silently dropped");
+        assert_eq!(read_text(&root.join("AGENTS.md")), "recreated-by-something-else", "the recreated file must not be clobbered");
     }
 
     #[test]
