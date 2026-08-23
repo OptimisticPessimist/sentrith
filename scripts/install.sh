@@ -62,6 +62,11 @@ copy_path() {
   [ -e "$src" ] || return 0
   mkdir -p "$(dirname "$dst")"
   if [ -d "$src" ]; then
+    # Reset per call: this is a plain (non-local) shell variable shared
+    # across every copy_path invocation in the loop below, so a path that
+    # does *not* need a backup this time must not remove a stale value left
+    # over from a *different* path's backup in an earlier call.
+    backup_dir=""
     if [ -e "$dst" ] || [ -L "$dst" ]; then
       backup_dir=$(mktemp -d "$(dirname "$dst")/.sentrith-update-backup.XXXXXX")
       rmdir "$backup_dir"
@@ -69,6 +74,22 @@ copy_path() {
     fi
     mkdir -p "$dst"
     cp -R "$src"/. "$dst"/
+    # Contract paths are Sentrith-owned and replaced wholesale on update --
+    # git already holds the prior version for anyone who committed before
+    # updating, so this backup is redundant once the new copy is in place.
+    # Left behind (as it used to be), it accumulates a new untracked,
+    # unreported directory on every single update.
+    #
+    # An `if`, not `[ -n "$backup_dir" ] && rm -rf ...`: under `set -e`,
+    # that form's own exit status is the *test's* whenever it's false (the
+    # common case, nothing to remove) -- and as the last statement in this
+    # branch, that becomes copy_path's own return status, aborting the
+    # whole script on every path that never needed a backup in the first
+    # place. Confirmed by reproducing it: install.sh silently stopped
+    # partway through the manifest with exit 1 and no error message.
+    if [ -n "$backup_dir" ]; then
+      rm -rf "$backup_dir"
+    fi
   else
     if [ -L "$dst" ]; then
       echo "Refusing to overwrite symlink: $dst (remove it before installing the contract file)" >&2

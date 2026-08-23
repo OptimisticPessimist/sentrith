@@ -48,12 +48,19 @@ function Copy-SentrithPath {
   if (-not (Test-Path $Src)) { return }
   New-Item -ItemType Directory -Force -Path (Split-Path $Dst -Parent) | Out-Null
   if ((Get-Item $Src).PSIsContainer) {
+    $Backup = $null
     if (Test-Path $Dst) {
       $Backup = "$Dst.sentrith-update-backup.$([Guid]::NewGuid().ToString('N'))"
       Move-Item -Force $Dst $Backup
     }
     New-Item -ItemType Directory -Force -Path $Dst | Out-Null
     Copy-Item -Recurse -Force (Join-Path $Src "*") $Dst
+    # Contract paths are Sentrith-owned and replaced wholesale on update --
+    # git already holds the prior version for anyone who committed before
+    # updating, so this backup is redundant once the new copy is in place.
+    # Left behind (as it used to be), it accumulates a new untracked,
+    # unreported directory on every single update.
+    if ($Backup) { Remove-Item -Recurse -Force $Backup }
   } else {
     Copy-Item -Force $Src $Dst
   }

@@ -3065,6 +3065,31 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // confirm its own journal no longer needs it (see
     // `finish_hook_restore_cleanup`'s doc comment) -- never here.
     let marker_path = backup_dir.join(format!("{rel_path}.restored"));
+    // `backup` could be substituted with a symlink after `reduce_hook_settings_for_baseline`
+    // created it -- e.g. pointing at `live` itself -- during the whole
+    // window an active baseline is open. Every read of `backup`'s content
+    // below (the retry-cleanup equality check, and the normal restore's
+    // `restore_file_content` call) would follow such a link: pointed at
+    // `live`, it would make `live_content == backup_content` trivially true
+    // by reading `live` against itself, misdiagnosing an untouched, still-
+    // reduced `live` as "already restored" and deleting the digest and the
+    // (symlinked) backup -- discarding the only record that this ever
+    // happened. `symlink_metadata` (unlike `exists`, used just below) does
+    // not follow the link, so this catches a substituted backup before
+    // anything trusts its content, regardless of which path below would
+    // otherwise have read it.
+    if let Ok(meta) = fs::symlink_metadata(&backup) {
+        if !meta.is_file() {
+            return Err(RestoreFailure::Unrecoverable(format!(
+                "{} was reduced during baseline, but its backup at {} is not a regular file \
+                 (found a symlink or other special file) -- something replaced it while the \
+                 baseline was active, so its content can no longer be trusted and the original \
+                 could not be recovered from it. Resolve manually.",
+                live.display(),
+                backup.display()
+            )));
+        }
+    }
     if !backup.exists() {
         if marker_path.exists() {
             // Retain the marker until the digest is confirmed gone: if this
@@ -3571,7 +3596,18 @@ fn rollback_moved_paths(moved: &[String], stash: &Path, root: &Path) -> Vec<Stri
     for path in moved.iter().rev() {
         let src = stash.join(path);
         let dst = root.join(path);
-        if !src.exists() {
+        // `src.exists()` follows a symlink to check whether its *target*
+        // resolves -- wrong here. A contract path that was a valid relative
+        // symlink at the repo root (e.g. `AGENTS.md -> ../shared/AGENTS.md`)
+        // keeps that same relative target string when moved into the
+        // (deeper) stash, so it commonly becomes dangling from its new
+        // location even though the symlink itself is intact and needs to be
+        // moved back. `exists()` alone would read that as "nothing here"
+        // and silently skip restoring it, leaving it stuck in the stash
+        // forever and the contract path missing from the working tree.
+        // `is_symlink()` (which uses `symlink_metadata`, not following the
+        // link) catches the directory entry regardless of where it resolves.
+        if !src.exists() && !src.is_symlink() {
             continue;
         }
         // Something has already recreated `dst` since it was stashed. Moving
@@ -6728,6 +6764,37 @@ mod tests {
         assert_eq!(read_text(&live), original, "the restore must still succeed correctly despite the stale symlink");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_backup_substituted_with_a_symlink_to_live() {
+        // Codex reproduced this by linking the backup to live itself after
+        // an active baseline had already reduced it: the retry-cleanup
+        // equality check reads through the symlink, sees live_content ==
+        // backup_content trivially (it's reading live against itself), and
+        // concludes restoration already happened -- deleting the digest and
+        // the (symlinked) backup while live is still sitting reduced, with
+        // baseline_stop reporting success.
+        let stash = temp_path("stash-backup-symlinked-to-live");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings-backup-symlinked-to-live.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        let reduced_content = read_text(&live);
+
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        fs::remove_file(&backup).unwrap();
+        std::os::unix::fs::symlink(&live, &backup).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+
+        assert!(
+            matches!(result, Err(RestoreFailure::Unrecoverable(_))),
+            "a substituted symlink backup must not be trusted as proof of restoration: {result:?}"
+        );
+        assert_eq!(read_text(&live), reduced_content, "live must be left exactly as found, not silently treated as already restored");
+    }
+
     #[test]
     fn baseline_hook_reduction_snapshot_does_not_store_full_settings_content() {
         let stash = temp_path("stash-digest");
@@ -7287,6 +7354,55 @@ mod tests {
         assert!(failed[0].contains("AGENTS.md"));
         assert!(stash.join("AGENTS.md").exists(), "the stashed copy must survive rather than being silently dropped");
         assert_eq!(read_text(&root.join("AGENTS.md")), "recreated-by-something-else", "the recreated file must not be clobbered");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_moved_paths_restores_a_relative_symlink_left_dangling_by_the_move() {
+        // Codex found that a contract path which is a valid relative
+        // symlink at the repo root (e.g. AGENTS.md -> ../shared/AGENTS.md)
+        // keeps that same relative target string when moved into the
+        // (deeper) stash, and commonly becomes dangling from its new
+        // location even though the symlink entry itself is intact.
+        // `src.exists()` follows the link to check whether the target
+        // resolves, so it read a perfectly restorable symlink as "nothing
+        // here" and silently skipped it.
+        let root = temp_path("root-dangling-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let stash = temp_path("stash-dangling-symlink");
+        fs::create_dir_all(&stash).unwrap();
+
+        // The real target this symlink is meant to resolve to, one level up
+        // from the repo root -- reachable via `../shared/AGENTS.md` from
+        // the root, but not from `stash/AGENTS.md`, which is what makes the
+        // moved symlink dangle.
+        let shared_dir = root.parent().unwrap().join(format!(
+            "shared-{}",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&shared_dir).unwrap();
+        fs::write(shared_dir.join("AGENTS.md"), "shared-contract-content").unwrap();
+        let relative_target = PathBuf::from("..")
+            .join(shared_dir.file_name().unwrap())
+            .join("AGENTS.md");
+
+        // Simulate the post-stash state directly: a relative symlink
+        // already sitting in the stash, pointing at a target that does not
+        // resolve from there (dangling), exactly as baseline_start's own
+        // move would have left it.
+        std::os::unix::fs::symlink(&relative_target, stash.join("AGENTS.md")).unwrap();
+        assert!(!stash.join("AGENTS.md").exists(), "sanity check: the symlink must actually be dangling from the stash");
+
+        let failed = rollback_moved_paths(&["AGENTS.md".to_string()], &stash, &root);
+
+        assert!(failed.is_empty(), "a dangling-but-restorable symlink must not be reported as a failure: {failed:?}");
+        assert!(root.join("AGENTS.md").is_symlink(), "the symlink must be moved back to the working tree");
+        assert!(!stash.join("AGENTS.md").exists() && !stash.join("AGENTS.md").is_symlink(), "nothing must be left behind in the stash");
+        assert_eq!(
+            read_text(&root.join("AGENTS.md")),
+            "shared-contract-content",
+            "restored to its original location, the same relative target must resolve again"
+        );
     }
 
     #[test]
