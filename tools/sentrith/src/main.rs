@@ -2869,15 +2869,6 @@ fn reduce_hook_settings_for_baseline(
     // getting stuck with it silently reduced and never restored (a disk
     // filling up mid-write, or the process exiting, must not be able to leave
     // `live` reduced with nothing recording that it needs restoring).
-    //
-    // The digest -- not the full reduced content -- is what `restore` later
-    // compares against; storing only a digest means there is no second copy
-    // of settings content (which may itself hold something sensitive) sitting
-    // at whatever permissions a fresh file gets by default.
-    let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
-    fs::write(&digest_path, content_digest(&reduced).to_string())
-        .map_err(|e| format!("failed to record the baseline snapshot for {}: {e}", live.display()))?;
-
     let tmp = live.with_extension("sentrith-baseline-tmp");
     // `write_secure_temp_file` never lets the full reduced settings --
     // unrelated secrets included -- sit exposed under default/inherited
@@ -2894,6 +2885,30 @@ fn reduce_hook_settings_for_baseline(
     // a brand-new path without a new dependency), and just before the rename
     // elsewhere -- either way, before `live` holds anything but the original.
     replace_file_preserving_security(&tmp, live, Some(&backup))?;
+
+    // The digest is written only after the swap above actually commits --
+    // not before it, the way an earlier version of this function did. A
+    // digest written first and left orphaned by a failed swap (e.g. Windows
+    // reporting a sharing violation because something else has the settings
+    // file open, which needs no special conditions to trigger) is
+    // indistinguishable, to `restore_hook_settings_backup`'s no-backup
+    // branch, from a genuinely completed-and-uncleaned restore: `live` was
+    // never touched by this call, but that stale digest alone would get
+    // read as unrecoverable data loss forever after, with the phase marker
+    // stuck at `baseline` and no CLI path to recover. Writing it last, once
+    // `live` is confirmed already reduced, means a failure here can at worst
+    // leave a backup with no digest -- which `restore_hook_settings_backup`
+    // already treats as a safely self-recovering conflict (fails closed,
+    // preserves the original in `baseline-hook-conflicts/`, and does not
+    // block cleanup), not a permanent, unrecoverable one.
+    //
+    // The digest -- not the full reduced content -- is what `restore` later
+    // compares against; storing only a digest means there is no second copy
+    // of settings content (which may itself hold something sensitive) sitting
+    // at whatever permissions a fresh file gets by default.
+    let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
+    fs::write(&digest_path, content_digest(&reduced).to_string())
+        .map_err(|e| format!("failed to record the baseline snapshot for {}: {e}", live.display()))?;
     Ok(true)
 }
 
@@ -3099,8 +3114,23 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
             // Only safe to drop the digest once the original is confirmed
             // preserved outside the stash: with the backup gone from its
             // known path, nothing else records that this path was ever
-            // diverged.
-            let _ = fs::remove_file(&digest_path);
+            // diverged. If this removal itself fails, the backup being gone
+            // (moved to `conflict`) plus a surviving digest is exactly the
+            // state `restore_hook_settings_backup`'s no-backup branch reads
+            // as unrecoverable data loss on a later call -- so that failure
+            // is surfaced now, with the conflict's location already at
+            // hand, instead of ignored and rediscovered from scratch later.
+            if let Err(e) = fs::remove_file(&digest_path) {
+                return Err(RestoreFailure::Unrecoverable(format!(
+                    "{} was edited while baseline was active; the original was safely preserved at \
+                     {} (merge the change by hand), but removing its now-orphaned digest at {} \
+                     failed: {e}. Remove that digest manually so this path is no longer treated as \
+                     needing recovery.",
+                    live.display(),
+                    conflict.display(),
+                    digest_path.display()
+                )));
+            }
             // Recoverable: the original is safely preserved outside the
             // stash, waiting to be merged by hand -- not a reason to block
             // baseline_stop's contract-file restoration.
@@ -3404,7 +3434,17 @@ fn baseline_start() -> Result<(), String> {
         let mut hook_restore_failed: Vec<String> = Vec::new();
         for path in BASELINE_HOOK_SETTINGS_PATHS.iter().rev() {
             if let Err(e) = restore_hook_settings_backup(path, &repo_file(path), &stash) {
-                hook_restore_failed.push(format!("{path} ({e})"));
+                // Only an Unrecoverable failure means live might still be
+                // reduced with nothing to recover it from -- a Recoverable
+                // one (a genuine conflict, safely preserved elsewhere or at
+                // its known backup path) must not block deleting the stash
+                // here either, matching `baseline_stop`'s identical
+                // distinction: the whole point of that preservation is to
+                // never hold the rest of a rollback hostage to an unrelated
+                // hook-settings issue that's already safely handled.
+                if e.is_unrecoverable() {
+                    hook_restore_failed.push(format!("{path} ({e})"));
+                }
             }
         }
         let mut rollback_failed = rollback_moved_paths(&moved, &stash, Path::new("."));
@@ -6192,6 +6232,48 @@ mod tests {
         let result = reduce_hook_settings_for_baseline("w", &live, &stash);
         assert!(result.is_err());
         assert_eq!(read_text(&live), "{not valid json", "a malformed file is left exactly as found");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reduce_leaves_no_orphaned_digest_when_the_swap_never_commits() {
+        if running_as_root() {
+            eprintln!("skipping reduce_leaves_no_orphaned_digest_when_the_swap_never_commits: running as root, where the read-only-directory simulation cannot fail");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        // Reproduces the real-world trigger directly: a digest written
+        // *before* the live replacement, left orphaned when that
+        // replacement fails for any reason (a sharing violation on Windows
+        // needs no special setup to occur -- another process merely having
+        // the settings file open is enough), used to be indistinguishable
+        // from a genuinely completed-and-uncleaned restore. `live` here was
+        // never touched by this call at all, yet the stale digest alone
+        // would previously read as unrecoverable data loss forever after.
+        let stash = temp_path("stash-swap-never-commits");
+        fs::create_dir_all(&stash).unwrap();
+        let live_dir = temp_path("live-dir");
+        fs::create_dir_all(&live_dir).unwrap();
+        let live = live_dir.join("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        // Removes write access to live's own directory, which the swap (and
+        // the temp file it stages through) both need -- simulating any
+        // failure between "the digest used to be written" and "the swap
+        // actually commits", not specifically a sharing violation, since
+        // that needs a second process this test can't spin up portably.
+        fs::set_permissions(&live_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash);
+        fs::set_permissions(&live_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "the simulated failure must actually prevent the swap: {result:?}");
+        assert_eq!(read_text(&live), original, "live must be completely untouched");
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        assert!(!digest.exists(), "no digest must be left behind when the swap itself never committed");
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert!(!backup.exists(), "no backup should exist either, since nothing was ever reduced");
     }
 
     #[test]
