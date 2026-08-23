@@ -1088,6 +1088,15 @@ fn replace_file_preserving_security(
 /// function's contract holds even when this specific step fails. Without a
 /// backup to roll back from, the error is annotated instead: there is
 /// nothing this function can do to undo the swap.
+///
+/// Restores through `restore_file_content` (the same atomic,
+/// permission-preserving swap `restore_hook_settings_backup`'s normal path
+/// already uses) rather than a plain `fs::copy` onto `destination`: a
+/// read-only destination -- Unix mode `0400`, or the Windows read-only
+/// attribute -- is exactly the state a rolled-back settings file is often
+/// already in, since preserving that original restriction is the whole
+/// point of this file's replacement helpers, and `fs::copy` fails outright
+/// against it while `fs::rename` (which the swap uses) does not.
 fn roll_back_committed_replacement(
     destination: &Path,
     backup: Option<&Path>,
@@ -1099,8 +1108,9 @@ fn roll_back_committed_replacement(
             destination.display()
         );
     };
-    match fs::copy(backup, destination) {
-        Ok(_) => format!(
+    let tmp = destination.with_extension("sentrith-baseline-rollback-tmp");
+    match restore_file_content(destination, backup, &tmp) {
+        Ok(()) => format!(
             "{original_error} (the replacement was rolled back from {}; {} is unchanged)",
             backup.display(),
             destination.display()
@@ -1111,6 +1121,32 @@ fn roll_back_committed_replacement(
             destination.display()
         ),
     }
+}
+
+/// Atomically overwrite `destination` with `source`'s content, staged
+/// through the freshly created, exclusively-owned `tmp` path. Shared by
+/// `restore_hook_settings_backup`'s normal restore and
+/// `roll_back_committed_replacement`'s rollback -- both are "put a
+/// known-good copy back in place of whatever `destination` currently
+/// holds," and this is the one place that knows how to do that safely:
+/// `create_secure_file` refuses to reuse or follow anything already at
+/// `tmp` (closing the symlink-follow window a direct `fs::copy` onto a
+/// predictable temp path would open), and `replace_file_preserving_security`
+/// -- unlike `fs::copy` straight onto `destination` -- does not require
+/// `destination` to already be writable: `fs::rename` only needs write
+/// permission on the containing directory, and the Windows implementation
+/// explicitly clears and restores the read-only attribute around
+/// `ReplaceFileW`. `destination`'s own current permissions (not `source`'s)
+/// are what `tmp` is widened or narrowed to match on Unix, since `tmp` is
+/// standing in for `destination`'s next content, not `source`'s.
+fn restore_file_content(destination: &Path, source: &Path, tmp: &Path) -> Result<(), String> {
+    let mut dest = create_secure_file(tmp)?;
+    let mut src = fs::File::open(source).map_err(|e| e.to_string())?;
+    std::io::copy(&mut src, &mut dest).map_err(|e| e.to_string())?;
+    drop(dest);
+    #[cfg(not(windows))]
+    copy_file_permissions(destination, tmp)?;
+    replace_file_preserving_security(tmp, destination, None)
 }
 
 #[cfg(windows)]
@@ -3183,39 +3219,16 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     }
 
     // `backup` is left at its original, already-known path until the
-    // replacement below actually commits: a copy here (not a rename) means an
+    // replacement below actually commits: staging through a separate `tmp`
+    // (rather than renaming `backup` itself onto `live`) means an
     // interruption at any point up to and including a failed replace still
     // leaves `backup` exactly where a retried restore looks for it, instead
     // of orphaning the original content at a temp path nothing else knows to
-    // check.
+    // check. See `restore_file_content`'s doc comment for why this goes
+    // through it rather than a direct `fs::copy` onto `live`.
     let tmp = live.with_extension("sentrith-baseline-restore-tmp");
-    // `fs::copy` opens its destination without refusing to follow an
-    // existing symlink there -- the same class of attack just fixed for the
-    // install-time backup, reachable here too since this predictable path
-    // could already be a symlink: it would silently overwrite the symlink's
-    // target with the backed-up settings, and the rename below would then
-    // move that same symlink onto `live` itself. `create_secure_file`
-    // refuses to reuse or follow anything already at the path; streaming
-    // `backup`'s bytes into the already-open handle it returns (rather than
-    // a second, separate open by path, which is what `fs::copy` does
-    // internally) closes the window entirely. This also means `tmp` is
-    // always a freshly created file with no attributes inherited from
-    // `backup` -- unlike `fs::copy`, so the read-only-attribute workaround
-    // this used to need on Windows no longer applies.
-    let mut dest = create_secure_file(&tmp)
-        .map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
-    let mut src = fs::File::open(&backup)
-        .map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
-    std::io::copy(&mut src, &mut dest)
-        .map_err(|e| format!("failed to prepare restore of {}: {e}", live.display()))?;
-    drop(dest);
-    #[cfg(not(windows))]
-    copy_file_permissions(live, &tmp)?;
-    // As in `reduce`: on Windows, replacing through `ReplaceFileW` (rather
-    // than a raw rename) is what actually preserves whatever the reduced
-    // file's security descriptor was, instead of silently adopting the
-    // backup's.
-    replace_file_preserving_security(&tmp, live, None)?;
+    restore_file_content(live, &backup, &tmp)
+        .map_err(|e| format!("failed to restore {}: {e}", live.display()))?;
     finish_hook_restore_cleanup(&backup, &digest_path, &marker_path, live).map_err(RestoreFailure::from)
 }
 
@@ -6331,6 +6344,45 @@ mod tests {
         );
         let backup = stash.join("hook-settings-backup").join("w");
         assert!(backup.exists(), "the backup this call already created is left for a retry to see");
+    }
+
+    #[test]
+    fn reduce_rolls_a_read_only_live_back_when_the_digest_write_fails() {
+        // Codex found that the rollback above used to call `fs::copy`
+        // directly onto `live`, which fails outright once `live` is
+        // read-only (Unix mode `0400`, or the Windows read-only attribute)
+        // -- exactly the state a rolled-back settings file is often already
+        // in, since preserving that original restriction is the whole point
+        // of this file's replacement helpers. The rollback now goes through
+        // `restore_file_content`, the same atomic swap the normal restore
+        // path already used for this exact reason.
+        let stash = temp_path("stash-digest-write-fails-readonly");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings-digest-write-fails-readonly.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+        let mut permissions = fs::metadata(&live).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&live, permissions).unwrap();
+
+        let digest_path = stash.join("hook-settings-backup").join("w.reduced-digest");
+        fs::create_dir_all(&digest_path).unwrap();
+
+        let result = reduce_hook_settings_for_baseline("w", &live, &stash);
+        let still_readonly = fs::metadata(&live).unwrap().permissions().readonly();
+        // Undo the read-only bit before any assertion can panic and skip it,
+        // so a failing run still leaves the temp directory cleanable.
+        let mut permissions = fs::metadata(&live).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&live, permissions).unwrap();
+
+        assert!(result.is_err(), "a failed digest write must still surface as Err");
+        assert_eq!(
+            read_text(&live),
+            original,
+            "a read-only live must still be rolled back to the original when the digest write fails"
+        );
+        assert!(still_readonly, "the rollback must not leave live any less restricted than it started");
     }
 
     #[test]
