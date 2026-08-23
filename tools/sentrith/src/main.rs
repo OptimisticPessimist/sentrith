@@ -1598,6 +1598,12 @@ impl std::fmt::Display for OpenRefusal {
     }
 }
 
+impl std::fmt::Debug for OpenRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
 /// Confirm every directory component from `root` down to (and including)
 /// `leaf`'s parent is a real directory rather than a symlink.
 ///
@@ -6920,7 +6926,7 @@ mod tests {
 
         let elsewhere = temp_path("elsewhere.txt");
         fs::write(&elsewhere, "untouched").unwrap();
-        let tmp = sibling_temp_path(live, "sentrith-baseline-tmp");
+        let tmp = sibling_temp_path(&live, "sentrith-baseline-tmp");
         std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
 
         assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
@@ -7062,7 +7068,7 @@ mod tests {
 
         let victim = temp_path("victim.txt");
         fs::write(&victim, "victim-must-not-be-touched").unwrap();
-        let restore_tmp = sibling_temp_path(live, "sentrith-baseline-restore-tmp");
+        let restore_tmp = sibling_temp_path(&live, "sentrith-baseline-restore-tmp");
         std::os::unix::fs::symlink(&victim, &restore_tmp).unwrap();
 
         assert!(restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap());
