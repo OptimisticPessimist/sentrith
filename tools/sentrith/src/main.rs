@@ -2959,20 +2959,31 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
     // Durable proof that Sentrith's own restore actually committed for this
     // path -- written by `finish_hook_restore_cleanup` before it touches
-    // backup or digest, removed only once cleanup fully finishes. Neither
-    // the backup's absence nor a digest mismatch is reliable proof on its
-    // own: the backup could have been deleted externally while `live` is
-    // still reduced, and a mismatch only proves `live` is no longer the
-    // *exact* reduced snapshot -- an unrelated edit made on top of the
-    // still-reduced file would produce the same mismatch without hooks ever
-    // actually being restored. Only this marker's presence is unambiguous.
+    // backup or digest. Neither the backup's absence nor a digest mismatch
+    // is reliable proof on its own: the backup could have been deleted
+    // externally while `live` is still reduced, and a mismatch only proves
+    // `live` is no longer the *exact* reduced snapshot -- an unrelated edit
+    // made on top of the still-reduced file would produce the same mismatch
+    // without hooks ever actually being restored. Only this marker's
+    // presence is unambiguous. Removed only by `baseline_stop`, once it can
+    // confirm its own journal no longer needs it (see
+    // `finish_hook_restore_cleanup`'s doc comment) -- never here.
     let marker_path = backup_dir.join(format!("{rel_path}.restored"));
     if !backup.exists() {
         if marker_path.exists() {
-            let _ = fs::remove_file(&digest_path);
-            fs::remove_file(&marker_path).map_err(|e| {
-                format!("could not remove restore marker {}: {e}", marker_path.display())
-            })?;
+            // Retain the marker until the digest is confirmed gone: if this
+            // removal fails (a transient sharing violation), the marker
+            // must still be here for a retry to find, or a later call would
+            // see a digest with no marker and misclassify this exact,
+            // already-proven-restored path as unrecoverable. A prior attempt
+            // may have already removed the digest before failing on
+            // something else, so only attempt this when there's actually
+            // something left to remove.
+            if digest_path.exists() {
+                fs::remove_file(&digest_path).map_err(|e| {
+                    format!("could not remove orphaned digest {}: {e}", digest_path.display())
+                })?;
+            }
             return Ok(true);
         }
         if digest_path.exists() {
@@ -3161,11 +3172,18 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
 }
 
 /// Durably record that `live` is restored, then remove the now-obsolete
-/// backup, digest, and that record itself, once `live` already holds the
-/// restored content -- whether that replacement just happened or was
-/// confirmed on a retry (see the equality check at the top of
-/// `restore_hook_settings_backup`). Split out so both paths share the same
-/// cleanup and the same failure handling.
+/// backup and digest, once `live` already holds the restored content --
+/// whether that replacement just happened or was confirmed on a retry (see
+/// the equality check at the top of `restore_hook_settings_backup`). Split
+/// out so both paths share the same cleanup and the same failure handling.
+///
+/// Deliberately does *not* remove the marker itself: `baseline_stop` durably
+/// removes a restored path from its own journal after this returns, and
+/// that journal rewrite can itself fail or be interrupted. If the marker
+/// were already gone by then, a retry would have nothing left to prove the
+/// restore happened, re-entering the exact stuck state this marker exists
+/// to prevent -- so the caller, not this function, removes it, only once
+/// it can confirm the journal itself no longer needs it.
 fn finish_hook_restore_cleanup(
     backup: &Path,
     digest_path: &Path,
@@ -3210,13 +3228,11 @@ fn finish_hook_restore_cleanup(
     fs::remove_file(digest_path).map_err(|e| {
         format!("restored {} but could not remove its digest {}: {e}", live.display(), digest_path.display())
     })?;
-    // Removed last, only once backup and digest are both confirmed gone: as
-    // long as this marker survives, the early no-backup branch above can
-    // still tell a genuinely completed restore apart from one that never
-    // happened, no matter what state the other two artifacts are in.
-    fs::remove_file(marker_path).map_err(|e| {
-        format!("restored {} but could not remove its restore marker {}: {e}", live.display(), marker_path.display())
-    })?;
+    // The marker is intentionally left in place here -- see this function's
+    // doc comment. `marker_path` is still taken as a parameter (rather than
+    // dropped now that this function no longer touches it) so every call
+    // site stays explicit about which marker belongs to this restore.
+    let _ = marker_path;
     Ok(true)
 }
 
@@ -3623,6 +3639,12 @@ fn baseline_stop() -> Result<(), String> {
         match restore_hook_settings_backup(path, &repo_file(path), &stash) {
             Ok(true) => {
                 hook_edits_restored += 1;
+                // `restore_hook_settings_backup` deliberately leaves this
+                // path's durable restore marker in place -- it is only safe
+                // to remove once the journal itself no longer needs it to
+                // recognize this path as done, which for a journaled path
+                // means *after* the write below actually lands.
+                let marker = stash.join("hook-settings-backup").join(format!("{path}.restored"));
                 if journaled.iter().any(|p| p == path) {
                     let mut without_path = journaled.clone();
                     without_path.retain(|p| p != path);
@@ -3634,11 +3656,20 @@ fn baseline_stop() -> Result<(), String> {
                     // exists to prevent -- ignoring the error would silently
                     // trade one bug for the illusion of having fixed it.
                     match fs::write(&hook_edits_manifest, without_path.join("\n") + "\n") {
-                        Ok(()) => journaled = without_path,
+                        Ok(()) => {
+                            journaled = without_path;
+                            let _ = fs::remove_file(&marker);
+                        }
                         Err(e) => hook_restore_failed.push(format!(
                             "{path} (restored, but could not durably record that in the baseline journal: {e})"
                         )),
                     }
+                } else {
+                    // Never journaled (or already durably removed by an
+                    // earlier, successful call within this same run) -- no
+                    // journal write is gating this path, so the marker can
+                    // be cleared immediately.
+                    let _ = fs::remove_file(&marker);
                 }
             }
             Ok(false) => {
@@ -5911,13 +5942,14 @@ mod tests {
     }
 
     #[test]
-    fn restore_hook_settings_backup_clears_a_leftover_restore_marker() {
-        // Simulates an interruption after a restore fully committed and
-        // cleaned up its backup and digest, but before it removed its own
-        // durable restore marker -- the marker's presence, not any
-        // inference from live's content or the digest, is what must let a
-        // later call conclude the restore already happened and finish
-        // tidying up.
+    fn restore_hook_settings_backup_recognizes_a_surviving_restore_marker() {
+        // Simulates a completed restore whose backup and digest were both
+        // already removed, leaving only the durable restore marker.
+        // `restore_hook_settings_backup` itself deliberately never removes
+        // this marker -- only `baseline_stop` does, once it confirms its own
+        // journal no longer needs it -- so repeated calls here must keep
+        // recognizing it and reporting success without erroring, not clear
+        // it out from under the caller that's supposed to own that decision.
         let stash = temp_path("stash-leftover-marker");
         fs::create_dir_all(&stash).unwrap();
         let live = temp_path("settings.json");
@@ -5926,7 +5958,7 @@ mod tests {
 
         assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
         // Simulate a completed restore whose backup and digest were both
-        // removed, but whose own marker removal did not happen.
+        // removed, but whose own marker removal is not this function's job.
         fs::write(&live, original).unwrap();
         let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
         let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
@@ -5935,12 +5967,46 @@ mod tests {
         fs::remove_file(&digest).unwrap();
         fs::write(&marker, "").unwrap();
 
-        assert!(
-            restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap(),
-            "the surviving restore marker is durable proof this path was already restored"
-        );
-        assert!(!marker.exists(), "the leftover marker must be cleaned up once found");
+        for _ in 0..2 {
+            assert!(
+                restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap(),
+                "the surviving restore marker is durable proof this path was already restored"
+            );
+        }
+        assert!(marker.exists(), "removing the marker is the caller's decision to make, not this function's");
         assert_eq!(read_text(&live), original, "live must be left untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_keeps_the_marker_when_orphaned_digest_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // If removing the leftover digest fails (a transient sharing
+        // violation, simulated here with a read-only parent directory), the
+        // marker must survive so a retry can still find it -- losing it here
+        // would leave the digest orphaned with no marker to explain it,
+        // which a later call would misclassify as unrecoverable.
+        let stash = temp_path("stash-digest-removal-fails");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        fs::write(&live, original).unwrap();
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        let marker = stash.join("hook-settings-backup").join(".claude/settings.json.restored");
+        fs::remove_file(&backup).unwrap();
+        fs::write(&marker, "").unwrap();
+
+        let backup_dir = stash.join("hook-settings-backup").join(".claude");
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "a failed digest removal must be reported, not silently ignored");
+        assert!(marker.exists(), "the marker must survive a failed digest removal so a retry can still find it");
     }
 
     #[test]
