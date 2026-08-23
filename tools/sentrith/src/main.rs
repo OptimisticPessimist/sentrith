@@ -1144,6 +1144,31 @@ fn restore_file_content(destination: &Path, source: &Path, tmp: &Path) -> Result
     let mut src = fs::File::open(source).map_err(|e| e.to_string())?;
     std::io::copy(&mut src, &mut dest).map_err(|e| e.to_string())?;
     drop(dest);
+    finish_restore_swap(destination, tmp)
+}
+
+/// `restore_file_content` for a caller that already holds the bytes and must
+/// not reopen their source. `restore_hook_settings_backup` reads its backup
+/// exactly once, through a handle that refused to follow a symlink; handing
+/// that content here (rather than the path it came from) is what keeps the
+/// restore from reopening a path another process may have substituted in the
+/// meantime.
+fn restore_file_content_from_memory(
+    destination: &Path,
+    content: &str,
+    tmp: &Path,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut dest = create_secure_file(tmp)?;
+    dest.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
+    drop(dest);
+    finish_restore_swap(destination, tmp)
+}
+
+/// The half both restore paths share once `tmp` holds the content to install:
+/// match `destination`'s current mode (not the source's -- `tmp` is standing
+/// in for `destination`'s next content), then swap atomically.
+fn finish_restore_swap(destination: &Path, tmp: &Path) -> Result<(), String> {
     #[cfg(not(windows))]
     copy_file_permissions(destination, tmp)?;
     replace_file_preserving_security(tmp, destination, None)
@@ -1406,7 +1431,7 @@ fn write_secure_temp_file(tmp: &Path, content: &str) -> Result<(), String> {
 /// ordinary-permission exclusive create instead.
 fn write_ordinary_file_without_following_a_symlink(path: &Path, content: &str) -> Result<(), String> {
     use std::io::Write;
-    let tmp = path.with_extension("sentrith-write-tmp");
+    let tmp = sibling_temp_path(path, "sentrith-write-tmp");
     let _ = fs::remove_file(&tmp);
     {
         let mut file = fs::OpenOptions::new()
@@ -1418,6 +1443,89 @@ fn write_ordinary_file_without_following_a_symlink(path: &Path, content: &str) -
             .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))?;
     }
     fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// `path` with `suffix` *appended* -- deliberately not `Path::with_extension`,
+/// which **replaces** whatever extension is already there and so collapses
+/// distinct paths onto one temp path. In `hook-settings-backup/` alone,
+/// `with_extension` maps both `settings.json.reduced-digest` and
+/// `settings.json.restored` to the same `settings.json.sentrith-write-tmp`;
+/// two files being staged concurrently (or one retried while the other's temp
+/// file is still around) would then silently overwrite each other's staging
+/// area. Appending keeps the mapping injective: distinct sources always get
+/// distinct temp paths.
+fn sibling_temp_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Whether a directory entry exists at `path` *as an entry*, without
+/// following it. `Path::exists` answers "does this resolve to something",
+/// which is a different question and the wrong one whenever a symlink is
+/// involved: a dangling symlink (its target gone, or -- for a relative link
+/// -- simply not resolvable from where the link now sits) makes `exists`
+/// return false even though the entry is right there and matters. Both
+/// baseline restore loops depend on this distinction in both directions:
+/// a stashed entry that must still be moved back, and a destination entry
+/// whose presence must block a rename that would otherwise silently delete it.
+fn entry_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// Open `path` for reading, refusing to follow a symlink at that path, and
+/// confirm the *opened handle* is a regular file.
+///
+/// The point is the ordering: a `symlink_metadata` check followed by a
+/// separate `File::open` is a check-then-use race -- during an active
+/// baseline another process has a long window to substitute the path in
+/// between, so the thing validated and the thing opened need not be the same
+/// file. Validating the handle this returns closes that gap: whatever is
+/// read from it is the same object whose type was checked.
+///
+/// `O_NOFOLLOW` (Unix) and `FILE_FLAG_OPEN_REPARSE_POINT` (Windows) make the
+/// open itself refuse to traverse a link rather than quietly reading the
+/// target, so a substituted symlink fails here instead of returning the
+/// wrong content. The `is_file` check on top rejects directories and other
+/// special files that a plain open would accept.
+fn open_regular_file_no_follow(path: &Path) -> Result<fs::File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Spelled out per-OS rather than pulled from libc: this project
+        // deliberately has no dependencies, and O_NOFOLLOW is not a shared
+        // constant across Unixes.
+        #[cfg(target_os = "linux")]
+        const O_NOFOLLOW: i32 = 0o400000;
+        #[cfg(target_os = "macos")]
+        const O_NOFOLLOW: i32 = 0x0100;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        const O_NOFOLLOW: i32 = 0o400000;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let is_file = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?
+        .is_file();
+    if !is_file {
+        return Err(format!(
+            "{} is not a regular file (found a directory or other special file)",
+            path.display()
+        ));
+    }
+    Ok(file)
 }
 
 fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
@@ -3067,30 +3175,55 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     let marker_path = backup_dir.join(format!("{rel_path}.restored"));
     // `backup` could be substituted with a symlink after `reduce_hook_settings_for_baseline`
     // created it -- e.g. pointing at `live` itself -- during the whole
-    // window an active baseline is open. Every read of `backup`'s content
-    // below (the retry-cleanup equality check, and the normal restore's
-    // `restore_file_content` call) would follow such a link: pointed at
-    // `live`, it would make `live_content == backup_content` trivially true
-    // by reading `live` against itself, misdiagnosing an untouched, still-
+    // window an active baseline is open. Pointed at `live`, a followed link
+    // would make the retry-cleanup equality check below trivially true by
+    // reading `live` against itself, misdiagnosing an untouched, still-
     // reduced `live` as "already restored" and deleting the digest and the
-    // (symlinked) backup -- discarding the only record that this ever
-    // happened. `symlink_metadata` (unlike `exists`, used just below) does
-    // not follow the link, so this catches a substituted backup before
-    // anything trusts its content, regardless of which path below would
-    // otherwise have read it.
-    if let Ok(meta) = fs::symlink_metadata(&backup) {
-        if !meta.is_file() {
-            return Err(RestoreFailure::Unrecoverable(format!(
-                "{} was reduced during baseline, but its backup at {} is not a regular file \
-                 (found a symlink or other special file) -- something replaced it while the \
-                 baseline was active, so its content can no longer be trusted and the original \
-                 could not be recovered from it. Resolve manually.",
-                live.display(),
-                backup.display()
-            )));
+    // (symlinked) backup -- discarding the only record that this happened.
+    //
+    // Read it exactly once, here, through a handle that refused to follow a
+    // link, and use *that content* for both the comparison and the restore
+    // below. An earlier version validated the path with `symlink_metadata`
+    // and then let the two consumers reopen it by name, which is a
+    // check-then-use race: a substitution landing between the check and
+    // either reopen would still be followed. Nothing below reopens `backup`
+    // for reading, so there is no second open left to race against.
+    let backup_content = match open_regular_file_no_follow(&backup) {
+        Ok(mut file) => {
+            use std::io::Read;
+            let mut content = String::new();
+            match file.read_to_string(&mut content) {
+                Ok(_) => Some(content),
+                // Unreadable (invalid UTF-8, a transient error) is not
+                // proof of substitution -- fall through to the same
+                // treatment as a backup that could not be opened at all.
+                Err(_) => None,
+            }
         }
-    }
-    if !backup.exists() {
+        Err(e) => {
+            // Distinguish "no backup here" (an ordinary, expected state
+            // handled by the `!backup.exists()` branch just below) from
+            // "something is here but it is not a regular file we can
+            // trust". Only the latter is evidence of substitution.
+            if entry_exists(&backup) {
+                return Err(RestoreFailure::Unrecoverable(format!(
+                    "{} was reduced during baseline, but its backup at {} could not be opened as \
+                     a regular file ({e}) -- something may have replaced it while the baseline \
+                     was active, so its content cannot be trusted and the original could not be \
+                     recovered from it. Resolve manually.",
+                    live.display(),
+                    backup.display()
+                )));
+            }
+            None
+        }
+    };
+    // `entry_exists`, not `backup.exists()`: this branch is the "no backup
+    // at all" case, and a dangling symlink at the path is emphatically not
+    // that -- it is a substitution, already rejected above. Using `exists()`
+    // here would let such an entry fall through into this branch and be
+    // treated as a plain missing backup.
+    if !entry_exists(&backup) {
         if marker_path.exists() {
             // Retain the marker until the digest is confirmed gone: if this
             // removal fails (a transient sharing violation), the marker
@@ -3144,11 +3277,14 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // otherwise make an unreadable `live` and an unreadable (or genuinely
     // empty) `backup` compare equal and falsely take this path -- deleting
     // the backup while `live` was never actually verified to hold the
-    // restored content.
-    if let (Ok(live_content), Ok(backup_content)) =
-        (fs::read_to_string(live), fs::read_to_string(&backup))
+    // restored content. `backup_content` was already read once, above,
+    // through a handle that refused to follow a symlink; comparing against
+    // that (rather than reopening `backup` by name here) is what keeps a
+    // substitution from slipping in between the validation and this use.
+    if let (Ok(live_content), Some(backup_content)) =
+        (fs::read_to_string(live), backup_content.as_ref())
     {
-        if live_content == backup_content {
+        if &live_content == backup_content {
             // `live` is already confirmed correct at this point; any
             // failure finishing cleanup is a leftover-artifact problem, not
             // evidence live might still be reduced.
@@ -3278,8 +3414,22 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // of orphaning the original content at a temp path nothing else knows to
     // check. See `restore_file_content`'s doc comment for why this goes
     // through it rather than a direct `fs::copy` onto `live`.
-    let tmp = live.with_extension("sentrith-baseline-restore-tmp");
-    restore_file_content(live, &backup, &tmp)
+    //
+    // Writes the content already read above rather than reopening `backup`
+    // by name -- the same reason the equality check does: reopening here
+    // would reintroduce exactly the check-then-use window the no-follow
+    // read closed, letting a substitution land between validation and this
+    // restore and put the wrong content into `live`.
+    let Some(backup_content) = backup_content else {
+        return Err(RestoreFailure::Recoverable(format!(
+            "{} was reduced during baseline, but its backup at {} could not be read; \
+             left the backup and digest in place so this can be retried.",
+            live.display(),
+            backup.display()
+        )));
+    };
+    let tmp = sibling_temp_path(live, "sentrith-baseline-restore-tmp");
+    restore_file_content_from_memory(live, &backup_content, &tmp)
         .map_err(|e| format!("failed to restore {}: {e}", live.display()))?;
     finish_hook_restore_cleanup(&backup, &digest_path, &marker_path, live).map_err(RestoreFailure::from)
 }
@@ -3594,38 +3744,55 @@ fn baseline_start() -> Result<(), String> {
 fn rollback_moved_paths(moved: &[String], stash: &Path, root: &Path) -> Vec<String> {
     let mut failed = Vec::new();
     for path in moved.iter().rev() {
-        let src = stash.join(path);
-        let dst = root.join(path);
-        // `src.exists()` follows a symlink to check whether its *target*
-        // resolves -- wrong here. A contract path that was a valid relative
-        // symlink at the repo root (e.g. `AGENTS.md -> ../shared/AGENTS.md`)
-        // keeps that same relative target string when moved into the
-        // (deeper) stash, so it commonly becomes dangling from its new
-        // location even though the symlink itself is intact and needs to be
-        // moved back. `exists()` alone would read that as "nothing here"
-        // and silently skip restoring it, leaving it stuck in the stash
-        // forever and the contract path missing from the working tree.
-        // `is_symlink()` (which uses `symlink_metadata`, not following the
-        // link) catches the directory entry regardless of where it resolves.
-        if !src.exists() && !src.is_symlink() {
-            continue;
-        }
-        // Something has already recreated `dst` since it was stashed. Moving
-        // the stashed copy over it would clobber whatever that is; leaving
-        // it silently in place -- without recording this as a failure --
-        // would let the caller believe rollback fully succeeded and delete
-        // the stash, discarding the stashed copy with no record it was ever
-        // there. Matches how `baseline_stop`'s equivalent restore loop
-        // already treats this exact situation.
-        if dst.exists() {
-            failed.push(format!("{path} (already exists in the working tree)"));
-            continue;
-        }
-        if let Err(e) = fs::rename(&src, &dst) {
-            failed.push(format!("{path} ({e})"));
+        if let Err(e) = restore_one_stashed_path(path, stash, root) {
+            failed.push(e);
         }
     }
     failed
+}
+
+/// Move one stashed path back to its place under `root`. `Ok(true)` means it
+/// was moved, `Ok(false)` that there was nothing in the stash to move, and
+/// `Err` carries a caller-displayable reason it could not be.
+///
+/// Shared by `baseline_start`'s rollback (via `rollback_moved_paths`) and
+/// `baseline_stop`'s restore loop, which are the same operation in opposite
+/// directions of the same baseline. They were separate near-copies until a
+/// symlink-handling fix landed in one and not the other; per
+/// `tools/sentrith/DECISIONS.md` ADR-20260823-01, the fix for that is to
+/// make there be one implementation, not to remember to patch both.
+///
+/// Uses `entry_exists` on *both* sides rather than `Path::exists`, which
+/// follows links and answers the wrong question in both directions:
+/// - `src`: a contract path that was a valid *relative* symlink at the repo
+///   root (e.g. `AGENTS.md -> ../shared/AGENTS.md`) keeps that same relative
+///   target when moved into the deeper stash, so it commonly dangles from
+///   its new location even though the entry is intact and must be moved
+///   back. `exists()` reads that as "nothing here" and silently skips it,
+///   stranding it in the stash with the contract path missing from the tree.
+/// - `dst`: something recreated at the destination must block the rename, and
+///   a *dangling* symlink recreated there is still something -- `exists()`
+///   returns false for it, so the rename would silently delete it instead of
+///   reporting the conflict this check promises.
+fn restore_one_stashed_path(path: &str, stash: &Path, root: &Path) -> Result<bool, String> {
+    let src = stash.join(path);
+    let dst = root.join(path);
+    if !entry_exists(&src) {
+        return Ok(false);
+    }
+    // Something has already recreated `dst` since it was stashed. Moving the
+    // stashed copy over it would clobber whatever that is; leaving it
+    // silently in place -- without recording this as a failure -- would let
+    // the caller believe the restore fully succeeded and delete the stash,
+    // discarding the stashed copy with no record it was ever there.
+    if entry_exists(&dst) {
+        return Err(format!("{path} (already exists in the working tree)"));
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{path} ({e})"))?;
+    }
+    fs::rename(&src, &dst).map_err(|e| format!("{path} ({e})"))?;
+    Ok(true)
 }
 
 enum StashState {
@@ -3894,22 +4061,19 @@ fn baseline_stop() -> Result<(), String> {
 
     let mut restored = 0;
     let mut failed = Vec::new();
+    // Shares `restore_one_stashed_path` with `baseline_start`'s rollback
+    // rather than repeating its logic: this loop used to be a near-copy, and
+    // a symlink-handling fix landed in the other copy but not this one.
+    // The empty root reproduces this loop's previous `repo_file(path)`
+    // exactly: `repo_file` is `Path::new(path)`, and `Path::new("").join(p)`
+    // is `p`. `baseline_start`'s rollback passes a real directory instead,
+    // which is why the helper takes one at all.
+    let root = repo_file("");
     for path in entries.iter().map(String::as_str) {
-        let src = stash.join(path);
-        let dst = repo_file(path);
-        if !src.exists() {
-            continue;
-        }
-        if dst.exists() {
-            failed.push(format!("{path} (already exists in the working tree)"));
-            continue;
-        }
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        match fs::rename(&src, &dst) {
-            Ok(_) => restored += 1,
-            Err(e) => failed.push(format!("{path} ({e})")),
+        match restore_one_stashed_path(path, &stash, &root) {
+            Ok(true) => restored += 1,
+            Ok(false) => {}
+            Err(e) => failed.push(e),
         }
     }
 
@@ -6795,6 +6959,38 @@ mod tests {
         assert_eq!(read_text(&live), reduced_content, "live must be left exactly as found, not silently treated as already restored");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_no_follow_refuses_a_symlink_instead_of_reading_its_target() {
+        // The primitive behind the check-then-use fix: validating a path
+        // with symlink_metadata and *then* opening it by name leaves a
+        // window for substitution in between. This opens and validates the
+        // same handle, so a symlink fails at open rather than silently
+        // yielding the target's bytes.
+        let target = temp_path("no-follow-target.txt");
+        fs::write(&target, "target-content-must-not-be-read").unwrap();
+        let link = temp_path("no-follow-link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            open_regular_file_no_follow(&link).is_err(),
+            "a symlink must not open, let alone yield its target's content"
+        );
+
+        // The same helper must still open an ordinary file normally.
+        let plain = temp_path("no-follow-plain.txt");
+        fs::write(&plain, "plain-content").unwrap();
+        let mut file = open_regular_file_no_follow(&plain).unwrap();
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut file, &mut content).unwrap();
+        assert_eq!(content, "plain-content");
+
+        // ...and reject a directory, which a plain open would accept on Unix.
+        let dir = temp_path("no-follow-dir");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(open_regular_file_no_follow(&dir).is_err(), "a directory is not a regular file");
+    }
+
     #[test]
     fn baseline_hook_reduction_snapshot_does_not_store_full_settings_content() {
         let stash = temp_path("stash-digest");
@@ -7402,6 +7598,88 @@ mod tests {
             read_text(&root.join("AGENTS.md")),
             "shared-contract-content",
             "restored to its original location, the same relative target must resolve again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_reports_a_conflict_for_a_dangling_symlink_recreated_at_the_destination() {
+        // Codex found the mirror of the dangling-source bug: `dst.exists()`
+        // also follows the link, so a *dangling* symlink recreated at the
+        // contract path while baseline was active reads as "nothing there"
+        // and the rename silently deletes it, instead of reporting the
+        // conflict this check exists to report.
+        let root = temp_path("root-dangling-dst");
+        fs::create_dir_all(&root).unwrap();
+        let stash = temp_path("stash-dangling-dst");
+        fs::create_dir_all(&stash).unwrap();
+        fs::write(stash.join("AGENTS.md"), "stashed-contract-content").unwrap();
+
+        // Recreated at the destination, pointing at something that does not
+        // exist -- a dangling entry, but an entry the user put there.
+        std::os::unix::fs::symlink("does-not-exist-anywhere", root.join("AGENTS.md")).unwrap();
+        assert!(!root.join("AGENTS.md").exists(), "sanity check: the destination symlink must be dangling");
+
+        let failed = rollback_moved_paths(&["AGENTS.md".to_string()], &stash, &root);
+
+        assert_eq!(failed.len(), 1, "a recreated dangling symlink must be reported as a conflict: {failed:?}");
+        assert!(root.join("AGENTS.md").is_symlink(), "the user's symlink must not be silently deleted");
+        assert!(stash.join("AGENTS.md").exists(), "the stashed copy must survive rather than being moved over it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_stop_and_start_rollback_share_one_restore_implementation() {
+        // These two loops were near-copies until a symlink fix landed in one
+        // and not the other (Codex found the un-fixed half a round later).
+        // They now share `restore_one_stashed_path`; this exercises that
+        // shared function directly for both of the symlink-aware checks, so
+        // a future divergence has to break a test rather than only being
+        // caught by review.
+        let root = temp_path("root-shared-restore");
+        fs::create_dir_all(&root).unwrap();
+        let stash = temp_path("stash-shared-restore");
+        fs::create_dir_all(&stash).unwrap();
+
+        // A dangling source entry must still be restored...
+        std::os::unix::fs::symlink("../elsewhere/AGENTS.md", stash.join("AGENTS.md")).unwrap();
+        assert_eq!(
+            restore_one_stashed_path("AGENTS.md", &stash, &root),
+            Ok(true),
+            "a dangling stashed symlink is still an entry that must be moved back"
+        );
+        assert!(root.join("AGENTS.md").is_symlink());
+
+        // ...and a dangling destination entry must still block.
+        fs::write(stash.join("CLAUDE.md"), "stashed").unwrap();
+        std::os::unix::fs::symlink("also-does-not-exist", root.join("CLAUDE.md")).unwrap();
+        assert!(
+            restore_one_stashed_path("CLAUDE.md", &stash, &root).is_err(),
+            "a dangling destination entry must be reported, not silently overwritten"
+        );
+        assert!(root.join("CLAUDE.md").is_symlink(), "the destination entry must survive");
+
+        // Nothing at all in the stash is not an error, just nothing to do.
+        assert_eq!(restore_one_stashed_path("docs/ai/PROJECT.md", &stash, &root), Ok(false));
+    }
+
+    #[test]
+    fn sibling_temp_path_never_collapses_two_sources_onto_one_temp_path() {
+        // `Path::with_extension` (what this used to be) *replaces* the
+        // existing extension, mapping both `settings.json.reduced-digest`
+        // and `settings.json.restored` onto the same
+        // `settings.json.sentrith-write-tmp` -- two files staged in the same
+        // directory would silently share a staging area.
+        let digest = sibling_temp_path(Path::new("d/settings.json.reduced-digest"), "sentrith-write-tmp");
+        let marker = sibling_temp_path(Path::new("d/settings.json.restored"), "sentrith-write-tmp");
+        let backup = sibling_temp_path(Path::new("d/settings.json"), "sentrith-write-tmp");
+        assert_ne!(digest, marker);
+        assert_ne!(digest, backup);
+        assert_ne!(marker, backup);
+        // And an extensionless path still gets a suffix rather than losing anything.
+        assert_eq!(
+            sibling_temp_path(Path::new(".ai-usage/phase"), "sentrith-write-tmp"),
+            PathBuf::from(".ai-usage/phase.sentrith-write-tmp")
         );
     }
 
