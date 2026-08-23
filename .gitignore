@@ -15,3 +15,4 @@ bin/sentrith.exe
 *.sentrith-baseline-tmp
 *.sentrith-baseline-restore-tmp
 *.sentrith-baseline-rollback-tmp
+*.sentrith-write-tmp

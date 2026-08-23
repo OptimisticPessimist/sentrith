@@ -1384,6 +1384,42 @@ fn write_secure_temp_file(tmp: &Path, content: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))
 }
 
+/// Write `content` to `path`, replacing anything already there -- including
+/// a symlink, which this refuses to follow -- via an exclusively created
+/// temp file and a rename, the same shape `hooks_install` already used for a
+/// brand-new settings file. `path` itself may not exist yet, so this cannot
+/// go through `replace_file_preserving_security` (which needs a real
+/// destination to read attributes from on Windows); `rename` alone still
+/// closes the symlink risk, since POSIX and Windows both replace whatever
+/// directory entry -- symlink or not -- currently sits at the destination
+/// rather than dereferencing it.
+///
+/// Deliberately does *not* use `create_secure_file`: that narrows `path` to
+/// an owner-only mode, which is correct for content that needs long-term
+/// restriction (a settings backup, a reduced-settings temp file) but wrong
+/// here. `hooks_install`'s own fresh-install path already learned this the
+/// hard way -- a brand-new file's restrictive creation mode becomes its
+/// *permanent* permissions when nothing later widens it, which broke a
+/// sandboxed process running as a different account trying to read it. The
+/// baseline phase marker and the hook-edit journal hold no secrets and may
+/// need the same broad readability, so this stages through an
+/// ordinary-permission exclusive create instead.
+fn write_ordinary_file_without_following_a_symlink(path: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    let tmp = path.with_extension("sentrith-write-tmp");
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
 fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
     let dry_run = opts.contains_key("dry-run");
     let mut touched = 0;
@@ -1546,29 +1582,14 @@ fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
             // Windows, where normal new files in the same directory inherit
             // access for several other accounts (breaking a sandboxed agent
             // process running as one of them).
-            //
-            // Still staged through an exclusively created temp file and
-            // renamed into place, rather than a single fs::write straight to
-            // settings_path: an interrupted or partial write to the final
-            // path directly would leave truncated JSON there, and a retry
-            // would then see an "existing" file it can't parse, requiring
-            // manual deletion to recover from an install that itself
-            // reported failure. create_new refuses to reuse or follow
-            // anything already at the temp path, same reasoning as
-            // write_secure_temp_file, just without forcing owner-only
-            // permissions on what becomes the final file.
-            let tmp = settings_path.with_extension("json.sentrith-tmp");
-            let _ = fs::remove_file(&tmp);
-            {
-                use std::io::Write;
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp)
-                    .map_err(|e| e.to_string())?;
-                file.write_all(rendered.as_bytes()).map_err(|e| e.to_string())?;
-            }
-            fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
+            // `write_ordinary_file_without_following_a_symlink` still stages
+            // through an exclusively created temp file and a rename rather
+            // than a single fs::write straight to settings_path: an
+            // interrupted or partial write to the final path directly would
+            // leave truncated JSON there, and a retry would then see an
+            // "existing" file it can't parse, requiring manual deletion to
+            // recover from an install that itself reported failure.
+            write_ordinary_file_without_following_a_symlink(&settings_path, &rendered)?;
         }
         touched += 1;
 
@@ -3350,9 +3371,14 @@ fn baseline_start() -> Result<(), String> {
     // Set the phase marker up front. If this fails, nothing has moved yet and
     // the working tree is untouched; doing it after the moves would leave the
     // contract stashed with no marker on an early return.
+    //
+    // `.ai-usage` is git-ignored, so a symlink planted at `phase` here
+    // wouldn't show up in normal `git status` -- `fs::write` would follow it
+    // and overwrite whatever it points at with "baseline\n" before any
+    // contract file is stashed.
     fs::create_dir_all(".ai-usage")
         .map_err(|e| format!("failed to prepare .ai-usage: {e}"))?;
-    fs::write(phase_marker_path(), "baseline\n")
+    write_ordinary_file_without_following_a_symlink(&phase_marker_path(), "baseline\n")
         .map_err(|e| format!("failed to write the phase marker: {e}"))?;
 
     let stash = baseline_stash_dir();
@@ -3433,7 +3459,14 @@ fn baseline_start() -> Result<(), String> {
         match reduce_hook_settings_for_baseline(path, &repo_file(path), &stash) {
             Ok(true) => {
                 hook_edits.push((*path).to_string());
-                if let Err(e) = fs::write(&hook_edits_manifest, hook_edits.join("\n") + "\n") {
+                // The stash is inside `.sentrith-private/`, also git-ignored,
+                // so a symlink planted at this predictable path during the
+                // active baseline wouldn't show up in `git status` either --
+                // same reasoning as the phase marker above.
+                if let Err(e) = write_ordinary_file_without_following_a_symlink(
+                    &hook_edits_manifest,
+                    &(hook_edits.join("\n") + "\n"),
+                ) {
                     hook_edit_failure = Some(format!("failed to record hook-edit manifest: {e}"));
                     break;
                 }
@@ -3733,7 +3766,14 @@ fn baseline_stop() -> Result<(), String> {
                     // exact permanently-stuck failure this durable removal
                     // exists to prevent -- ignoring the error would silently
                     // trade one bug for the illusion of having fixed it.
-                    match fs::write(&hook_edits_manifest, without_path.join("\n") + "\n") {
+                    // Also refuses to follow a symlink planted at this
+                    // predictable, git-ignored path during the long window
+                    // between `baseline start` and `stop` -- same reasoning
+                    // as the phase marker and this journal's initial write.
+                    match write_ordinary_file_without_following_a_symlink(
+                        &hook_edits_manifest,
+                        &(without_path.join("\n") + "\n"),
+                    ) {
                         Ok(()) => {
                             journaled = without_path;
                             let _ = fs::remove_file(&marker);
@@ -6539,6 +6579,47 @@ mod tests {
         assert!(!tmp.is_symlink(), "a stale symlink at the temp path must be replaced, not followed");
         assert_eq!(read_text(&tmp), "new-content");
         assert_eq!(read_text(&elsewhere), "untouched", "the stale symlink's target must never receive the content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_ordinary_file_does_not_follow_a_symlink_at_the_destination() {
+        // Codex found this exact class of attack reachable at two more
+        // predictable, git-ignored paths: `.ai-usage/phase` (baseline_start)
+        // and `.sentrith-private/baseline-stash/HOOK_EDITS.txt` (both
+        // baseline_start's initial write and baseline_stop's retry-time
+        // rewrite). Both used a plain `fs::write`, which follows a symlink
+        // planted at the destination and overwrites whatever it points at.
+        let elsewhere = temp_path("write-ordinary-elsewhere.txt");
+        fs::write(&elsewhere, "untouched").unwrap();
+        let path = temp_path("write-ordinary-destination.txt");
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+        write_ordinary_file_without_following_a_symlink(&path, "new-content").unwrap();
+
+        assert!(!path.is_symlink(), "the destination must end up a regular file, not the stale symlink");
+        assert_eq!(read_text(&path), "new-content");
+        assert_eq!(read_text(&elsewhere), "untouched", "the symlink's target must never receive the new content");
+    }
+
+    #[test]
+    fn write_ordinary_file_does_not_narrow_permissions_the_way_create_secure_file_does() {
+        // Unlike write_secure_temp_file/create_secure_file, this must leave
+        // a brand-new file at ordinary (not owner-only) permissions -- the
+        // fresh-install ACL-lock regression this codebase already hit once
+        // for exactly this reason.
+        let path = temp_path("write-ordinary-fresh.txt");
+        let _ = fs::remove_file(&path);
+
+        write_ordinary_file_without_following_a_symlink(&path, "content").unwrap();
+
+        assert_eq!(read_text(&path), "content");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_ne!(mode, 0o600, "must not be locked to the same owner-only mode create_secure_file uses");
+        }
     }
 
     #[cfg(unix)]

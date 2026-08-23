@@ -156,4 +156,86 @@ Reuse is strictly cheaper than rediscovery.
 
 ---
 
+### ADR-20260823-02 — Two safe-write primitives, chosen by whether the file may need to stay broadly readable
+
+**Status:** accepted
+
+**Context**
+
+ADR-20260823-01 named `create_secure_file` as *the* safe way to create a
+file without following a symlink at its path. Applying that literally to
+two new symlink findings (`.ai-usage/phase`, written by `baseline_start`;
+`.sentrith-private/baseline-stash/HOOK_EDITS.txt`, written by both
+`baseline_start` and `baseline_stop`) would have been wrong:
+`create_secure_file` creates at an owner-only mode on Unix and an
+owner/SYSTEM/Administrators-only DACL on Windows, and this codebase
+already hit the consequence of that once, for `hooks_install`'s
+fresh-install case — a brand-new file's restrictive creation mode
+becomes its *permanent* permissions when nothing later widens it, which
+broke a sandboxed process running as a different account trying to read
+the file. `.ai-usage/phase` and `HOOK_EDITS.txt` hold no secrets and may
+need the same broad readability `hooks_install` needed for `settings.json`.
+
+**Decision**
+
+Two safe-write primitives now exist, chosen by whether the file needs
+long-term permission restriction:
+
+- `create_secure_file` / `write_secure_temp_file` — for content that
+  should stay narrowly restricted (a settings backup, a reduced-settings
+  temp file about to be swapped into a permission-preserving replace).
+- `write_ordinary_file_without_following_a_symlink` — for a file that
+  must remain readable at ordinary, default/inherited permissions (a
+  phase marker, a journal, anything a differently-privileged process
+  might need to read). Stages through an exclusively created temp file
+  at ordinary permissions and a plain rename, refusing to follow a
+  symlink at either the temp or the final path exactly as
+  `create_secure_file` does, without narrowing the destination.
+
+Pick based on whether the file is meant to hold restricted/sensitive
+content long-term, not by convenience or which one was reached for last.
+
+**Rationale**
+
+Symlink-safety and permission-restriction are two independent
+properties, and this codebase's one existing primitive
+(`create_secure_file`) bundled both. Using it everywhere "for safety"
+would silently reintroduce the fresh-install ACL-lock class of bug at
+every new call site; a second primitive that provides only the
+symlink-safety property, without the permission side effect, was needed
+once a second file needing broad readability showed up.
+
+**Alternatives considered**
+
+- Use `create_secure_file` everywhere and have callers explicitly widen
+  permissions afterward (mirroring `copy_file_permissions` after
+  `write_secure_temp_file` for an *existing* file) — rejected: there is
+  no "original" file to copy a mode from for a brand-new marker/journal,
+  which is exactly the scenario that already broke `hooks_install` once.
+- Keep hand-rolling the ordinary-permission exclusive-create-plus-rename
+  block per call site (as `hooks_install`'s fresh-install branch
+  originally did) — rejected: this is the same duplication
+  ADR-20260823-01 exists to stop; extracted into
+  `write_ordinary_file_without_following_a_symlink` and reused by
+  `hooks_install` itself, `baseline_start`'s phase marker and initial
+  journal write, and `baseline_stop`'s retry-time journal rewrite.
+
+**Consequences**
+
+- positive: four call sites across `hooks_install`, `baseline_start`,
+  and `baseline_stop` now share one implementation for this shape
+  instead of four independently-drifting copies.
+- follow-up obligation: when a new marker/journal/state file is added to
+  this codebase, decide *up front* which of the two primitives it needs
+  (does it hold anything requiring restriction, and does anything other
+  than this process need to read it?) rather than defaulting to whichever
+  one is closer in the file at the time.
+
+**Affected areas**
+
+- `tools/sentrith/src/main.rs` — `write_ordinary_file_without_following_a_symlink`,
+  `hooks_install`, `baseline_start`, `baseline_stop`.
+
+---
+
 No further decisions have been recorded yet.
