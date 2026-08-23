@@ -2957,52 +2957,38 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     let backup_dir = stash.join("hook-settings-backup");
     let backup = backup_dir.join(rel_path);
     let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
+    // Durable proof that Sentrith's own restore actually committed for this
+    // path -- written by `finish_hook_restore_cleanup` before it touches
+    // backup or digest, removed only once cleanup fully finishes. Neither
+    // the backup's absence nor a digest mismatch is reliable proof on its
+    // own: the backup could have been deleted externally while `live` is
+    // still reduced, and a mismatch only proves `live` is no longer the
+    // *exact* reduced snapshot -- an unrelated edit made on top of the
+    // still-reduced file would produce the same mismatch without hooks ever
+    // actually being restored. Only this marker's presence is unambiguous.
+    let marker_path = backup_dir.join(format!("{rel_path}.restored"));
     if !backup.exists() {
-        // A prior attempt may have removed the backup but been interrupted,
-        // or failed, before removing its digest -- but the backup's absence
-        // alone is not proof `live` was ever actually restored: it could
-        // just as well have been deleted externally (manual cleanup, a
-        // stray `rm`) while `live` is still sitting in its reduced state and
-        // the digest has never been touched. The digest still describes
-        // exactly what "still reduced" looks like, so it -- not the
-        // backup's mere absence -- is what actually gets checked against
-        // `live` before this concludes restoration ever committed.
-        if digest_path.exists() {
-            // Unrecoverable, not just retriable: with the backup already
-            // gone, an unreadable `live` leaves no way at all to confirm it
-            // was actually restored -- treating that as safe to proceed
-            // past would be exactly as risky as confirming it's still
-            // reduced.
-            let live_content = fs::read_to_string(live).map_err(|e| {
-                RestoreFailure::Unrecoverable(format!(
-                    "{}'s baseline backup is already missing, and live could not be read to verify \
-                     whether it was ever restored: {e}. Left the digest in place so this can be retried.",
-                    live.display()
-                ))
-            })?;
-            // Fail closed on an unparseable digest too: with no backup left
-            // to fall back on, an unreadable digest leaves no way at all to
-            // tell whether `live` still holds the reduced content.
-            let still_reduced = read_text(&digest_path)
-                .trim()
-                .parse::<u64>()
-                .map(|expected| expected == content_digest(&live_content))
-                .unwrap_or(true);
-            if still_reduced {
-                return Err(RestoreFailure::Unrecoverable(format!(
-                    "{} was reduced during baseline, but its backup is missing and live still matches \
-                     the reduced content on record -- it was never actually restored, and the original \
-                     could not be recovered. Resolve manually.",
-                    live.display()
-                )));
-            }
-            // `live` has genuinely moved off the reduced state recorded in
-            // the digest, so whatever removed the backup, restoration did
-            // happen -- clean up the now-orphaned digest.
-            fs::remove_file(&digest_path).map_err(|e| {
-                format!("could not remove orphaned digest {}: {e}", digest_path.display())
+        if marker_path.exists() {
+            let _ = fs::remove_file(&digest_path);
+            fs::remove_file(&marker_path).map_err(|e| {
+                format!("could not remove restore marker {}: {e}", marker_path.display())
             })?;
             return Ok(true);
+        }
+        if digest_path.exists() {
+            // Unrecoverable: with the backup gone and no restore marker,
+            // there is nothing durable indicating this path's restore ever
+            // committed. `live`'s current content is deliberately not
+            // consulted here -- it can neither confirm nor rule out a real
+            // restore, only whether it still matches the reduced snapshot,
+            // which an edit made without restoring anything would also
+            // change.
+            return Err(RestoreFailure::Unrecoverable(format!(
+                "{} was reduced during baseline, but its backup is missing and there is no durable \
+                 record that it was ever restored -- the original could not be recovered. \
+                 Resolve manually.",
+                live.display()
+            )));
         }
         return Ok(false);
     }
@@ -3034,7 +3020,7 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
             // `live` is already confirmed correct at this point; any
             // failure finishing cleanup is a leftover-artifact problem, not
             // evidence live might still be reduced.
-            return finish_hook_restore_cleanup(&backup, &digest_path, live).map_err(RestoreFailure::from);
+            return finish_hook_restore_cleanup(&backup, &digest_path, &marker_path, live).map_err(RestoreFailure::from);
         }
     }
 
@@ -3171,15 +3157,29 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // file's security descriptor was, instead of silently adopting the
     // backup's.
     replace_file_preserving_security(&tmp, live, None)?;
-    finish_hook_restore_cleanup(&backup, &digest_path, live).map_err(RestoreFailure::from)
+    finish_hook_restore_cleanup(&backup, &digest_path, &marker_path, live).map_err(RestoreFailure::from)
 }
 
-/// Remove a hook-settings backup and its digest once `live` already holds
-/// the restored content, whether that replacement just happened or was
+/// Durably record that `live` is restored, then remove the now-obsolete
+/// backup, digest, and that record itself, once `live` already holds the
+/// restored content -- whether that replacement just happened or was
 /// confirmed on a retry (see the equality check at the top of
 /// `restore_hook_settings_backup`). Split out so both paths share the same
 /// cleanup and the same failure handling.
-fn finish_hook_restore_cleanup(backup: &Path, digest_path: &Path, live: &Path) -> Result<bool, String> {
+fn finish_hook_restore_cleanup(
+    backup: &Path,
+    digest_path: &Path,
+    marker_path: &Path,
+    live: &Path,
+) -> Result<bool, String> {
+    // Written first, before backup or digest is touched, and idempotent if
+    // an earlier attempt already wrote it: its presence is the durable proof
+    // that `live` was actually restored, independent of what a later edit
+    // might do to `live`'s content or of whether the backup gets deleted out
+    // from under this before cleanup finishes.
+    fs::write(marker_path, "").map_err(|e| {
+        format!("restored {} but could not durably record that: {e}", live.display())
+    })?;
     // Defensive: on Windows, a read-only file refuses to delete. In this
     // codebase the backup created during reduce does not currently end up
     // read-only even from a read-only original -- `replace_file_preserving_security`
@@ -3209,6 +3209,13 @@ fn finish_hook_restore_cleanup(backup: &Path, digest_path: &Path, live: &Path) -
     // running divergence detection against a digest that no longer applies.
     fs::remove_file(digest_path).map_err(|e| {
         format!("restored {} but could not remove its digest {}: {e}", live.display(), digest_path.display())
+    })?;
+    // Removed last, only once backup and digest are both confirmed gone: as
+    // long as this marker survives, the early no-backup branch above can
+    // still tell a genuinely completed restore apart from one that never
+    // happened, no matter what state the other two artifacts are in.
+    fs::remove_file(marker_path).map_err(|e| {
+        format!("restored {} but could not remove its restore marker {}: {e}", live.display(), marker_path.display())
     })?;
     Ok(true)
 }
@@ -5904,38 +5911,65 @@ mod tests {
     }
 
     #[test]
-    fn restore_hook_settings_backup_clears_an_orphaned_digest_with_no_backup() {
-        // Simulates an even later interruption than the retry-cleanup test
-        // above: the backup itself was already removed, but the digest
-        // removal that follows it either failed or never ran. `!backup.exists()`
-        // used to return early without touching the digest at all, leaving it
-        // to keep `hook-settings-backup` non-empty forever -- which later
-        // fails the stash directory's removal on every subsequent
-        // `baseline stop` and strands the phase marker at `baseline`.
-        let stash = temp_path("stash-orphaned-digest");
+    fn restore_hook_settings_backup_clears_a_leftover_restore_marker() {
+        // Simulates an interruption after a restore fully committed and
+        // cleaned up its backup and digest, but before it removed its own
+        // durable restore marker -- the marker's presence, not any
+        // inference from live's content or the digest, is what must let a
+        // later call conclude the restore already happened and finish
+        // tidying up.
+        let stash = temp_path("stash-leftover-marker");
         fs::create_dir_all(&stash).unwrap();
         let live = temp_path("settings.json");
         let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
         fs::write(&live, original).unwrap();
 
         assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
-        // Simulate a completed restore whose backup was removed but whose
-        // digest removal did not happen.
+        // Simulate a completed restore whose backup and digest were both
+        // removed, but whose own marker removal did not happen.
         fs::write(&live, original).unwrap();
         let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
         let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        let marker = stash.join("hook-settings-backup").join(".claude/settings.json.restored");
         fs::remove_file(&backup).unwrap();
-        assert!(digest.exists(), "the digest must still be there for this scenario to be meaningful");
+        fs::remove_file(&digest).unwrap();
+        fs::write(&marker, "").unwrap();
 
         assert!(
             restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap(),
-            "a backup once existed and is now gone with an orphaned digest as the only explanation: \
-             live is confirmed restored, even though this call only finished trailing cleanup \
-             rather than replacing live itself -- callers cross-checking a journal need `true` \
-             here to tell this apart from a path that was never reduced at all"
+            "the surviving restore marker is durable proof this path was already restored"
         );
-        assert!(!digest.exists(), "the orphaned digest must be cleaned up even with no backup present");
+        assert!(!marker.exists(), "the leftover marker must be cleaned up once found");
         assert_eq!(read_text(&live), original, "live must be left untouched");
+    }
+
+    #[test]
+    fn restore_does_not_treat_an_edit_on_top_of_the_reduced_file_as_proof_of_restoration() {
+        // The scenario a digest-comparison-based check cannot see: the
+        // backup is deleted externally, and the user then edits the still-
+        // reduced live file (e.g. adding an unrelated setting) without ever
+        // restoring the advisory hooks. The edit makes live's content differ
+        // from the exact reduced snapshot the digest describes, but that
+        // difference alone proves nothing about whether a restore actually
+        // happened -- only the durable marker (absent here) can.
+        let stash = temp_path("stash-edit-on-reduced");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        fs::remove_file(&backup).unwrap();
+
+        // An edit on top of the still-reduced file -- hooks are still
+        // stripped, just with an unrelated key added.
+        let edited_but_still_reduced = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"unrelated":true}}"#;
+        fs::write(&live, edited_but_still_reduced).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+
+        assert!(result.is_err(), "an edit that changes live without ever restoring the hooks must not be reported as success: {result:?}");
+        assert_eq!(read_text(&live), edited_but_still_reduced, "live must be left exactly as found");
     }
 
     #[test]
