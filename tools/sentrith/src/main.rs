@@ -2959,9 +2959,15 @@ fn reduce_hook_settings_for_baseline(
     // The digest -- not the full reduced content -- is what `restore` later
     // compares against; storing only a digest means there is no second copy
     // of settings content (which may itself hold something sensitive) sitting
-    // at whatever permissions a fresh file gets by default.
+    // at whatever permissions a fresh file gets by default. This directory is
+    // git-ignored, same as HOOK_EDITS.txt and STASHED.txt -- a symlink
+    // planted at this predictable path wouldn't show up in `git status`
+    // either, so this goes through the same symlink-safe helper.
     let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
-    if let Err(e) = fs::write(&digest_path, content_digest(&reduced).to_string()) {
+    if let Err(e) = write_ordinary_file_without_following_a_symlink(
+        &digest_path,
+        &content_digest(&reduced).to_string(),
+    ) {
         // Writing the digest last, once `live` is confirmed already
         // reduced, means every earlier failure in this function leaves
         // `live` untouched -- but this one can't: the swap above already
@@ -3408,7 +3414,12 @@ fn baseline_start() -> Result<(), String> {
         }
         let mut planned = moved.clone();
         planned.push((*path).to_string());
-        if let Err(e) = fs::write(&manifest, planned.join("\n") + "\n") {
+        // Git-ignored, same as HOOK_EDITS.txt and the phase marker -- a
+        // symlink planted here between iterations wouldn't show up in
+        // `git status`, and plain `fs::write` would follow it.
+        if let Err(e) =
+            write_ordinary_file_without_following_a_symlink(&manifest, &(planned.join("\n") + "\n"))
+        {
             failure = Some(format!("failed to record stash manifest: {e}"));
             break;
         }
@@ -6616,9 +6627,20 @@ mod tests {
         assert_eq!(read_text(&path), "content");
         #[cfg(unix)]
         {
+            // Codex found that asserting mode != 0o600 outright is wrong: a
+            // restrictive-but-valid umask (e.g. 077) makes an ordinary
+            // creation legitimately land on 0o600 too, which would fail this
+            // assertion even though the helper correctly used ordinary,
+            // umask-derived permissions rather than create_secure_file's
+            // fixed owner-only mode. Compare against a control file created
+            // the ordinary way under the same umask instead of requiring a
+            // specific non-0600 value.
             use std::os::unix::fs::PermissionsExt;
+            let control = temp_path("write-ordinary-fresh-control.txt");
+            fs::write(&control, "content").unwrap();
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_ne!(mode, 0o600, "must not be locked to the same owner-only mode create_secure_file uses");
+            let control_mode = fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, control_mode, "must match an ordinary file's umask-derived mode, not a fixed owner-only one");
         }
     }
 
