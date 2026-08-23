@@ -3190,14 +3190,21 @@ fn finish_hook_restore_cleanup(
     marker_path: &Path,
     live: &Path,
 ) -> Result<bool, String> {
-    // Written first, before backup or digest is touched, and idempotent if
+    // Written first, before backup or digest is touched, and safe to redo if
     // an earlier attempt already wrote it: its presence is the durable proof
     // that `live` was actually restored, independent of what a later edit
     // might do to `live`'s content or of whether the backup gets deleted out
-    // from under this before cleanup finishes.
-    fs::write(marker_path, "").map_err(|e| {
+    // from under this before cleanup finishes. `fs::write` would follow an
+    // existing symlink at this predictable path -- the same class of attack
+    // fixed for the backup, the reduce temp file, and the restore temp file
+    // -- and during an active baseline there is a real window (from
+    // `baseline start` to `baseline stop`) for something to plant one here.
+    // `create_secure_file` refuses to reuse or follow anything already at
+    // the path; the file it returns is already empty, so nothing further
+    // needs to be written to it.
+    drop(create_secure_file(marker_path).map_err(|e| {
         format!("restored {} but could not durably record that: {e}", live.display())
-    })?;
+    })?);
     // Defensive: on Windows, a read-only file refuses to delete. In this
     // codebase the backup created during reduce does not currently end up
     // read-only even from a read-only original -- `replace_file_preserving_security`
@@ -6398,6 +6405,32 @@ mod tests {
 
         assert_eq!(read_text(&victim), "victim-must-not-be-touched", "the symlink target must never receive the settings content");
         assert!(!live.is_symlink(), "live must end up as a regular file, not the stale symlink renamed onto it");
+        assert_eq!(read_text(&live), original, "the restore must still succeed correctly despite the stale symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_does_not_follow_a_symlink_at_the_marker_path() {
+        // There's a real window, for the whole duration of an active
+        // baseline, for something to plant a symlink at the marker's
+        // predictable path (<rel_path>.restored) before restore ever runs.
+        // fs::write would follow it and truncate whatever it points at;
+        // create_secure_file must not.
+        let stash = temp_path("stash-marker-symlink");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        let victim = temp_path("victim.txt");
+        fs::write(&victim, "victim-must-not-be-touched").unwrap();
+        let marker = stash.join("hook-settings-backup").join(".claude/settings.json.restored");
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+
+        assert!(restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap());
+
+        assert_eq!(read_text(&victim), "victim-must-not-be-touched", "the symlink target must never be written to");
         assert_eq!(read_text(&live), original, "the restore must still succeed correctly despite the stale symlink");
     }
 
