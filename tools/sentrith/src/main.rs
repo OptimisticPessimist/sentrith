@@ -1108,7 +1108,7 @@ fn roll_back_committed_replacement(
             destination.display()
         );
     };
-    let tmp = destination.with_extension("sentrith-baseline-rollback-tmp");
+    let tmp = sibling_temp_path(destination, "sentrith-baseline-rollback-tmp");
     match restore_file_content(destination, backup, &tmp) {
         Ok(()) => format!(
             "{original_error} (the replacement was rolled back from {}; {} is unchanged)",
@@ -1489,7 +1489,7 @@ fn entry_exists(path: &Path) -> bool {
 /// target, so a substituted symlink fails here instead of returning the
 /// wrong content. The `is_file` check on top rejects directories and other
 /// special files that a plain open would accept.
-fn open_regular_file_no_follow(path: &Path) -> Result<fs::File, String> {
+fn open_regular_file_no_follow(path: &Path) -> Result<fs::File, OpenRefusal> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1497,14 +1497,43 @@ fn open_regular_file_no_follow(path: &Path) -> Result<fs::File, String> {
         use std::os::unix::fs::OpenOptionsExt;
         // Spelled out per-OS rather than pulled from libc: this project
         // deliberately has no dependencies, and O_NOFOLLOW is not a shared
-        // constant across Unixes.
+        // constant across Unixes. Getting this wrong is not a silent
+        // no-op -- on FreeBSD, Linux's 0x20000 is `O_DIRECTORY`, which
+        // would make every open of a regular file fail with ENOTDIR and,
+        // via `NotRegular` below, permanently break `baseline stop`.
         #[cfg(target_os = "linux")]
         const O_NOFOLLOW: i32 = 0o400000;
-        #[cfg(target_os = "macos")]
+        // macOS and the BSDs share 0x0100.
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
         const O_NOFOLLOW: i32 = 0x0100;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        const O_NOFOLLOW: i32 = 0o400000;
-        options.custom_flags(O_NOFOLLOW);
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )))]
+        const O_NOFOLLOW: i32 = 0;
+        // A zero flag is the deliberate fallback for an unknown Unix:
+        // guessing a wrong non-zero value risks colliding with an unrelated
+        // flag, which fails *closed in the wrong direction* (every open
+        // rejected). With 0, the open simply doesn't get the no-follow
+        // guarantee and the `symlink_metadata` pre-check plus the `is_file`
+        // check on the handle below still reject a substituted symlink --
+        // only the narrow check-then-use window remains, which is strictly
+        // better than a CLI that cannot run at all.
+        if O_NOFOLLOW != 0 {
+            options.custom_flags(O_NOFOLLOW);
+        }
     }
     #[cfg(windows)]
     {
@@ -1512,20 +1541,101 @@ fn open_regular_file_no_follow(path: &Path) -> Result<fs::File, String> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options
-        .open(path)
-        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let file = options.open(path).map_err(|e| {
+        // ELOOP/ENOTDIR from an O_NOFOLLOW open is positive proof the path
+        // is (or traverses) a symlink -- the substitution this guards
+        // against. Anything else (a permission glitch, a Windows sharing
+        // violation, which this codebase has repeatedly confirmed needs no
+        // special conditions to occur) proves nothing about *what* is
+        // there, only that this attempt could not tell.
+        #[cfg(unix)]
+        {
+            const ELOOP: i32 = 40;
+            const ENOTDIR: i32 = 20;
+            if matches!(e.raw_os_error(), Some(ELOOP) | Some(ENOTDIR)) {
+                return OpenRefusal::NotRegular(format!(
+                    "{} is a symlink or lies behind one: {e}",
+                    path.display()
+                ));
+            }
+        }
+        OpenRefusal::Transient(format!("failed to open {}: {e}", path.display()))
+    })?;
+    // On Windows the open above *succeeds* for a reparse point (that is what
+    // the flag asks for), so this is what rejects it there. It also rejects
+    // directories and other special files on every platform.
     let is_file = file
         .metadata()
-        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?
+        .map_err(|e| OpenRefusal::Transient(format!("failed to inspect {}: {e}", path.display())))?
         .is_file();
     if !is_file {
-        return Err(format!(
-            "{} is not a regular file (found a directory or other special file)",
+        return Err(OpenRefusal::NotRegular(format!(
+            "{} is not a regular file (found a symlink, directory, or other special file)",
             path.display()
-        ));
+        )));
     }
     Ok(file)
+}
+
+/// Why `open_regular_file_no_follow` declined, split by whether the answer is
+/// *evidence about what is at the path* or merely *this attempt could not
+/// tell*. Callers must not collapse these: treating a transient failure as
+/// proof of substitution turns an ordinary retryable hiccup (a Windows
+/// sharing violation, a permission glitch) into an unrecoverable,
+/// resolve-by-hand error that blocks the rest of `baseline stop`, while
+/// treating proven substitution as transient would silently retry into the
+/// attack it exists to catch.
+enum OpenRefusal {
+    NotRegular(String),
+    Transient(String),
+}
+
+impl std::fmt::Display for OpenRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenRefusal::NotRegular(m) | OpenRefusal::Transient(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Confirm every directory component from `root` down to (and including)
+/// `leaf`'s parent is a real directory rather than a symlink.
+///
+/// `O_NOFOLLOW` and `symlink_metadata` only constrain a path's **final**
+/// component; both happily traverse a symlinked *directory* on the way there.
+/// Under this codebase's stated threat model -- something can plant entries at
+/// predictable, git-ignored paths for the whole span of an active baseline --
+/// swapping `hook-settings-backup/.claude` for a link to an attacker-owned
+/// directory costs exactly what swapping the leaf costs, and yields a "backup"
+/// that passes every leaf-level check while holding content of the attacker's
+/// choosing. That content is written back into a hook-settings file whose
+/// `command` strings the agent then executes.
+///
+/// `root` itself is not checked: it is the caller's own already-established
+/// base (the stash directory), not something derived from data.
+fn ancestors_are_real_directories(root: &Path, leaf: &Path) -> Result<(), String> {
+    let Ok(relative) = leaf.strip_prefix(root) else {
+        return Ok(());
+    };
+    let mut current = root.to_path_buf();
+    // `parent()` drops the leaf itself: its own type is checked by the
+    // no-follow open, which is strictly stronger than a metadata peek.
+    let Some(parent_of_leaf) = relative.parent() else {
+        return Ok(());
+    };
+    for component in parent_of_leaf.components() {
+        current.push(component);
+        let meta = fs::symlink_metadata(&current)
+            .map_err(|e| format!("failed to inspect {}: {e}", current.display()))?;
+        if !meta.is_dir() {
+            return Err(format!(
+                "{} is not a real directory (found a symlink or other special file); \
+                 something replaced it while the baseline was active",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
@@ -3036,7 +3146,7 @@ fn reduce_hook_settings_for_baseline(
     // getting stuck with it silently reduced and never restored (a disk
     // filling up mid-write, or the process exiting, must not be able to leave
     // `live` reduced with nothing recording that it needs restoring).
-    let tmp = live.with_extension("sentrith-baseline-tmp");
+    let tmp = sibling_temp_path(live, "sentrith-baseline-tmp");
     // `write_secure_temp_file` never lets the full reduced settings --
     // unrelated secrets included -- sit exposed under default/inherited
     // permissions even briefly; `copy_file_permissions` below still narrows
@@ -3188,35 +3298,56 @@ fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Re
     // check-then-use race: a substitution landing between the check and
     // either reopen would still be followed. Nothing below reopens `backup`
     // for reading, so there is no second open left to race against.
-    let backup_content = match open_regular_file_no_follow(&backup) {
-        Ok(mut file) => {
-            use std::io::Read;
-            let mut content = String::new();
-            match file.read_to_string(&mut content) {
-                Ok(_) => Some(content),
-                // Unreadable (invalid UTF-8, a transient error) is not
-                // proof of substitution -- fall through to the same
-                // treatment as a backup that could not be opened at all.
-                Err(_) => None,
+    //
+    // The open only constrains the path's final component, so the directory
+    // components leading to it are checked separately first -- a symlinked
+    // `hook-settings-backup/.claude` would otherwise hand over an
+    // attacker-chosen "backup" that passes every leaf-level check. That
+    // check covers the digest and marker too: all three share this parent.
+    let backup_content = if entry_exists(&backup) {
+        ancestors_are_real_directories(stash, &backup).map_err(RestoreFailure::Unrecoverable)?;
+        match open_regular_file_no_follow(&backup) {
+            Ok(mut file) => {
+                use std::io::Read;
+                let mut content = String::new();
+                match file.read_to_string(&mut content) {
+                    Ok(_) => Some(content),
+                    // Unreadable (invalid UTF-8, a transient I/O error) is
+                    // not proof of substitution: fall through to divergence
+                    // detection, which fails closed and preserves rather
+                    // than destroying anything.
+                    Err(_) => None,
+                }
             }
-        }
-        Err(e) => {
-            // Distinguish "no backup here" (an ordinary, expected state
-            // handled by the `!backup.exists()` branch just below) from
-            // "something is here but it is not a regular file we can
-            // trust". Only the latter is evidence of substitution.
-            if entry_exists(&backup) {
+            // Proven to be (or to lie behind) a symlink: this is the
+            // substitution being guarded against.
+            Err(OpenRefusal::NotRegular(e)) => {
                 return Err(RestoreFailure::Unrecoverable(format!(
-                    "{} was reduced during baseline, but its backup at {} could not be opened as \
-                     a regular file ({e}) -- something may have replaced it while the baseline \
-                     was active, so its content cannot be trusted and the original could not be \
-                     recovered from it. Resolve manually.",
+                    "{} was reduced during baseline, but its backup at {} is not a regular file \
+                     ({e}) -- something replaced it while the baseline was active, so its content \
+                     cannot be trusted and the original could not be recovered from it. \
+                     Resolve manually.",
                     live.display(),
                     backup.display()
                 )));
             }
-            None
+            // Could not tell -- a permission glitch, or a Windows sharing
+            // violation, which needs no special conditions to occur.
+            // Deliberately `Recoverable`, matching how the `live` read below
+            // already treats its own transient failures: escalating this to
+            // `Unrecoverable` would let an ordinary retryable hiccup block
+            // `baseline_stop` before it restores the contract files, which
+            // is the safety-critical half of the operation.
+            Err(OpenRefusal::Transient(e)) => {
+                return Err(RestoreFailure::Recoverable(format!(
+                    "could not read the baseline backup for {} ({e}); left the backup and digest \
+                     in place so `baseline stop` can be retried.",
+                    live.display()
+                )));
+            }
         }
+    } else {
+        None
     };
     // `entry_exists`, not `backup.exists()`: this branch is the "no backup
     // at all" case, and a dangling symlink at the path is emphatically not
@@ -3878,6 +4009,45 @@ fn finish_baseline_stop_cleanup(
         .map(|p| format!("hook-settings-backup/{p}"))
         .collect();
     remove_empty_stash_parents(stash, &hook_backup_entries)?;
+
+    // The manifests must outlive any failure to remove the stash itself.
+    // Removing them first (as this used to) and *then* having `remove_dir`
+    // fail with `DirectoryNotEmpty` -- which any surviving leftover causes:
+    // an un-removed `.restored` marker, a backup kept by a `Recoverable`
+    // hook-restore failure -- leaves a stash with contents and no manifest
+    // explaining them. `inspect_stash` reads exactly that as
+    // `Unattributable` and refuses to touch it, so the next `baseline stop`
+    // stops permanently with the phase marker still reading `baseline`,
+    // needing manual recovery. Checking emptiness up front instead keeps
+    // that state reachable only as a *retryable* failure, with the
+    // manifests still on disk to attribute the leftovers.
+    let manifest_names = ["STASHED.txt", "HOOK_EDITS.txt"];
+    let leftovers: Vec<String> = match fs::read_dir(stash) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| !manifest_names.contains(&n.as_str()))
+            .collect(),
+        // Already gone: nothing left to clean up, and nothing to explain.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(format!(
+                "restored files, but could not inspect the baseline stash {}: {e}; \
+                 the manifest, marker, and stash were kept",
+                stash.display()
+            ));
+        }
+    };
+    if !leftovers.is_empty() {
+        return Err(format!(
+            "restored files, but {} still contains: {}. The manifest and phase marker were kept \
+             so this stays attributable -- resolve those, then run `sentrith usage baseline stop` \
+             again.",
+            stash.display(),
+            leftovers.join(", ")
+        ));
+    }
+
     let _ = fs::remove_file(stash.join("HOOK_EDITS.txt"));
     match fs::remove_file(manifest) {
         Ok(()) => {}
@@ -6750,7 +6920,7 @@ mod tests {
 
         let elsewhere = temp_path("elsewhere.txt");
         fs::write(&elsewhere, "untouched").unwrap();
-        let tmp = live.with_extension("sentrith-baseline-tmp");
+        let tmp = sibling_temp_path(live, "sentrith-baseline-tmp");
         std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
 
         assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
@@ -6892,7 +7062,7 @@ mod tests {
 
         let victim = temp_path("victim.txt");
         fs::write(&victim, "victim-must-not-be-touched").unwrap();
-        let restore_tmp = live.with_extension("sentrith-baseline-restore-tmp");
+        let restore_tmp = sibling_temp_path(live, "sentrith-baseline-restore-tmp");
         std::os::unix::fs::symlink(&victim, &restore_tmp).unwrap();
 
         assert!(restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap());
@@ -7496,7 +7666,15 @@ mod tests {
     }
 
     #[test]
-    fn baseline_cleanup_keeps_marker_when_stash_removal_fails() {
+    fn baseline_cleanup_keeps_the_manifest_when_the_stash_cannot_be_removed() {
+        // This used to assert the opposite for the manifest (`!manifest.exists()`):
+        // cleanup removed both manifests first and only then discovered
+        // `remove_dir` could not succeed. That left a stash with contents and
+        // nothing explaining them, which `inspect_stash` reads as
+        // `Unattributable` and refuses to touch -- turning a retryable
+        // failure into one that permanently blocks `baseline stop` with the
+        // phase marker still reading `baseline`. The manifest must now
+        // survive so the leftovers stay attributable and a retry can work.
         let marker = temp_path("phase");
         fs::write(&marker, "baseline\n").unwrap();
         let stash = temp_path("stash");
@@ -7506,10 +7684,17 @@ mod tests {
         fs::write(stash.join("unexpected"), "keep me").unwrap();
 
         let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[], &[]).unwrap_err();
-        assert!(error.contains("baseline stash"));
+        assert!(error.contains("unexpected"), "the error must name what is blocking cleanup: {error}");
         assert!(marker.exists(), "the phase marker must remain active");
         assert!(stash.exists(), "the stash must remain recoverable");
-        assert!(!manifest.exists());
+        assert!(manifest.exists(), "the manifest must survive so the leftovers stay attributable");
+        assert_eq!(read_text(&stash.join("unexpected")), "keep me", "nothing unexplained may be deleted");
+
+        // The retry, once the leftover is resolved, must then succeed.
+        fs::remove_file(stash.join("unexpected")).unwrap();
+        finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[], &[]).unwrap();
+        assert!(!stash.exists(), "the retry must complete cleanup");
+        assert!(!marker.exists(), "the retry must return to standard phase");
     }
 
     #[test]

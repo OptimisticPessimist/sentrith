@@ -6,6 +6,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Source = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+# Backups Copy-SentrithPath kept because they held files Sentrith does not
+# ship (see the comment there). Reported at the end so an update never
+# silently leaves an untracked directory behind, and never silently deletes
+# one.
+$KeptBackups = @()
 $TargetPath = (Resolve-Path $Target).Path
 
 # Contract paths are owned by Sentrith and are replaced on update.
@@ -48,6 +53,20 @@ function Copy-SentrithPath {
   if (-not (Test-Path $Src)) { return }
   New-Item -ItemType Directory -Force -Path (Split-Path $Dst -Parent) | Out-Null
   if ((Get-Item $Src).PSIsContainer) {
+    # A junction or directory symlink at the destination (dotfile managers,
+    # a shared checkout) is refused rather than replaced -- matching the
+    # file branch below, and matching install.sh. Replacing it would swap a
+    # managed link for a real directory and destroy the record of where it
+    # pointed. This also keeps the removal below from ever being handed a
+    # reparse point: on Windows PowerShell 5.1, `Remove-Item -Recurse`
+    # follows one and deletes the *link target's* contents.
+    if (Test-Path $Dst) {
+      $Existing = Get-Item -Force $Dst
+      if ($Existing.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Write-Error "Refusing to replace symlinked/junctioned directory: $Dst (remove it before updating the contract)"
+        return
+      }
+    }
     $Backup = $null
     if (Test-Path $Dst) {
       $Backup = "$Dst.sentrith-update-backup.$([Guid]::NewGuid().ToString('N'))"
@@ -55,12 +74,27 @@ function Copy-SentrithPath {
     }
     New-Item -ItemType Directory -Force -Path $Dst | Out-Null
     Copy-Item -Recurse -Force (Join-Path $Src "*") $Dst
-    # Contract paths are Sentrith-owned and replaced wholesale on update --
-    # git already holds the prior version for anyone who committed before
-    # updating, so this backup is redundant once the new copy is in place.
-    # Left behind (as it used to be), it accumulates a new untracked,
-    # unreported directory on every single update.
-    if ($Backup) { Remove-Item -Recurse -Force $Backup }
+    # Contract paths are Sentrith-owned and replaced wholesale, so the
+    # backup is redundant *for the files Sentrith itself ships* -- but not
+    # for anything else living under the same directory. This project's own
+    # docs tell users to create files inside contract directories
+    # (docs/rfcs/, custom .claude/skills/), and those may be uncommitted.
+    # Deleting the backup unconditionally would destroy them silently;
+    # keeping it unconditionally accumulates an untracked directory on every
+    # update. So: remove it only when it holds nothing the new copy does
+    # not, and otherwise keep it and report it.
+    if ($Backup) {
+      $Extra = @()
+      foreach ($Item in Get-ChildItem -Recurse -Force -File $Backup) {
+        $Rel = $Item.FullName.Substring($Backup.Length).TrimStart('\', '/')
+        if (-not (Test-Path (Join-Path $Dst $Rel))) { $Extra += "$Path/$($Rel -replace '\\', '/')" }
+      }
+      if ($Extra.Count -gt 0) {
+        $script:KeptBackups += "  $Backup  (contains: $($Extra -join ', '))"
+      } else {
+        Remove-Item -Recurse -Force $Backup
+      }
+    }
   } else {
     Copy-Item -Force $Src $Dst
   }
@@ -82,6 +116,10 @@ if ($Update) {
   if ($Added.Count -gt 0) {
     Write-Host ("New memory files added as uninitialized templates:`n  " + ($Added -join "`n  "))
     Write-Host "Ask your agent to fill them (see docs/ai/BOOTSTRAP.md)."
+  }
+  if ($KeptBackups.Count -gt 0) {
+    Write-Host ("Kept backups of replaced contract directories that held files Sentrith does not ship:`n" + ($KeptBackups -join "`n"))
+    Write-Host "Move anything you still need out of them, then delete them."
   }
   Write-Host "Review: git diff -- AGENTS.md docs/development docs/profiles"
   Write-Host "Post-update steps: docs/guide/UPDATING.en.md (日本語: UPDATING.ja.md) in the Sentrith source."

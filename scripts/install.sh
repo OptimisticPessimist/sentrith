@@ -5,6 +5,10 @@ SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 FORCE=0
 UPDATE=0
 TARGET_DIR="."
+# Backups `copy_path` kept because they held files Sentrith does not ship
+# (see the comment there). Reported at the end so an update never silently
+# leaves an untracked directory behind, and never silently deletes one.
+KEPT_BACKUPS=""
 
 for arg in "$@"; do
   case "$arg" in
@@ -62,23 +66,37 @@ copy_path() {
   [ -e "$src" ] || return 0
   mkdir -p "$(dirname "$dst")"
   if [ -d "$src" ]; then
+    # A symlinked contract directory (dotfile managers, a shared checkout)
+    # is refused rather than replaced, matching what the file branch below
+    # already does. Replacing it would silently swap a managed link for a
+    # real directory, and -- once the backup is removed -- destroy the only
+    # record of where it pointed.
+    if [ -L "$dst" ]; then
+      echo "Refusing to replace symlinked directory: $dst (remove it before updating the contract)" >&2
+      return 2
+    fi
     # Reset per call: this is a plain (non-local) shell variable shared
     # across every copy_path invocation in the loop below, so a path that
     # does *not* need a backup this time must not remove a stale value left
     # over from a *different* path's backup in an earlier call.
     backup_dir=""
-    if [ -e "$dst" ] || [ -L "$dst" ]; then
+    if [ -e "$dst" ]; then
       backup_dir=$(mktemp -d "$(dirname "$dst")/.sentrith-update-backup.XXXXXX")
       rmdir "$backup_dir"
       mv "$dst" "$backup_dir"
     fi
     mkdir -p "$dst"
     cp -R "$src"/. "$dst"/
-    # Contract paths are Sentrith-owned and replaced wholesale on update --
-    # git already holds the prior version for anyone who committed before
-    # updating, so this backup is redundant once the new copy is in place.
-    # Left behind (as it used to be), it accumulates a new untracked,
-    # unreported directory on every single update.
+    # Contract paths are Sentrith-owned and replaced wholesale, so the
+    # backup is redundant *for the files Sentrith itself ships* -- but not
+    # for anything else that was living under the same directory. This
+    # project's own docs tell users to create files inside contract
+    # directories (`docs/rfcs/`, custom `.claude/skills/`), and those may be
+    # uncommitted. Deleting the backup unconditionally would destroy them
+    # with no message; keeping it unconditionally accumulates an untracked
+    # directory on every update, which is what this replaced. So: remove it
+    # only when it holds nothing the new copy does not, and otherwise keep
+    # it and say so.
     #
     # An `if`, not `[ -n "$backup_dir" ] && rm -rf ...`: under `set -e`,
     # that form's own exit status is the *test's* whenever it's false (the
@@ -88,7 +106,25 @@ copy_path() {
     # place. Confirmed by reproducing it: install.sh silently stopped
     # partway through the manifest with exit 1 and no error message.
     if [ -n "$backup_dir" ]; then
-      rm -rf "$backup_dir"
+      extra=""
+      # Compare by relative path: anything present in the backup but not in
+      # the freshly installed copy did not come from Sentrith.
+      while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        if [ ! -e "$dst/$rel" ]; then
+          extra="$extra
+    $1/$rel"
+        fi
+      done <<EOF
+$(cd "$backup_dir" && find . -type f -o -type l | sed 's|^\./||')
+EOF
+      if [ -n "$extra" ]; then
+        KEPT_BACKUPS="$KEPT_BACKUPS
+  $backup_dir  (contains:$extra
+  )"
+      else
+        rm -rf "$backup_dir"
+      fi
     fi
   else
     if [ -L "$dst" ]; then
@@ -118,6 +154,11 @@ if [ "$UPDATE" -eq 1 ]; then
   if [ -n "$added" ]; then
     printf '%s\n' "New memory files added as uninitialized templates:$added"
     printf '%s\n' "Ask your agent to fill them (see docs/ai/BOOTSTRAP.md)."
+  fi
+  if [ -n "$KEPT_BACKUPS" ]; then
+    printf '%s\n' \
+      "Kept backups of replaced contract directories that held files Sentrith does not ship:$KEPT_BACKUPS" \
+      "Move anything you still need out of them, then delete them."
   fi
   printf '%s\n' \
     "Review: git diff -- AGENTS.md docs/development docs/profiles" \
