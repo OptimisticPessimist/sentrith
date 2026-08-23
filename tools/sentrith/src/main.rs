@@ -1073,19 +1073,21 @@ fn replace_file_preserving_security(
     fs::rename(replacement, destination).map_err(|e| e.to_string())
 }
 
-/// `ReplaceFileW` has already committed (the swap itself succeeded) by the
-/// time a caller might see this Err -- it's only reached when a step *after*
-/// that succeeded call fails. Callers of `replace_file_preserving_security`
-/// rely on `Err` meaning nothing changed (e.g. `baseline_start`'s rollback
-/// only restores hook edits it recorded as `Ok(true)`; a path that returns
-/// `Err` here despite the replacement having actually happened would be
-/// skipped by that rollback, which could then delete the only backup while
-/// leaving the live file reduced). Best-effort restores `destination`'s
+/// A swap or write into `destination` has already committed by the time a
+/// caller might see this `Err` -- it's only reached when a step *after* that
+/// succeeded call fails. Originally written for `replace_file_preserving_security`'s
+/// Windows path (`ReplaceFileW` committing before a later metadata step could
+/// fail), and now reused by `reduce_hook_settings_for_baseline` for the same
+/// shape of problem on every platform: its own swap can succeed and a later
+/// digest write can still fail, and callers rely on `Err` meaning `live` is
+/// untouched (`restore_hook_settings_backup`'s divergence check fails closed
+/// on a missing digest, treating an un-rolled-back reduction as a user edit
+/// and relocating the only copy of the original into `baseline-hook-conflicts`
+/// without ever restoring `live`). Best-effort restores `destination`'s
 /// content from `backup` before surfacing the original error, so the
 /// function's contract holds even when this specific step fails. Without a
 /// backup to roll back from, the error is annotated instead: there is
 /// nothing this function can do to undo the swap.
-#[cfg(windows)]
 fn roll_back_committed_replacement(
     destination: &Path,
     backup: Option<&Path>,
@@ -2895,20 +2897,36 @@ fn reduce_hook_settings_for_baseline(
     // branch, from a genuinely completed-and-uncleaned restore: `live` was
     // never touched by this call, but that stale digest alone would get
     // read as unrecoverable data loss forever after, with the phase marker
-    // stuck at `baseline` and no CLI path to recover. Writing it last, once
-    // `live` is confirmed already reduced, means a failure here can at worst
-    // leave a backup with no digest -- which `restore_hook_settings_backup`
-    // already treats as a safely self-recovering conflict (fails closed,
-    // preserves the original in `baseline-hook-conflicts/`, and does not
-    // block cleanup), not a permanent, unrecoverable one.
+    // stuck at `baseline` and no CLI path to recover.
     //
     // The digest -- not the full reduced content -- is what `restore` later
     // compares against; storing only a digest means there is no second copy
     // of settings content (which may itself hold something sensitive) sitting
     // at whatever permissions a fresh file gets by default.
     let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
-    fs::write(&digest_path, content_digest(&reduced).to_string())
-        .map_err(|e| format!("failed to record the baseline snapshot for {}: {e}", live.display()))?;
+    if let Err(e) = fs::write(&digest_path, content_digest(&reduced).to_string()) {
+        // Writing the digest last, once `live` is confirmed already
+        // reduced, means every earlier failure in this function leaves
+        // `live` untouched -- but this one can't: the swap above already
+        // committed. Without a digest, `restore_hook_settings_backup` has
+        // no way to tell "reduced, but the digest write just failed" apart
+        // from "a user edited this file during baseline", and fails closed
+        // into the latter: it relocates `backup` -- the only copy of the
+        // true original -- into `baseline-hook-conflicts` as something to
+        // merge by hand, without ever touching `live`. `baseline_start`'s
+        // rollback then treats that as `Recoverable` and reports the
+        // working tree unchanged, leaving `live` reduced (hooks disabled)
+        // with nothing recording that it still needs restoring. There is no
+        // such ambiguity here -- this call knows for certain `live`
+        // currently holds `reduced` and `backup` holds the true original --
+        // so roll the swap back directly instead of leaving that to be
+        // misdiagnosed later.
+        return Err(roll_back_committed_replacement(
+            live,
+            Some(&backup),
+            format!("failed to record the baseline snapshot for {}: {e}", live.display()),
+        ));
+    }
     Ok(true)
 }
 
@@ -5630,7 +5648,6 @@ mod tests {
         assert_eq!(read_text(&path), "pre-existing", "the pre-existing file must be left untouched");
     }
 
-    #[cfg(windows)]
     #[test]
     fn roll_back_committed_replacement_restores_content_from_the_backup() {
         // Callers rely on Err from replace_file_preserving_security meaning
@@ -5649,7 +5666,6 @@ mod tests {
         assert!(message.contains("rolled back"), "the error message must say a rollback happened: {message}");
     }
 
-    #[cfg(windows)]
     #[test]
     fn roll_back_committed_replacement_explains_when_no_backup_was_available() {
         let destination = temp_path("destination-no-backup.json");
@@ -6274,6 +6290,47 @@ mod tests {
         assert!(!digest.exists(), "no digest must be left behind when the swap itself never committed");
         let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
         assert!(!backup.exists(), "no backup should exist either, since nothing was ever reduced");
+    }
+
+    #[test]
+    fn reduce_rolls_live_back_when_the_digest_write_fails_after_the_swap_commits() {
+        // The swap into `live` and the digest write are two separate steps;
+        // if the swap commits but the digest write then fails, `live` would
+        // be left reduced with no digest to prove it.
+        // `restore_hook_settings_backup` reads a missing digest as unknown
+        // and fails closed, misreading this as a user edit made during
+        // baseline and relocating `backup` -- the only copy of the true
+        // original -- into `baseline-hook-conflicts` without ever touching
+        // `live`. This function must instead roll `live` back to the
+        // original itself when the digest write fails, so a caller that
+        // sees `Err` here can rely on `live` being unchanged either way,
+        // the same guarantee every earlier failure in this function already
+        // gave for free.
+        let stash = temp_path("stash-digest-write-fails");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings-digest-write-fails.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        // Pre-create the digest path as a directory. `reduce_hook_settings_for_baseline`
+        // writes its backup to a sibling path inside the same directory, so
+        // the swap itself still commits normally -- only the final
+        // `fs::write` to the digest path fails, deterministically and
+        // portably on both platforms, with no root-bypass or second-process
+        // concerns the way a permission-based simulation would have.
+        let digest_path = stash.join("hook-settings-backup").join("w.reduced-digest");
+        fs::create_dir_all(&digest_path).unwrap();
+
+        let result = reduce_hook_settings_for_baseline("w", &live, &stash);
+
+        assert!(result.is_err(), "a failed digest write must still surface as Err");
+        assert_eq!(
+            read_text(&live),
+            original,
+            "live must be rolled back to the original when the digest write fails"
+        );
+        let backup = stash.join("hook-settings-backup").join("w");
+        assert!(backup.exists(), "the backup this call already created is left for a retry to see");
     }
 
     #[test]
