@@ -5015,6 +5015,21 @@ mod tests {
         dir.join(name)
     }
 
+    /// Root bypasses Unix access checks entirely, so any test that simulates
+    /// a permission-based failure (a read-only directory blocking a rename
+    /// or delete) cannot actually produce that failure under root -- the
+    /// operation just succeeds, and asserting on the simulated failure fails
+    /// for a reason unrelated to the behavior under test. Shared by every
+    /// such test so the guard isn't duplicated (or, as happened once
+    /// already, forgotten) at each new call site.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        unsafe { geteuid() == 0 }
+    }
+
     fn assistant_line(msg_id: &str, input: u64, cache_read: u64, output: u64) -> String {
         format!(
             r#"{{"type":"assistant","message":{{"model":"claude-fable-5","id":"{msg_id}","type":"message","role":"assistant","content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":{input},"cache_creation_input_tokens":0,"cache_read_input_tokens":{cache_read},"output_tokens":{output},"output_tokens_details":{{"thinking_tokens":1}}}}}}}}"#
@@ -5982,6 +5997,11 @@ mod tests {
     fn restore_keeps_the_marker_when_orphaned_digest_removal_fails() {
         use std::os::unix::fs::PermissionsExt;
 
+        if running_as_root() {
+            eprintln!("skipping restore_keeps_the_marker_when_orphaned_digest_removal_fails: running as root, where the read-only-directory simulation cannot fail");
+            return;
+        }
+
         // If removing the leftover digest fails (a transient sharing
         // violation, simulated here with a read-only parent directory), the
         // marker must survive so a retry can still find it -- losing it here
@@ -6470,17 +6490,8 @@ mod tests {
     #[test]
     fn conflict_preservation_failure_keeps_the_digest_for_a_retry() {
         use std::os::unix::fs::PermissionsExt;
-        extern "C" {
-            fn geteuid() -> u32;
-        }
 
-        // Root bypasses Unix access checks entirely, so a read-only
-        // directory does not actually block root from renaming into it --
-        // the permission-based failure this test simulates cannot happen
-        // under root, and asserting on it would fail for a reason unrelated
-        // to the behavior under test. Skip rather than assert a premise that
-        // does not hold for this user.
-        if unsafe { geteuid() } == 0 {
+        if running_as_root() {
             eprintln!("skipping conflict_preservation_failure_keeps_the_digest_for_a_retry: running as root, where the read-only-directory simulation cannot fail");
             return;
         }
