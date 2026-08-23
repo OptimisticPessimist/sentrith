@@ -1490,6 +1490,30 @@ fn entry_exists(path: &Path) -> bool {
 /// wrong content. The `is_file` check on top rejects directories and other
 /// special files that a plain open would accept.
 fn open_regular_file_no_follow(path: &Path) -> Result<fs::File, OpenRefusal> {
+    // Reject a non-regular entry before opening at all. On Linux, macOS, the
+    // BSDs, and Windows the flags below already make this redundant (the
+    // open itself refuses), and there it is only belt-and-braces. It is the
+    // *only* guard on an unknown Unix, where `O_NOFOLLOW` falls back to 0:
+    // there a symlink-to-regular-file would open successfully, and the
+    // `is_file` check at the end would not catch it -- metadata on an open
+    // handle describes the target, not the link. That leaves a narrow
+    // check-then-use window on such a platform, which is worth having over
+    // no defence at all.
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(OpenRefusal::NotRegular(format!(
+                "{} is a symlink, directory, or other special file",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(OpenRefusal::Transient(format!(
+                "failed to inspect {}: {e}",
+                path.display()
+            )));
+        }
+    }
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1526,10 +1550,9 @@ fn open_regular_file_no_follow(path: &Path) -> Result<fs::File, OpenRefusal> {
         // A zero flag is the deliberate fallback for an unknown Unix:
         // guessing a wrong non-zero value risks colliding with an unrelated
         // flag, which fails *closed in the wrong direction* (every open
-        // rejected). With 0, the open simply doesn't get the no-follow
-        // guarantee and the `symlink_metadata` pre-check plus the `is_file`
-        // check on the handle below still reject a substituted symlink --
-        // only the narrow check-then-use window remains, which is strictly
+        // rejected). With 0 the open loses its no-follow guarantee and the
+        // `symlink_metadata` pre-check at the top of this function becomes
+        // the only defence -- a narrow check-then-use window, but strictly
         // better than a CLI that cannot run at all.
         if O_NOFOLLOW != 0 {
             options.custom_flags(O_NOFOLLOW);
@@ -1542,24 +1565,32 @@ fn open_regular_file_no_follow(path: &Path) -> Result<fs::File, OpenRefusal> {
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path).map_err(|e| {
-        // ELOOP/ENOTDIR from an O_NOFOLLOW open is positive proof the path
-        // is (or traverses) a symlink -- the substitution this guards
-        // against. Anything else (a permission glitch, a Windows sharing
-        // violation, which this codebase has repeatedly confirmed needs no
-        // special conditions to occur) proves nothing about *what* is
-        // there, only that this attempt could not tell.
-        #[cfg(unix)]
-        {
-            const ELOOP: i32 = 40;
-            const ENOTDIR: i32 = 20;
-            if matches!(e.raw_os_error(), Some(ELOOP) | Some(ENOTDIR)) {
-                return OpenRefusal::NotRegular(format!(
-                    "{} is a symlink or lies behind one: {e}",
-                    path.display()
-                ));
-            }
+        // Classify by asking the filesystem what is actually there, not by
+        // matching errno numbers: those differ per OS (ELOOP is 40 on Linux
+        // but 62 on macOS), and a first attempt at this hardcoded Linux's
+        // values, which made every macOS symlink look transient.
+        //
+        // Consulting the path again here does not reintroduce a
+        // check-then-use race on the *content*: the open already failed, so
+        // nothing is read through it either way. This only decides how to
+        // describe a failure that has already happened. The worst a
+        // substitution racing this classification can achieve is a
+        // "transient, retry" message instead of a "tampered" one -- no file
+        // is trusted or written in either case.
+        match fs::symlink_metadata(path) {
+            // Something is there and it is not a regular file: positive
+            // proof of the substitution this guards against.
+            Ok(meta) if !meta.is_file() => OpenRefusal::NotRegular(format!(
+                "{} is a symlink, directory, or other special file: {e}",
+                path.display()
+            )),
+            // A regular file that still would not open, or a path we cannot
+            // stat either: a permission glitch, or a Windows sharing
+            // violation, which this codebase has repeatedly confirmed needs
+            // no special conditions to occur. Proves nothing about what is
+            // there -- only that this attempt could not tell.
+            _ => OpenRefusal::Transient(format!("failed to open {}: {e}", path.display())),
         }
-        OpenRefusal::Transient(format!("failed to open {}: {e}", path.display()))
     })?;
     // On Windows the open above *succeeds* for a reparse point (that is what
     // the flag asks for), so this is what rejects it there. It also rejects
