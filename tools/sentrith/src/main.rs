@@ -2940,12 +2940,7 @@ where
     let lock_path = path.with_extension("csv.lock");
     let mut guard: Option<File> = None;
     for _ in 0..500 {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&lock_path)
-        {
+        match open_usage_lock_file(&lock_path) {
             Ok(mut file) => match file.try_lock() {
                 Ok(()) => {
                     let owner = format!("pid={}\ncreated={}\n", std::process::id(), now_unix());
@@ -2977,6 +2972,76 @@ where
     // lock is released when this handle is dropped, including after a crash.
     drop(guard);
     result
+}
+
+/// Open the persistent usage lock without following a substituted symlink.
+/// The type check is performed on the opened handle before it can be locked or
+/// truncated, so a symlink at the predictable lock path cannot redirect either
+/// operation to an unrelated file.
+fn open_usage_lock_file(path: &Path) -> Result<File, String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(format!(
+                "{} is a symlink, directory, or other special file",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to inspect {}: {e}", path.display())),
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(target_os = "linux")]
+        const O_NOFOLLOW: i32 = 0o400000;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
+        const O_NOFOLLOW: i32 = 0x0100;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )))]
+        const O_NOFOLLOW: i32 = 0;
+        if O_NOFOLLOW != 0 {
+            options.custom_flags(O_NOFOLLOW);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    let file = options
+        .open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let is_file = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?
+        .is_file();
+    if !is_file {
+        return Err(format!(
+            "{} is not a regular file (found a symlink, directory, or other special file)",
+            path.display()
+        ));
+    }
+    Ok(file)
 }
 
 fn ensure_usage_file(path: &Path) -> Result<(), String> {
@@ -4544,6 +4609,14 @@ fn verif_path(agent: &str, session: &str) -> PathBuf {
     live_dir().join(format!("{agent}-{session}.verif"))
 }
 
+fn read_transcript_boundary(path: &str) -> Option<String> {
+    if path.is_empty() {
+        None
+    } else {
+        fs::read_to_string(path).ok()
+    }
+}
+
 /// Aggregated usage and verification signals from one turn's slice of a
 /// provider transcript. Transcript formats are not stable vendor contracts;
 /// all parsing here is best-effort and must degrade to `seen == false`.
@@ -4866,10 +4939,20 @@ fn update_and_resolve_success(
 ) -> String {
     let vpath = verif_path(agent, session);
     if let Some(pass) = window_verification {
-        if let Some(parent) = vpath.parent() {
-            let _ = fs::create_dir_all(parent);
+        if committed {
+            let _ = fs::remove_file(&vpath);
+            return (if pass { "yes" } else { "no" }).into();
         }
-        let _ = fs::write(&vpath, if pass { "pass" } else { "fail" });
+        if let Some(parent) = vpath.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("SENTRITH-WARN: could not persist verification state at {}: {e}", vpath.display());
+                return "unknown".into();
+            }
+        }
+        if let Err(e) = fs::write(&vpath, if pass { "pass" } else { "fail" }) {
+            eprintln!("SENTRITH-WARN: could not persist verification state at {}: {e}", vpath.display());
+            return "unknown".into();
+        }
     }
     let carried = fs::read_to_string(&vpath)
         .ok()
@@ -4936,11 +5019,11 @@ fn usage_hook_claude(args: &[String]) -> Result<(), String> {
     if event == "UserPromptSubmit" {
         let prompt = json_string_field(&input, "prompt").unwrap_or_else(|| "Claude turn".into());
         let snap = read_kv(&snapshot_path("claude", &session));
-        let transcript_lines = if transcript.is_empty() {
-            0
-        } else {
-            fs::read_to_string(&transcript).map(|s| s.lines().count()).unwrap_or(0)
-        };
+        let transcript_boundary = read_transcript_boundary(&transcript);
+        let transcript_lines = transcript_boundary
+            .as_ref()
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
         write_kv(&task_path("claude", &session), &[
             ("phase", phase),
             ("task", prompt.chars().take(160).collect()),
@@ -4949,6 +5032,7 @@ fn usage_hook_claude(args: &[String]) -> Result<(), String> {
             ("model", snap.get("model").cloned().unwrap_or_default()),
             ("transcript", transcript),
             ("transcript_lines", transcript_lines.to_string()),
+            ("transcript_boundary", if transcript_boundary.is_some() { "ready" } else { "unavailable" }.into()),
             ("start_head", git_head()),
         ])?;
     } else if event == "Stop" {
@@ -4963,11 +5047,15 @@ fn usage_hook_claude(args: &[String]) -> Result<(), String> {
             .cloned()
             .filter(|x| !x.is_empty())
             .unwrap_or(transcript);
+        let transcript_boundary_ready = task
+            .get("transcript_boundary")
+            .map(|s| s == "ready")
+            .unwrap_or(false);
         let skip: usize = task
             .get("transcript_lines")
             .and_then(|x| x.parse().ok())
             .unwrap_or(0);
-        let window = if tp.is_empty() {
+        let window = if tp.is_empty() || !transcript_boundary_ready {
             TranscriptWindow::default()
         } else {
             fs::read_to_string(&tp)
@@ -5046,18 +5134,25 @@ fn usage_hook_claude(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn latest_token_usage_from_codex_transcript(path: &Path) -> (Option<f64>,Option<f64>,Option<f64>) {
-    let Ok(s) = fs::read_to_string(path) else { return (None,None,None); };
-    let mut last = (None,None,None);
+fn latest_token_usage_from_codex_text(s: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let mut last = (None, None, None);
     for line in s.lines() {
         if line.contains("token_count") || line.contains("total_token_usage") || line.contains("\"usage\"") {
             let i = json_number_field(line, "input_tokens");
             let c = json_number_field(line, "cached_input_tokens");
             let o = json_number_field(line, "output_tokens");
-            if i.is_some() || c.is_some() || o.is_some() { last=(i,c,o); }
+            if i.is_some() || c.is_some() || o.is_some() {
+                last = (i, c, o);
+            }
         }
     }
     last
+}
+
+fn latest_token_usage_from_codex_transcript(path: &Path) -> (Option<f64>, Option<f64>, Option<f64>) {
+    fs::read_to_string(path)
+        .map(|s| latest_token_usage_from_codex_text(&s))
+        .unwrap_or((None, None, None))
 }
 
 fn usage_hook_codex(args: &[String]) -> Result<(), String> {
@@ -5072,18 +5167,22 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
 
     if event == "UserPromptSubmit" {
         let prompt = json_string_field(&input, "prompt").unwrap_or_else(|| "Codex turn".into());
-        let (i,c,o) = if transcript.is_empty() {(None,None,None)} else {latest_token_usage_from_codex_transcript(Path::new(&transcript))};
-        let transcript_lines = if transcript.is_empty() {
-            0
-        } else {
-            fs::read_to_string(&transcript).map(|s| s.lines().count()).unwrap_or(0)
-        };
+        let transcript_boundary = read_transcript_boundary(&transcript);
+        let (i, c, o) = transcript_boundary
+            .as_deref()
+            .map(latest_token_usage_from_codex_text)
+            .unwrap_or((None, None, None));
+        let transcript_lines = transcript_boundary
+            .as_ref()
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
         write_kv(&task_path("codex", &session), &[
             ("phase", phase),
             ("task", prompt.chars().take(160).collect()),
             ("model", model),
             ("transcript", transcript),
             ("transcript_lines", transcript_lines.to_string()),
+            ("transcript_boundary", if transcript_boundary.is_some() { "ready" } else { "unavailable" }.into()),
             ("start_head", git_head()),
             ("start_input", num_cell(i)),
             ("start_cached", num_cell(c)),
@@ -5097,12 +5196,20 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
                 .cloned()
                 .filter(|x| !x.is_empty())
                 .unwrap_or(transcript);
-            let (ei,ec,eo) = if tp.is_empty() {(None,None,None)} else {latest_token_usage_from_codex_transcript(Path::new(&tp))};
+            let transcript_boundary_ready = task
+                .get("transcript_boundary")
+                .map(|s| s == "ready")
+                .unwrap_or(false);
+            let (ei, ec, eo) = if tp.is_empty() || !transcript_boundary_ready {
+                (None, None, None)
+            } else {
+                latest_token_usage_from_codex_transcript(Path::new(&tp))
+            };
             let parse = |k:&str| task.get(k).and_then(|x| x.parse::<f64>().ok());
             let delta = |end:Option<f64>, start:Option<f64>| match (end,start) {(Some(e),Some(s))=>Some((e-s).max(0.0)),(Some(e),None)=>Some(e),_=>None};
 
             let skip: usize = task.get("transcript_lines").and_then(|x| x.parse().ok()).unwrap_or(0);
-            let verification = if tp.is_empty() {
+            let verification = if tp.is_empty() || !transcript_boundary_ready {
                 None
             } else {
                 fs::read_to_string(&tp)
@@ -5767,6 +5874,19 @@ mod tests {
     }
 
     #[test]
+    fn transcript_boundary_read_failure_is_not_an_empty_transcript() {
+        let missing = temp_path("missing-transcript.jsonl");
+        assert!(read_transcript_boundary(missing.to_str().unwrap()).is_none());
+
+        let present = temp_path("present-transcript.jsonl");
+        fs::write(&present, "before\n").unwrap();
+        assert_eq!(
+            read_transcript_boundary(present.to_str().unwrap()),
+            Some("before\n".into())
+        );
+    }
+
+    #[test]
     fn usage_lock_waits_for_an_os_owned_lock() {
         let path = temp_path("usage.csv");
         let lock = path.with_extension("csv.lock");
@@ -5797,6 +5917,21 @@ mod tests {
             .expect("the waiter should enter after the lock is released");
         worker.join().unwrap().unwrap();
         let _ = fs::remove_file(lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_lock_refuses_symlink_without_touching_target() {
+        let path = temp_path("usage.csv");
+        let lock = path.with_extension("csv.lock");
+        let victim = temp_path("usage-lock-victim.txt");
+        fs::write(&victim, "victim-content").unwrap();
+        std::os::unix::fs::symlink(&victim, &lock).unwrap();
+
+        let result = with_usage_file_lock(&path, || Ok(()));
+        assert!(result.is_err(), "a symlinked lock path must be rejected");
+        assert_eq!(read_text(&victim), "victim-content");
+        assert!(lock.is_symlink(), "the rejected symlink must remain untouched");
     }
 
     #[test]
@@ -7958,5 +8093,20 @@ mod tests {
             "no"
         );
         let _ = fs::remove_file(verif_path("testagent", &session));
+    }
+
+    #[test]
+    fn committed_turn_uses_current_verification_when_state_cannot_be_written() {
+        let session = format!("write-fail-{}", std::process::id());
+        let vpath = verif_path("testagent", &session);
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_dir_all(&vpath);
+        fs::create_dir_all(&vpath).unwrap();
+
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, Some(true), true),
+            "yes"
+        );
+        let _ = fs::remove_dir_all(&vpath);
     }
 }
