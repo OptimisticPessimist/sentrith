@@ -2974,11 +2974,11 @@ where
     result
 }
 
-/// Open the persistent usage lock without following a substituted symlink.
-/// The type check is performed on the opened handle before it can be locked or
-/// truncated, so a symlink at the predictable lock path cannot redirect either
+/// Open a usage data file without following a substituted symlink.
+/// The type check is performed on the opened handle before the caller can read
+/// or write it, so a symlink at a predictable usage path cannot redirect an
 /// operation to an unrelated file.
-fn open_usage_lock_file(path: &Path) -> Result<File, String> {
+fn open_usage_file(path: &Path, create: bool) -> Result<File, String> {
     match fs::symlink_metadata(path) {
         Ok(meta) if !meta.is_file() => {
             return Err(format!(
@@ -2987,12 +2987,12 @@ fn open_usage_lock_file(path: &Path) -> Result<File, String> {
             ));
         }
         Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if create && e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("failed to inspect {}: {e}", path.display())),
     }
 
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
+    options.read(true).write(true).create(create);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -3044,33 +3044,47 @@ fn open_usage_lock_file(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-fn ensure_usage_file(path: &Path) -> Result<(), String> {
+/// Open the persistent usage lock without following a substituted symlink.
+/// The type check is performed on the opened handle before it can be locked or
+/// truncated, so a symlink at the predictable lock path cannot redirect either
+/// operation to an unrelated file.
+fn open_usage_lock_file(path: &Path) -> Result<File, String> {
+    open_usage_file(path, true)
+}
+
+fn ensure_usage_file(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    if !path.exists() {
-        fs::write(path, USAGE_HEADER).map_err(|e| e.to_string())?;
-    } else {
-        migrate_usage_file_if_needed(path)?;
+    let mut file = open_usage_file(path, true)?;
+    if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
+        file.write_all(USAGE_HEADER.as_bytes()).map_err(|e| e.to_string())?;
+        return Ok(file);
     }
-    Ok(())
+
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|e| e.to_string())?;
+    if migrate_usage_file_if_needed(path, &text)? {
+        file = open_usage_file(path, false)?;
+    }
+    Ok(file)
 }
 
 /// Upgrade a schema-v1 usage file in place by rewriting the header and padding
 /// old rows with empty `head_sha`/`verification` columns. Unknown headers are
 /// left untouched.
-fn migrate_usage_file_if_needed(path: &Path) -> Result<(), String> {
-    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+fn migrate_usage_file_if_needed(path: &Path, text: &str) -> Result<bool, String> {
     // Split on logical records: a quoted field may span physical lines, and
     // appending columns per physical line would inject commas into it.
     let records = split_csv_records(&text);
     let mut records = records.iter();
-    let Some(header) = records.next() else { return Ok(()); };
+    let Some(header) = records.next() else { return Ok(false); };
     if header.trim_end() == USAGE_HEADER.trim_end() {
-        return Ok(());
+        return Ok(false);
     }
     if header.trim_end() != USAGE_HEADER_V1.trim_end() {
-        return Ok(());
+        return Ok(false);
     }
     let mut out = String::from(USAGE_HEADER);
     for record in records {
@@ -3081,12 +3095,19 @@ fn migrate_usage_file_if_needed(path: &Path) -> Result<(), String> {
         out.push_str(",,");
         out.push('\n');
     }
-    let tmp = path.with_extension(format!("csv.migrate.{}.tmp", std::process::id()));
-    fs::write(&tmp, out).map_err(|e| e.to_string())?;
-    #[cfg(not(windows))]
-    copy_file_permissions(path, &tmp)?;
-    replace_file_preserving_security(&tmp, path, None)?;
-    Ok(())
+    let tmp = sibling_temp_path(path, "sentrith-migrate-tmp");
+    let result = (|| {
+        let mut file = create_secure_file(&tmp)?;
+        file.write_all(out.as_bytes()).map_err(|e| e.to_string())?;
+        drop(file);
+        #[cfg(not(windows))]
+        copy_file_permissions(path, &tmp)?;
+        replace_file_preserving_security(&tmp, path, None)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map(|()| true)
 }
 
 fn phase_marker_path() -> PathBuf {
@@ -4404,10 +4425,10 @@ fn num_cell(v: Option<f64>) -> String {
 
 fn append_usage_row(path: &Path, values: &[String]) -> Result<(), String> {
     with_usage_file_lock(path, || {
-        ensure_usage_file(path)?;
+        let mut file = ensure_usage_file(path)?;
         let row = values.iter().map(|x| csv_escape(x)).collect::<Vec<_>>().join(",");
-        let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
-        writeln!(f, "{row}").map_err(|e| e.to_string())
+        file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+        writeln!(file, "{row}").map_err(|e| e.to_string())
     })
 }
 
@@ -4607,6 +4628,40 @@ fn commit_reached(start_head: &str, head: &str) -> bool {
 
 fn verif_path(agent: &str, session: &str) -> PathBuf {
     live_dir().join(format!("{agent}-{session}.verif"))
+}
+
+/// Persist a verification result through a fresh temp file and an atomic swap.
+/// Existing destinations are checked with symlink_metadata first, so a
+/// symlink substituted at the state path is refused rather than followed.
+/// When the destination does not exist, rename creates it without ever
+/// dereferencing a link that races into that path.
+fn write_verification_state(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let destination_exists = match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(format!(
+                "{} is a symlink, directory, or other special file",
+                path.display()
+            ));
+        }
+        Ok(_) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(format!("failed to inspect {}: {e}", path.display())),
+    };
+
+    let tmp = sibling_temp_path(path, "sentrith-verif-tmp");
+    write_secure_temp_file(&tmp, content)?;
+    let result = if destination_exists {
+        replace_file_preserving_security(&tmp, path, None)
+    } else {
+        fs::rename(&tmp, path).map_err(|e| e.to_string())
+    };
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn read_transcript_boundary(path: &str) -> Option<String> {
@@ -4949,7 +5004,7 @@ fn update_and_resolve_success(
                 return "unknown".into();
             }
         }
-        if let Err(e) = fs::write(&vpath, if pass { "pass" } else { "fail" }) {
+        if let Err(e) = write_verification_state(&vpath, if pass { "pass" } else { "fail" }) {
             eprintln!("SENTRITH-WARN: could not persist verification state at {}: {e}", vpath.display());
             return "unknown".into();
         }
@@ -5932,6 +5987,25 @@ mod tests {
         assert!(result.is_err(), "a symlinked lock path must be rejected");
         assert_eq!(read_text(&victim), "victim-content");
         assert!(lock.is_symlink(), "the rejected symlink must remain untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_ledger_refuses_symlink_without_touching_target() {
+        let path = temp_path("usage.csv");
+        let victim = temp_path("usage-victim.txt");
+        fs::write(&victim, "victim-content").unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let usage = AutoUsage {
+            agent: "claude".into(),
+            task: "symlink-ledger".into(),
+            ..Default::default()
+        };
+        let result = append_auto_usage(&path, &usage);
+        assert!(result.is_err(), "a symlinked usage ledger must be rejected");
+        assert_eq!(read_text(&victim), "victim-content");
+        assert!(path.is_symlink(), "the rejected symlink must remain untouched");
     }
 
     #[test]
@@ -8108,5 +8182,29 @@ mod tests {
             "yes"
         );
         let _ = fs::remove_dir_all(&vpath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_state_refuses_symlink_without_touching_target() {
+        let session = format!("symlink-{}", std::process::id());
+        let vpath = verif_path("testagent", &session);
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_dir_all(&vpath);
+        fs::create_dir_all(vpath.parent().unwrap()).unwrap();
+
+        let victim = temp_path("verification-victim.txt");
+        fs::write(&victim, "victim-content").unwrap();
+        std::os::unix::fs::symlink(&victim, &vpath).unwrap();
+
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, Some(true), false),
+            "unknown"
+        );
+        assert_eq!(read_text(&victim), "victim-content");
+        assert!(vpath.is_symlink(), "the rejected symlink must remain untouched");
+
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_file(&victim);
     }
 }
