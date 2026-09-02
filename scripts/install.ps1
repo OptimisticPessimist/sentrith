@@ -96,7 +96,22 @@ function Copy-SentrithPath {
       }
     }
   } else {
-    Copy-Item -Force $Src $Dst
+    # Match the directory branch and install.sh: never hand Copy-Item a
+    # managed link, and never stream a replacement directly into the live
+    # contract file. A same-directory staged file keeps the existing file
+    # intact until Move-Item performs the final replacement.
+    $Existing = Get-Item -Force -LiteralPath $Dst -ErrorAction SilentlyContinue
+    if ($null -ne $Existing -and ($Existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      Write-Error "Refusing to overwrite symlinked contract file: $Dst (remove it before updating the contract)"
+      return
+    }
+    $Temp = "$Dst.sentrith-install-file.$([Guid]::NewGuid().ToString('N'))"
+    try {
+      Copy-Item -Force -LiteralPath $Src -Destination $Temp
+      Move-Item -Force -LiteralPath $Temp -Destination $Dst
+    } finally {
+      if (Test-Path -LiteralPath $Temp) { Remove-Item -Force -LiteralPath $Temp }
+    }
   }
 }
 

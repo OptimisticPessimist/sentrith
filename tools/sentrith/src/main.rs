@@ -4664,6 +4664,18 @@ fn write_verification_state(path: &Path, content: &str) -> Result<(), String> {
     result
 }
 
+/// Read carried verification state through the same no-follow, regular-file
+/// boundary used for other attacker-plantable state paths. A missing,
+/// unreadable, or substituted entry is unavailable evidence, never a result
+/// that can decide task success.
+fn read_verification_state(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = open_regular_file_no_follow(path).ok()?;
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+    Some(content.trim().to_string())
+}
+
 fn read_transcript_boundary(path: &str) -> Option<String> {
     if path.is_empty() {
         None
@@ -5009,9 +5021,7 @@ fn update_and_resolve_success(
             return "unknown".into();
         }
     }
-    let carried = fs::read_to_string(&vpath)
-        .ok()
-        .map(|s| s.trim().to_string());
+    let carried = read_verification_state(&vpath);
     let success = if committed {
         match carried.as_deref() {
             Some("pass") => "yes",
@@ -8203,6 +8213,29 @@ mod tests {
         );
         assert_eq!(read_text(&victim), "victim-content");
         assert!(vpath.is_symlink(), "the rejected symlink must remain untouched");
+
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_file(&victim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn carried_verification_state_refuses_symlink_without_trusting_target() {
+        let session = format!("carried-symlink-{}", std::process::id());
+        let vpath = verif_path("testagent", &session);
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_dir_all(&vpath);
+        fs::create_dir_all(vpath.parent().unwrap()).unwrap();
+
+        let victim = temp_path("carried-verification-victim.txt");
+        fs::write(&victim, "pass").unwrap();
+        std::os::unix::fs::symlink(&victim, &vpath).unwrap();
+
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, None, true),
+            "unknown"
+        );
+        assert_eq!(read_text(&victim), "pass");
 
         let _ = fs::remove_file(&vpath);
         let _ = fs::remove_file(&victim);

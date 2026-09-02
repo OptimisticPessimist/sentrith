@@ -131,7 +131,19 @@ EOF
       echo "Refusing to overwrite symlink: $dst (remove it before installing the contract file)" >&2
       return 2
     fi
-    cp "$src" "$dst"
+    # Never copy directly onto the live contract file: an interrupted copy
+    # can truncate it and leave no recoverable version. Stage beside the
+    # destination (so the final move stays on one filesystem), preserve the
+    # source mode, and only replace the live entry after the copy succeeds.
+    tmp_file=$(mktemp "$(dirname "$dst")/.sentrith-install-file.XXXXXX")
+    if ! cp -p "$src" "$tmp_file"; then
+      rm -f "$tmp_file"
+      return 1
+    fi
+    if ! mv -f "$tmp_file" "$dst"; then
+      rm -f "$tmp_file"
+      return 1
+    fi
   fi
 }
 
