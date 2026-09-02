@@ -75,18 +75,31 @@ copy_path() {
       echo "Refusing to replace symlinked directory: $dst (remove it before updating the contract)" >&2
       return 2
     fi
-    # Reset per call: this is a plain (non-local) shell variable shared
-    # across every copy_path invocation in the loop below, so a path that
-    # does *not* need a backup this time must not remove a stale value left
-    # over from a *different* path's backup in an earlier call.
+    # Build the replacement completely beside the destination. A failed or
+    # interrupted recursive copy therefore leaves the live directory intact.
+    stage_dir=$(mktemp -d "$(dirname "$dst")/.sentrith-update-stage.XXXXXX")
+    if ! cp -R "$src"/. "$stage_dir"/; then
+      rm -rf "$stage_dir"
+      return 1
+    fi
     backup_dir=""
     if [ -e "$dst" ]; then
       backup_dir=$(mktemp -d "$(dirname "$dst")/.sentrith-update-backup.XXXXXX")
       rmdir "$backup_dir"
-      mv "$dst" "$backup_dir"
+      if ! mv "$dst" "$backup_dir"; then
+        rm -rf "$stage_dir"
+        return 1
+      fi
     fi
-    mkdir -p "$dst"
-    cp -R "$src"/. "$dst"/
+    if ! mv "$stage_dir" "$dst"; then
+      if [ -n "$backup_dir" ]; then
+        if ! mv "$backup_dir" "$dst"; then
+          echo "Directory update failed and rollback also failed; original remains at $backup_dir" >&2
+        fi
+      fi
+      rm -rf "$stage_dir"
+      return 1
+    fi
     # Contract paths are Sentrith-owned and replaced wholesale, so the
     # backup is redundant *for the files Sentrith itself ships* -- but not
     # for anything else that was living under the same directory. This

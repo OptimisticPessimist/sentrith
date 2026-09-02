@@ -1675,6 +1675,44 @@ fn ancestors_are_real_directories(root: &Path, leaf: &Path) -> Result<(), String
     Ok(())
 }
 
+/// Create `path` one component at a time, refusing to traverse a symlink or
+/// other special entry. `create_dir_all` follows symlinked ancestors, which
+/// is unsafe for the git-ignored baseline stash: contract files are later
+/// moved there and trusted again by `baseline stop`.
+fn create_real_directory_tree(path: &Path) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::ParentDir => {
+                return Err(format!(
+                    "refusing to create {} through a parent-directory component",
+                    path.display()
+                ));
+            }
+            Component::Normal(_) => current.push(component.as_os_str()),
+        }
+
+        if !entry_exists(&current) {
+            fs::create_dir(&current)
+                .map_err(|e| format!("failed to create {}: {e}", current.display()))?;
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|e| format!("failed to inspect {}: {e}", current.display()))?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "{} is not a real directory (found a symlink or other special file)",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
     let dry_run = opts.contains_key("dry-run");
     let mut touched = 0;
@@ -3828,9 +3866,9 @@ fn baseline_start() -> Result<(), String> {
         .map_err(|e| format!("failed to write the phase marker: {e}"))?;
 
     let stash = baseline_stash_dir();
-    if let Err(e) = fs::create_dir_all(&stash) {
+    if let Err(e) = create_real_directory_tree(&stash) {
         let _ = fs::remove_file(phase_marker_path());
-        return Err(e.to_string());
+        return Err(format!("failed to prepare baseline stash: {e}"));
     }
     let manifest = stash.join("STASHED.txt");
 
@@ -3947,18 +3985,18 @@ fn baseline_start() -> Result<(), String> {
         // already no-ops for a path with no backup, so scanning every
         // candidate is safe regardless of which ones were ever recorded.
         let mut hook_restore_failed: Vec<String> = Vec::new();
+        let mut hook_restore_notes: Vec<String> = Vec::new();
         for path in BASELINE_HOOK_SETTINGS_PATHS.iter().rev() {
             if let Err(e) = restore_hook_settings_backup(path, &repo_file(path), &stash) {
-                // Only an Unrecoverable failure means live might still be
-                // reduced with nothing to recover it from -- a Recoverable
-                // one (a genuine conflict, safely preserved elsewhere or at
-                // its known backup path) must not block deleting the stash
-                // here either, matching `baseline_stop`'s identical
-                // distinction: the whole point of that preservation is to
-                // never hold the rest of a rollback hostage to an unrelated
-                // hook-settings issue that's already safely handled.
-                if e.is_unrecoverable() {
+                // A Recoverable error is only safe to clean past when its
+                // recovery material was actually moved outside this stash
+                // (the normal divergence/conflict case). Transient failures
+                // deliberately leave backup/digest/marker files here for a
+                // retry; deleting the stash would destroy the original.
+                if e.is_unrecoverable() || hook_restore_artifacts_exist(path, &stash) {
                     hook_restore_failed.push(format!("{path} ({e})"));
+                } else {
+                    hook_restore_notes.push(format!("{path} ({e})"));
                 }
             }
         }
@@ -3969,7 +4007,13 @@ fn baseline_start() -> Result<(), String> {
             let _ = fs::remove_file(&manifest);
             let _ = fs::remove_dir_all(&stash);
             let _ = fs::remove_file(phase_marker_path());
-            return Err(format!("{err}; rolled back, the working tree is unchanged"));
+            if hook_restore_notes.is_empty() {
+                return Err(format!("{err}; rolled back, the working tree is unchanged"));
+            }
+            return Err(format!(
+                "{err}; contract files were rolled back, but hook settings require attention: {}",
+                hook_restore_notes.join(", ")
+            ));
         }
         return Err(format!(
             "{err}; rollback incomplete for: {}. Files are still in {} — restore them manually.",
@@ -3996,6 +4040,17 @@ fn baseline_start() -> Result<(), String> {
     println!("Start a NEW agent session so the stashed instructions are not still in its context.");
     println!("When you have enough baseline tasks: sentrith usage baseline stop");
     Ok(())
+}
+
+fn hook_restore_artifacts_exist(rel_path: &str, stash: &Path) -> bool {
+    let backup_dir = stash.join("hook-settings-backup");
+    [
+        backup_dir.join(rel_path),
+        backup_dir.join(format!("{rel_path}.reduced-digest")),
+        backup_dir.join(format!("{rel_path}.restored")),
+    ]
+    .iter()
+    .any(|path| entry_exists(path))
 }
 
 /// Move stashed paths back to their live locations for as many `moved`
@@ -8060,6 +8115,53 @@ mod tests {
         assert!(error.contains("phase marker"));
         assert!(marker.is_dir());
         assert!(stash.exists(), "an empty stash keeps baseline_active true");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_real_directory_tree_refuses_a_symlinked_ancestor() {
+        let root = temp_path("real-directory-tree-root");
+        let outside = temp_path("real-directory-tree-outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let private = root.join(".sentrith-private");
+        std::os::unix::fs::symlink(&outside, &private).unwrap();
+
+        let error = create_real_directory_tree(&private.join("baseline-stash")).unwrap_err();
+
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(private.is_symlink(), "the rejected ancestor must remain untouched");
+        assert!(
+            !outside.join("baseline-stash").exists(),
+            "the helper must not create anything through the symlink"
+        );
+    }
+
+    #[test]
+    fn hook_restore_artifacts_keep_start_rollback_stash_recoverable() {
+        let stash = temp_path("stash-with-hook-recovery");
+        let backup_dir = stash.join("hook-settings-backup/.claude");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let rel = ".claude/settings.json";
+        let artifact_paths = [
+            backup_dir.join("settings.json"),
+            backup_dir.join("settings.json.reduced-digest"),
+            backup_dir.join("settings.json.restored"),
+        ];
+
+        for artifact in artifact_paths {
+            fs::write(&artifact, "recovery material").unwrap();
+            assert!(
+                hook_restore_artifacts_exist(rel, &stash),
+                "{} must prevent baseline-start rollback from deleting the stash",
+                artifact.display()
+            );
+            fs::remove_file(artifact).unwrap();
+        }
+        assert!(
+            !hook_restore_artifacts_exist(rel, &stash),
+            "a conflict already preserved outside the stash has no in-stash recovery material"
+        );
     }
 
     #[test]

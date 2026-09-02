@@ -67,13 +67,29 @@ function Copy-SentrithPath {
         return
       }
     }
+    # Populate a sibling stage before moving the live directory, so a failed
+    # or interrupted recursive copy cannot leave the destination partial.
     $Backup = $null
-    if (Test-Path $Dst) {
-      $Backup = "$Dst.sentrith-update-backup.$([Guid]::NewGuid().ToString('N'))"
-      Move-Item -Force $Dst $Backup
+    $Stage = "$Dst.sentrith-update-stage.$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+    try {
+      Get-ChildItem -Force -LiteralPath $Src | Copy-Item -Recurse -Force -Destination $Stage
+      if (Test-Path $Dst) {
+        $Backup = "$Dst.sentrith-update-backup.$([Guid]::NewGuid().ToString('N'))"
+        Move-Item -Force $Dst $Backup
+      }
+      try {
+        Move-Item -Force -LiteralPath $Stage -Destination $Dst
+      } catch {
+        if ($Backup -and -not (Test-Path -LiteralPath $Dst)) {
+          Move-Item -Force -LiteralPath $Backup -Destination $Dst
+          $Backup = $null
+        }
+        throw
+      }
+    } finally {
+      if (Test-Path -LiteralPath $Stage) { Remove-Item -Recurse -Force -LiteralPath $Stage }
     }
-    New-Item -ItemType Directory -Force -Path $Dst | Out-Null
-    Copy-Item -Recurse -Force (Join-Path $Src "*") $Dst
     # Contract paths are Sentrith-owned and replaced wholesale, so the
     # backup is redundant *for the files Sentrith itself ships* -- but not
     # for anything else living under the same directory. This project's own
