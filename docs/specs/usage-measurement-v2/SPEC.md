@@ -34,12 +34,12 @@ Fully automatic, deterministic (no model calls, no network) capture that yields:
 
 - REQ-001: `usage hook claude` parses the turn's window of the transcript JSONL and records summed input/cache_read/cache_creation/output tokens and model, deduplicated by message id.
 - REQ-002: The turn window is delimited by the transcript line count captured at `UserPromptSubmit`.
-- REQ-003: Test-like Bash commands inside the window are detected; the matching `tool_result`'s `is_error` flag determines pass/fail. The latest verification state is carried per session.
+- REQ-003: Test-like Bash commands inside the window are detected; the matching `tool_result`'s `is_error` flag determines pass/fail. The latest verification state is carried per agent/session and bound to the task's starting HEAD.
 - REQ-004: HEAD is captured at `UserPromptSubmit` and compared at `Stop`; a change marks the turn as the commit-closing row, and `head_sha` records the new SHA only in that case, so a non-empty value always denotes a task boundary.
 - REQ-005: Success semantics: commit reached AND last verification pass → `yes`; commit reached AND last verification fail → `no`; otherwise `unknown`.
 - REQ-006: The usage CSV gains `head_sha` and `verification` columns (schema v2). Existing v1 files are migrated in place deterministically (header rewrite + column padding).
-- REQ-007: Phase precedence is `--phase` > the `.ai-usage/phase` marker written by `usage baseline start` > `SENTRITH_PHASE` > `standard`. The marker outranks the environment because hooks are spawned by the agent process and never see a variable exported afterwards.
-- REQ-008: `usage report --tasks` groups turn rows into tasks by session, closing a task on any recorded `head_sha` (or a decided outcome, for manual ledger rows), and reports task-level stats; success rate counts `yes/(yes+no)` and reports the unknown share separately.
+- REQ-007: Phase precedence is `--phase` > the `.ai-usage/phase` marker written by `usage baseline start` > `SENTRITH_PHASE` > `standard`. The marker outranks the environment because hooks are spawned by the agent process and never see a variable exported afterwards. The marker is read without following links and only accepts `baseline` or `standard`.
+- REQ-008: `usage report --tasks` groups turn rows into tasks by agent and session, closing a task on any recorded `head_sha` (or a decided outcome, for manual ledger rows), and reports task-level stats; success rate counts `yes/(yes+no)` and reports the unknown share separately.
 - REQ-009: `usage report --churn [--days N]` computes file-level churn for recorded commits from git history.
 - REQ-010: `usage hook codex` applies the same HEAD tracking and best-effort test detection over the Codex transcript (`command` fields plus `exit_code` when present).
 - REQ-011: statusLine cost capture remains as fallback for cost_usd; transcript parse failure must not error the hook.

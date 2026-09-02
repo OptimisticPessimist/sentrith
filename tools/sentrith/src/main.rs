@@ -2169,18 +2169,20 @@ fn filter_tasks_by_model<'a>(
 }
 
 /// Group turn rows into tasks: rows without a session id stand alone;
-/// within a session, a change of `head_sha` closes the current task at the
-/// row that observed the new commit.
+/// within one agent/session pair, a change of `head_sha` closes the current
+/// task at the row that observed the new commit.
 fn group_tasks<'a>(rows: &[&'a BTreeMap<String, String>]) -> Vec<Vec<&'a BTreeMap<String, String>>> {
     let mut tasks: Vec<Vec<&'a BTreeMap<String, String>>> = Vec::new();
-    let mut open: BTreeMap<String, Vec<&'a BTreeMap<String, String>>> = BTreeMap::new();
+    let mut open: BTreeMap<(String, String), Vec<&'a BTreeMap<String, String>>> = BTreeMap::new();
     for row in rows.iter().copied() {
         let sid = row.get("session_id").cloned().unwrap_or_default();
         if sid.is_empty() {
             tasks.push(vec![row]);
             continue;
         }
-        open.entry(sid.clone()).or_default().push(row);
+        let agent = row.get("agent").cloned().unwrap_or_default();
+        let key = (agent, sid);
+        open.entry(key.clone()).or_default().push(row);
 
         // `head_sha` is written only for a turn that produced a commit, so any
         // value closes the task. Comparing against a previous SHA instead would
@@ -2195,7 +2197,7 @@ fn group_tasks<'a>(rows: &[&'a BTreeMap<String, String>]) -> Vec<Vec<&'a BTreeMa
         );
 
         if committed || decided {
-            if let Some(g) = open.remove(&sid) {
+            if let Some(g) = open.remove(&key) {
                 tasks.push(g);
             }
         }
@@ -3135,8 +3137,18 @@ fn resolve_phase_value(
     "standard".to_string()
 }
 
+fn read_phase_marker(path: &Path) -> Option<String> {
+    let value = read_regular_file_no_follow(path)?;
+    match value.trim() {
+        "baseline" => Some("baseline".into()),
+        "standard" => Some("standard".into()),
+        _ => None,
+    }
+}
+
 fn resolve_phase(explicit: Option<&str>) -> String {
-    let marker = fs::read_to_string(phase_marker_path()).ok();
+    let marker_path = phase_marker_path();
+    let marker = read_phase_marker(&marker_path);
     resolve_phase_value(
         explicit,
         marker.as_deref(),
@@ -3777,9 +3789,8 @@ fn baseline_active() -> bool {
 }
 
 fn baseline_status() -> Result<(), String> {
-    let phase = fs::read_to_string(phase_marker_path())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "standard (no marker)".into());
+    let phase = read_phase_marker(&phase_marker_path())
+        .unwrap_or_else(|| "standard (no valid marker)".into());
     if baseline_active() {
         println!("SENTRITH-BASELINE: active; contract stashed in {}", baseline_stash_dir().display());
         let edited = read_text(&baseline_stash_dir().join("HOOK_EDITS.txt"))
@@ -4664,16 +4675,31 @@ fn write_verification_state(path: &Path, content: &str) -> Result<(), String> {
     result
 }
 
-/// Read carried verification state through the same no-follow, regular-file
-/// boundary used for other attacker-plantable state paths. A missing,
-/// unreadable, or substituted entry is unavailable evidence, never a result
-/// that can decide task success.
-fn read_verification_state(path: &Path) -> Option<String> {
+/// Read a small state file through the no-follow, regular-file boundary used
+/// for attacker-plantable paths. A missing, unreadable, or substituted entry
+/// is unavailable evidence, never content a caller may trust.
+fn read_regular_file_no_follow(path: &Path) -> Option<String> {
     use std::io::Read;
     let mut file = open_regular_file_no_follow(path).ok()?;
     let mut content = String::new();
     file.read_to_string(&mut content).ok()?;
     Some(content.trim().to_string())
+}
+
+fn verification_state_content(pass: bool, task_head: &str) -> String {
+    format!("{}\t{task_head}\n", if pass { "pass" } else { "fail" })
+}
+
+fn verification_for_head(content: &str, task_head: &str) -> Option<bool> {
+    let (outcome, bound_head) = content.trim().split_once('\t')?;
+    if bound_head != task_head {
+        return None;
+    }
+    match outcome {
+        "pass" => Some(true),
+        "fail" => Some(false),
+        _ => None,
+    }
 }
 
 fn read_transcript_boundary(path: &str) -> Option<String> {
@@ -5003,11 +5029,12 @@ fn update_and_resolve_success(
     session: &str,
     window_verification: Option<bool>,
     committed: bool,
+    task_head: &str,
 ) -> String {
     let vpath = verif_path(agent, session);
     if let Some(pass) = window_verification {
         if committed {
-            let _ = fs::remove_file(&vpath);
+            remove_verification_state(&vpath);
             return (if pass { "yes" } else { "no" }).into();
         }
         if let Some(parent) = vpath.parent() {
@@ -5016,25 +5043,38 @@ fn update_and_resolve_success(
                 return "unknown".into();
             }
         }
-        if let Err(e) = write_verification_state(&vpath, if pass { "pass" } else { "fail" }) {
+        let content = verification_state_content(pass, task_head);
+        if let Err(e) = write_verification_state(&vpath, &content) {
             eprintln!("SENTRITH-WARN: could not persist verification state at {}: {e}", vpath.display());
             return "unknown".into();
         }
     }
-    let carried = read_verification_state(&vpath);
+    let carried = read_regular_file_no_follow(&vpath)
+        .and_then(|content| verification_for_head(&content, task_head));
     let success = if committed {
-        match carried.as_deref() {
-            Some("pass") => "yes",
-            Some("fail") => "no",
+        match carried {
+            Some(true) => "yes",
+            Some(false) => "no",
             _ => "unknown",
         }
     } else {
         "unknown"
     };
     if committed {
-        let _ = fs::remove_file(&vpath);
+        remove_verification_state(&vpath);
     }
     success.to_string()
+}
+
+fn remove_verification_state(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "SENTRITH-WARN: could not remove consumed verification state at {}: {e}",
+            path.display()
+        ),
+    }
 }
 
 fn usage_claude_status(_args: &[String]) -> Result<(), String> {
@@ -5131,7 +5171,13 @@ fn usage_hook_claude(args: &[String]) -> Result<(), String> {
         let start_head = task.get("start_head").cloned().unwrap_or_default();
         let head = git_head();
         let committed = commit_reached(&start_head, &head);
-        let success = update_and_resolve_success("claude", &session, window.verification, committed);
+        let success = update_and_resolve_success(
+            "claude",
+            &session,
+            window.verification,
+            committed,
+            &start_head,
+        );
 
         // statusLine snapshot stays as the cost/duration fallback; it may lag
         // the turn end, which is why tokens now come from the transcript.
@@ -5284,7 +5330,13 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
             let start_head = task.get("start_head").cloned().unwrap_or_default();
             let head = git_head();
             let committed = commit_reached(&start_head, &head);
-            let success = update_and_resolve_success("codex", &session, verification, committed);
+            let success = update_and_resolve_success(
+                "codex",
+                &session,
+                verification,
+                committed,
+                &start_head,
+            );
 
             let u = AutoUsage {
                 agent: "codex".into(),
@@ -6198,6 +6250,32 @@ mod tests {
             resolve_phase_value(None, Some("baseline\n"), None),
             "baseline"
         );
+    }
+
+    #[test]
+    fn phase_marker_accepts_only_supported_values() {
+        let marker = temp_path("phase-marker");
+        fs::write(&marker, "baseline\n").unwrap();
+        assert_eq!(read_phase_marker(&marker).as_deref(), Some("baseline"));
+        fs::write(&marker, "secret-or-unsupported").unwrap();
+        assert_eq!(read_phase_marker(&marker), None);
+        let _ = fs::remove_file(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phase_marker_read_does_not_follow_a_symlink() {
+        let marker = temp_path("phase-marker-symlink");
+        let victim = temp_path("phase-marker-victim");
+        let _ = fs::remove_file(&marker);
+        fs::write(&victim, "baseline").unwrap();
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+
+        assert_eq!(read_phase_marker(&marker), None);
+        assert_eq!(read_text(&victim), "baseline");
+
+        let _ = fs::remove_file(&marker);
+        let _ = fs::remove_file(&victim);
     }
 
     #[test]
@@ -7598,6 +7676,22 @@ mod tests {
     }
 
     #[test]
+    fn task_grouping_keeps_agents_with_the_same_session_separate() {
+        let mut codex = turn("unknown", "", "unknown", "10");
+        codex.insert("agent".into(), "codex".into());
+        let mut claude = turn("unknown", "commit", "yes", "20");
+        claude.insert("agent".into(), "claude".into());
+        let owned = vec![codex, claude];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+
+        let tasks = group_tasks(&rows);
+        assert_eq!(tasks.len(), 2);
+        assert!(
+            tasks.iter().all(|task| task.len() == 1),
+            "rows from different agents must never become one task"
+        );
+    }
+    #[test]
     fn success_rate_excludes_unknown_from_denominator() {
         let owned = vec![
             row("", "", "yes", "standard"),
@@ -8159,21 +8253,21 @@ mod tests {
 
         // No commit yet: undecidable even though tests passed.
         assert_eq!(
-            update_and_resolve_success("testagent", &session, Some(true), false),
+            update_and_resolve_success("testagent", &session, Some(true), false, "head-a"),
             "unknown"
         );
         // Commit arrives in a later turn; the earlier pass is carried forward.
         assert_eq!(
-            update_and_resolve_success("testagent", &session, None, true),
+            update_and_resolve_success("testagent", &session, None, true, "head-a"),
             "yes"
         );
         // State is cleared after the commit closes the task.
         assert_eq!(
-            update_and_resolve_success("testagent", &session, None, true),
+            update_and_resolve_success("testagent", &session, None, true, "head-b"),
             "unknown"
         );
         assert_eq!(
-            update_and_resolve_success("testagent", &session, Some(false), true),
+            update_and_resolve_success("testagent", &session, Some(false), true, "head-b"),
             "no"
         );
         let _ = fs::remove_file(verif_path("testagent", &session));
@@ -8188,7 +8282,7 @@ mod tests {
         fs::create_dir_all(&vpath).unwrap();
 
         assert_eq!(
-            update_and_resolve_success("testagent", &session, Some(true), true),
+            update_and_resolve_success("testagent", &session, Some(true), true, "head-a"),
             "yes"
         );
         let _ = fs::remove_dir_all(&vpath);
@@ -8208,7 +8302,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &vpath).unwrap();
 
         assert_eq!(
-            update_and_resolve_success("testagent", &session, Some(true), false),
+            update_and_resolve_success("testagent", &session, Some(true), false, "head-a"),
             "unknown"
         );
         assert_eq!(read_text(&victim), "victim-content");
@@ -8232,12 +8326,31 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &vpath).unwrap();
 
         assert_eq!(
-            update_and_resolve_success("testagent", &session, None, true),
+            update_and_resolve_success("testagent", &session, None, true, "head-a"),
             "unknown"
         );
         assert_eq!(read_text(&victim), "pass");
 
         let _ = fs::remove_file(&vpath);
         let _ = fs::remove_file(&victim);
+    }
+
+    #[test]
+    fn stale_verification_state_is_not_reused_by_a_later_head() {
+        let session = format!("stale-head-{}", std::process::id());
+        let vpath = verif_path("testagent", &session);
+        let _ = fs::remove_file(&vpath);
+        fs::create_dir_all(vpath.parent().unwrap()).unwrap();
+        write_verification_state(
+            &vpath,
+            &verification_state_content(true, "previous-head"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, None, true, "later-head"),
+            "unknown"
+        );
+        let _ = fs::remove_file(&vpath);
     }
 }
