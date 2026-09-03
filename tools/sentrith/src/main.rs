@@ -5111,12 +5111,6 @@ fn update_and_resolve_success(
             remove_verification_state(&vpath);
             return (if pass { "yes" } else { "no" }).into();
         }
-        if let Some(parent) = vpath.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("SENTRITH-WARN: could not persist verification state at {}: {e}", vpath.display());
-                return "unknown".into();
-            }
-        }
         let content = verification_state_content(pass, task_head);
         if let Err(e) = write_verification_state(&vpath, &content) {
             eprintln!("SENTRITH-WARN: could not persist verification state at {}: {e}", vpath.display());
@@ -5140,15 +5134,44 @@ fn update_and_resolve_success(
     success.to_string()
 }
 
-fn remove_verification_state(path: &Path) {
+fn remove_live_state_file(path: &Path) {
+    if path.is_absolute() {
+        eprintln!(
+            "SENTRITH-WARN: refusing to remove absolute live-state path {}",
+            path.display()
+        );
+        return;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "SENTRITH-WARN: could not inspect live state at {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    }
+    if let Err(e) = ancestors_are_real_directories(Path::new(""), path) {
+        eprintln!(
+            "SENTRITH-WARN: could not safely remove live state at {}: {e}",
+            path.display()
+        );
+        return;
+    }
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => eprintln!(
-            "SENTRITH-WARN: could not remove consumed verification state at {}: {e}",
+            "SENTRITH-WARN: could not remove live state at {}: {e}",
             path.display()
         ),
     }
+}
+
+fn remove_verification_state(path: &Path) {
+    remove_live_state_file(path);
 }
 
 fn usage_claude_status(_args: &[String]) -> Result<(), String> {
@@ -5314,7 +5337,7 @@ fn usage_hook_claude(args: &[String]) -> Result<(), String> {
             ..Default::default()
         };
         append_auto_usage(&file, &u)?;
-        let _ = fs::remove_file(task_path("claude", &session));
+        remove_live_state_file(&task_path("claude", &session));
     }
     Ok(())
 }
@@ -5433,7 +5456,7 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
                 ..Default::default()
             };
             append_auto_usage(&file, &u)?;
-            let _ = fs::remove_file(task_path("codex", &session));
+            remove_live_state_file(&task_path("codex", &session));
         }
     }
     Ok(())
@@ -8539,6 +8562,25 @@ mod tests {
         assert!(write_verification_state(&traversing, "replacement").is_err());
         assert_eq!(read_text(&victim), "must-survive");
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_state_cleanup_refuses_a_symlinked_parent_directory() {
+        let root = relative_usage_test_path("state-cleanup-parent-root");
+        let outside = temp_path("state-cleanup-parent-outside");
+        create_real_directory_tree(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let live = root.join("live");
+        std::os::unix::fs::symlink(&outside, &live).unwrap();
+        let victim = outside.join("agent-session.task");
+        fs::write(&victim, "must-survive").unwrap();
+
+        remove_live_state_file(&live.join("agent-session.task"));
+
+        assert_eq!(read_text(&victim), "must-survive");
+        fs::remove_file(&live).unwrap();
         fs::remove_dir_all(&root).unwrap();
     }
 
