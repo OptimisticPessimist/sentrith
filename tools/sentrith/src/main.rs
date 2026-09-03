@@ -4742,7 +4742,13 @@ fn write_verification_state(path: &Path, content: &str) -> Result<(), String> {
 /// for attacker-plantable paths. A missing, unreadable, or substituted entry
 /// is unavailable evidence, never content a caller may trust.
 fn read_regular_file_no_follow_raw(path: &Path) -> Option<String> {
-    ancestors_are_real_directories(Path::new(""), path).ok()?;
+    // Live hook state is repository-relative. Validate those ancestors without
+    // following links, while allowing absolute paths supplied by isolated
+    // callers to pass through platform aliases such as macOS
+    // /var -> /private/var.
+    if !path.is_absolute() {
+        ancestors_are_real_directories(Path::new(""), path).ok()?;
+    }
     use std::io::Read;
     let mut file = open_regular_file_no_follow(path).ok()?;
     let mut content = String::new();
@@ -5841,6 +5847,16 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    fn relative_usage_test_path(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        PathBuf::from(".ai-usage").join(format!(
+            "sentrith-test-{name}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ))
     }
 
     /// Root bypasses Unix access checks entirely, so any test that simulates
@@ -8133,9 +8149,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn create_real_directory_tree_refuses_a_symlinked_ancestor() {
-        let root = temp_path("real-directory-tree-root");
+        let root = relative_usage_test_path("real-directory-tree-root");
         let outside = temp_path("real-directory-tree-outside");
-        fs::create_dir_all(&root).unwrap();
+        create_real_directory_tree(&root).unwrap();
         fs::create_dir_all(&outside).unwrap();
         let private = root.join(".sentrith-private");
         std::os::unix::fs::symlink(&outside, &private).unwrap();
@@ -8148,6 +8164,9 @@ mod tests {
             !outside.join("baseline-stash").exists(),
             "the helper must not create anything through the symlink"
         );
+
+        fs::remove_file(&private).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -8453,8 +8472,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn kv_state_neither_writes_nor_reads_through_a_symlink() {
-        let state = temp_path("kv-state-symlink");
+        let state = relative_usage_test_path("kv-state-symlink");
         let victim = temp_path("kv-state-victim");
+        create_real_directory_tree(state.parent().unwrap()).unwrap();
         fs::write(&victim, "secret\tvalue\n").unwrap();
         std::os::unix::fs::symlink(&victim, &state).unwrap();
 
@@ -8468,14 +8488,16 @@ mod tests {
         assert!(result.is_err(), "a substituted state path must be refused");
         assert_eq!(read_text(&victim), "secret\tvalue\n");
         assert!(state.is_symlink(), "the rejected state entry must remain untouched");
+
+        fs::remove_file(&state).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
     fn kv_state_refuses_a_symlinked_parent_directory() {
-        let root = temp_path("kv-state-parent-root");
+        let root = relative_usage_test_path("kv-state-parent-root");
         let outside = temp_path("kv-state-parent-outside");
-        fs::create_dir_all(&root).unwrap();
+        create_real_directory_tree(&root).unwrap();
         fs::create_dir_all(&outside).unwrap();
         let live = root.join("live");
         std::os::unix::fs::symlink(&outside, &live).unwrap();
@@ -8487,23 +8509,28 @@ mod tests {
             !outside.join("agent-session.task").exists(),
             "nothing may be written through the symlinked ancestor"
         );
+
+        fs::remove_file(&live).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn kv_state_round_trip_preserves_value_whitespace() {
-        let state = temp_path("kv-state-whitespace");
+        let state = relative_usage_test_path("kv-state-whitespace");
         write_kv(&state, &[("task", " leading and trailing ".to_string())]).unwrap();
 
         assert_eq!(
             read_kv(&state).get("task").map(String::as_str),
             Some(" leading and trailing ")
         );
+
+        fs::remove_file(&state).unwrap();
     }
 
     #[test]
     fn state_paths_refuse_parent_directory_traversal() {
-        let root = temp_path("state-parent-traversal");
-        fs::create_dir_all(root.join("child")).unwrap();
+        let root = relative_usage_test_path("state-parent-traversal");
+        create_real_directory_tree(&root.join("child")).unwrap();
         let victim = root.join("victim");
         fs::write(&victim, "must-survive").unwrap();
         let traversing = root.join("child/../victim");
@@ -8511,6 +8538,8 @@ mod tests {
         assert!(read_regular_file_no_follow_raw(&traversing).is_none());
         assert!(write_verification_state(&traversing, "replacement").is_err());
         assert_eq!(read_text(&victim), "must-survive");
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
