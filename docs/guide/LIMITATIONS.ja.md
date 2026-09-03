@@ -1,6 +1,6 @@
 <p align="right"><a href="LIMITATIONS.en.md">English</a> ｜ <strong>日本語</strong></p>
 
-# Sentrith pre-release prototype の懸念点・限界
+# Sentrith の懸念点・限界
 
 このテンプレートはAgentの暴走や再調査を減らすためのガードであり、正しさを保証する仕組みではありません。
 
@@ -186,7 +186,7 @@ Sentrith標準は「同じAgentターン内の自動ルーティング + LLMを�
 
 ---
 
-# Sentrith pre-release prototype でさらに意識すべき懸念
+# さらに意識すべき懸念
 
 ## 11. ガード文書そのものの肥大化
 
@@ -230,7 +230,7 @@ credit増加・重要ルール埋没
 
 逆に、文字列ヒューリスティックやAgent判断が危険変更を見逃す可能性があります。
 
-`guard_check.py` / `review_hint.py` は補助であり、保証ではありません。
+`sentrith guard` / `sentrith review-hint` は補助であり、保証ではありません。
 
 対策:
 
@@ -331,7 +331,7 @@ failure cost
 
 ---
 
-# Sentrith pre-release prototype 以降で残る懸念
+# 運用上残る懸念
 
 ## 19. policy間の矛盾
 
@@ -357,14 +357,15 @@ Credit Policyは安全性を上書きしません。
 
 ---
 
-## 20. ローカルscriptのportable性
+## 20. ローカル自動化のportable性
 
-Hook scriptはPythonを前提にしています。
+Shell/Python依存の自動化はWindows / macOS / Linux / CI / 制限付き企業環境で壊れやすいものです。
 
-Pythonのないenvironmentではhookが動きません。
+そのためSentrithは小さなRust製CLIとprebuilt binaryを採用しています。
 
-これはAgent workflow自体の必須要件ではないため、
-hookはoptionalのままにしています。
+それでもOS固有の挙動は個別にテストが必要です。
+
+hookはAgent workflow自体の必須要件ではないため、optionalのままにしています。
 
 ---
 

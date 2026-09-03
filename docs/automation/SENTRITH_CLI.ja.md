@@ -2,7 +2,7 @@
 
 # sentrith CLI
 
-Sentrith v1.0からローカル自動化・Usage測定はPythonではなくRust製単一CLIに統合しています。
+ローカル自動化・Usage測定はPythonではなくRust製単一CLIに統合しています。
 
 ## 利用者
 
@@ -29,8 +29,15 @@ sentrith diff-budget
 Usage:
 
 ```text
+sentrith hooks install
+sentrith usage status
+sentrith usage baseline start
+sentrith usage baseline stop
+
 sentrith usage record --agent codex --phase standard --task "fix login" --credits 5.2
 sentrith usage report --compare
+sentrith usage report --tasks
+sentrith usage report --churn --days 14
 sentrith usage note "Codex /status before task: ..."
 ```
 
@@ -68,7 +75,7 @@ cargo test --manifest-path tools/sentrith/Cargo.toml
 通常利用者はbuild不要です。
 
 
-## Sentrith pre-release prototype Usage commands
+## Usage commands
 
 ```bash
 sentrith usage snapshot copilot --github-user USER [--org ORG]

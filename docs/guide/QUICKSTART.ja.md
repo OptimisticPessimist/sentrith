@@ -1,6 +1,6 @@
 <p align="right"><a href="QUICKSTART.en.md">English</a> ｜ <strong>日本語</strong></p>
 
-# Sentrith Sentrith pre-release prototype — クイックスタート
+# Sentrith — クイックスタート
 
 普段は**開発手法のコマンドを覚える必要はありません**。
 
@@ -240,7 +240,7 @@ Sentrithにはoptionalなhook用スクリプトがあります。
 
 です。
 
-これらはPythonのローカルスクリプトだけで動き、LLMを呼びません。
+これらはローカルの `sentrith` バイナリ(Rust製)だけで動き、LLMを呼びません。
 
 そのため**hook自体のAIクレジット消費はありません**。
 
@@ -293,7 +293,7 @@ Agent側が開発手法を選びます。
 **SDDはユーザーが操作する工程ではなく、Agentが必要なときだけ内部で適用する工程**として扱います。
 
 
-# Sentrith pre-release prototype: 強いガード
+# 強いガード
 
 短い依頼でも、Agentは `docs/development/SAFETY_GATES.md` に従います。
 
@@ -316,7 +316,7 @@ migration簡単にして
 ガードの限界は `docs/guide/LIMITATIONS.ja.md` を参照してください。
 
 
-# Sentrith pre-release prototype: 人間レビューも自動選別
+# 人間レビューも自動選別
 
 Agentは変更を次の3段階で内部判定します。
 
@@ -336,7 +336,7 @@ REVIEW-REQUIRED
 破壊的変更を自己承認することは禁止しています。
 
 
-# Sentrith pre-release prototype: クレジット方針
+# クレジット方針
 
 標準では追加のreview Agent / memory Agent / summary Agentを自動起動しません。
 

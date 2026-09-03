@@ -40,3 +40,9 @@ End users should use a prebuilt GitHub Release binary.
 ```bash
 cargo test --manifest-path tools/sentrith/Cargo.toml
 ```
+
+## Before changing file-replacement or backup/restore logic
+
+Read [`DECISIONS.md`](DECISIONS.md) first. It records durable engineering
+decisions about this implementation whose rationale would otherwise be
+expensive to rediscover.

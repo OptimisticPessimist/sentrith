@@ -32,16 +32,26 @@ AGENTS.md
 CLAUDE.md
 .github/copilot-instructions.md
 .github/prompts/
-.claude/
-.codex/
+.agents/            # canonical cross-agent skills
+.claude/skills/     # thin adapters
+.claude/settings.hooks.example.json
+.codex/hooks.example.json
 docs/ai/
 docs/development/
+docs/profiles/
 docs/specs/
 docs/rfcs/
 ```
 
 It does not modify your application source code.
-> If the target already contains Sentrith-managed paths, the installer stops instead of overwriting them. Merge intentionally, or use `--force` / `-Force` only when replacement is deliberate.
+
+`.agents/` is required: the adapters in `.claude/skills/` point at it.
+
+> If the target already contains Sentrith-managed paths, the installer stops instead of overwriting them.
+> **If Sentrith is already installed and you are moving to a new version, use `--update`.** It replaces contract files and preserves project memory.
+> `--force` replaces project memory too; use it only to reinstall from scratch.
+
+Details: [Updating](UPDATING.en.md)
 
 
 ## Bootstrap Project Memory
@@ -66,7 +76,21 @@ The important step is reviewing generated project facts before treating them as 
 
 End users should prefer a prebuilt `sentrith` binary from a release once release assets are available.
 
-Maintainers can build it locally:
+A fetch script downloads the binary for the current OS from the newest release into the target repository's `bin/`, with SHA256 verification:
+
+```bash
+./scripts/get-sentrith.sh /path/to/your-project
+```
+
+Windows PowerShell:
+
+```powershell
+./scripts/get-sentrith.ps1 -Target C:\path\to\your-project
+```
+
+No Rust toolchain is required.
+
+Maintainers can also build it locally:
 
 ```bash
 cargo build --release --manifest-path tools/sentrith/Cargo.toml
@@ -80,6 +104,14 @@ After placing `sentrith` on `PATH`, verify the repository:
 sentrith preflight
 sentrith guard
 ```
+
+To enable measurement hooks, run this instead of editing JSON by hand:
+
+```bash
+sentrith hooks install
+```
+
+It merges only Sentrith's hooks and preserves the rest of your `.claude/settings.json`.
 
 ## First real task
 

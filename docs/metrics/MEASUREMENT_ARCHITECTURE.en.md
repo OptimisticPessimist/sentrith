@@ -32,6 +32,75 @@ Sentrith records the engineering work boundary:
 
 This lets provider consumption be attributed to meaningful engineering work.
 
+Besides the explicit ledger written by `usage task start` / `stop`, hook-based capture **derives** the work boundary automatically:
+
+```text
+1 turn = one usage.csv row
+1 task = the turns of a session up to and including the turn that commits
+```
+
+The `head_sha` column is written **only** for a turn that produced a commit, so any value is itself the task boundary.
+
+Recording HEAD at the end of every turn cannot distinguish a first turn that committed from one that merely inherited an existing HEAD, which would merge that task into the next one.
+
+`sentrith usage report --tasks` aggregates turns into tasks using that rule.
+
+## Success semantics (automatic capture)
+
+For hook-captured rows, success comes from **repository evidence, not human judgment**:
+
+```text
+commit reached + last test run green -> yes
+commit reached + last test run red   -> no
+otherwise (nothing to decide on)     -> unknown
+```
+
+Evidence used:
+
+- **commit reached**: HEAD at `Stop` differs from HEAD at `UserPromptSubmit` (the resulting SHA is what `head_sha` records)
+- **test outcome**: success/failure of test-runner commands (`cargo test`, `pytest`, `npm test`, …) executed during the turn
+
+`unknown` is not failure. It is **excluded from the success-rate denominator**:
+
+```text
+success rate = yes / (yes + no)
+```
+
+This prevents automatic capture from deflating the rate. The unknown count is always reported alongside it.
+
+The definition is reproducible, but it is not the same as "did a human consider this successful". Correct work that ended without a commit is recorded as unknown.
+
+## Rework (churn proxy)
+
+Rework is not instrumented at capture time; it is **computed retroactively from git history**:
+
+```bash
+sentrith usage report --churn --days 14
+```
+
+For each recorded commit it reports the share of files touched by that commit which were modified again within N days.
+
+This is a file-level proxy, not line-level attribution.
+
+## Phase (baseline / standard)
+
+Switch phases with the dedicated commands:
+
+```bash
+sentrith usage baseline start
+sentrith usage baseline stop
+```
+
+Precedence:
+
+```text
+--phase > .ai-usage/phase (marker) > SENTRITH_PHASE > standard
+```
+
+The marker outranks the environment variable because hooks are spawned by the agent process: a variable exported after the agent started never reaches them, while the marker always can be read.
+
+Baseline measurement requires running without the Sentrith contract, so switching is an explicit step.
+
 ## Provider Usage
 
 Prefer the provider's documented usage/billing surface as source of truth.

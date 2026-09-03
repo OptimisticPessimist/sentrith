@@ -8,6 +8,7 @@ Before substantial work, consult:
 
 - `docs/ai/PROJECT.md`
 - `docs/ai/STATE.md`
+- `docs/ai/PROFILE.md`
 
 When relevant, consult:
 

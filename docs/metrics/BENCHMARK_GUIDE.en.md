@@ -21,11 +21,31 @@ Record available metrics with:
 sentrith usage record ...
 ```
 
+With hooks enabled, capture is automatic. To measure a baseline, switch the contract off:
+
+```bash
+sentrith usage baseline start
+```
+
+Agent instruction files move to `.sentrith-private/baseline-stash/` and later turns record as `baseline`, while measurement keeps running. **Start a new agent session**, then work normally. When you have enough tasks:
+
+```bash
+sentrith usage baseline stop
+```
+
+Check progress at any time with `sentrith usage status`.
+
+Phase precedence is `--phase` > `.ai-usage/phase` (the marker these commands write) > `SENTRITH_PHASE` > `standard`. The marker outranks the environment because hooks are spawned by the agent process: a variable exported after the agent started never reaches them.
+
 Compare with:
 
 ```bash
 sentrith usage report --compare
+sentrith usage report --tasks
+sentrith usage report --churn --days 14
 ```
+
+`--tasks` aggregates captured turns into tasks; `--churn` computes the rework proxy from git history.
 
 ## Primary metrics
 

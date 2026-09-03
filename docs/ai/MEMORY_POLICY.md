@@ -52,6 +52,17 @@ Store only current state, such as:
 
 Replace stale state rather than appending history.
 
+### PROFILE.md
+
+Store only which engineering profiles are enabled, what triggers them in this
+repository, and which techniques are actually in force with the condition that
+activated them.
+
+Do not store technique explanations; those live in `docs/profiles/`.
+
+Update it when the repository gains or loses a domain (for example a data
+pipeline or model-driven behavior appears), not per task.
+
 ### DECISIONS.md
 
 Store only durable decisions where rationale matters.
@@ -105,8 +116,11 @@ For a normal substantial task:
 - `AGENTS.md`
 - `docs/ai/PROJECT.md`
 - `docs/ai/STATE.md`
+- `docs/ai/PROFILE.md`
 
 Read other memory files only when relevant.
+
+Read a `docs/profiles/` document only when the task matches a trigger recorded in `PROFILE.md`.
 
 ### Targeted reads
 
@@ -122,6 +136,7 @@ Recommended soft targets:
 
 - `PROJECT.md`: <= 400 lines
 - `STATE.md`: <= 120 lines
+- `PROFILE.md`: <= 100 lines
 - `DECISIONS.md`: no fixed total, but retrieve relevant entries rather than reading all
 - `KNOWN_ISSUES.md`: no fixed total, but retrieve relevant entries rather than reading all
 

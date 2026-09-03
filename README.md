@@ -57,19 +57,21 @@ Sentrith does not start by asking:
 > “Do you want DDD?”  
 > “Should we use CQRS?”
 
-Instead, it asks a small number of project questions about complexity, failure impact, AI/Data/Platform dependencies, and hard-to-test areas.
+Instead, bootstrap asks a small number of project questions about failure impact, external contracts, AI/Data/Platform dependencies, and existing verification. The answers are recorded once in `docs/ai/PROFILE.md`.
 
 ```mermaid
 flowchart TD
-    P["Project"] --> Q["5–10 multiple-choice questions"]
-    Q --> E["Engineering Profile"]
+    P["Project"] --> Q["Bootstrap questions"]
+    Q --> E["docs/ai/PROFILE.md"]
     E --> W["Web / Backend"]
     E --> A["AI / ML"]
     E --> D["Data"]
     E --> G["Game / 3D"]
 ```
 
-Supported areas include:
+Profiles are **additive overlays**, not exclusive modes. A RAG-backed API enables Web/Backend and AI/ML, and a change matching both is verified against the union of the two.
+
+Supported areas:
 
 - **Web / Backend**
 - **AI / ML**
@@ -80,9 +82,11 @@ Supported areas include:
   - Godot
   - Unreal Engine
 
-Techniques such as DDD Lite / Full, Threat Modeling, Property-Based Testing, Ports & Adapters, Statistical Review, Visual Regression, Formal Methods, CQRS, and Event Sourcing are enabled only when they fit the actual problem.
+Each profile carries **technique gates**: DDD Lite / Full, Ports & Adapters, CQRS, Event Sourcing, Threat Modeling, Property-Based Testing, Golden Eval, Statistical Review, Data Contract Tests, Visual Acceptance. A technique is applied only when its documented condition holds — when in doubt, it stays off.
 
 **The technique is not the goal. Solving the project’s real risk is.**
+
+[Engineering Profiles →](docs/profiles/README.en.md)
 
 ---
 
@@ -239,7 +243,21 @@ sentrith guard
 
 Want to measure impact? Record a baseline **before** changing your workflow.
 
-[Full installation guide →](docs/guide/INSTALLATION.en.md)
+### Updating an existing project
+
+```bash
+./scripts/install.sh --update /path/to/your-project
+```
+
+```powershell
+./scripts/install.ps1 -Target C:\path\to\your-project -Update
+```
+
+`--update` replaces contract files and **preserves project memory** (`docs/ai/PROJECT.md` and friends) and your feature specs.
+
+Do not use `--force` to update: it overwrites project memory.
+
+[Installation →](docs/guide/INSTALLATION.en.md) ｜ [Updating →](docs/guide/UPDATING.en.md)
 
 Works with:
 
@@ -255,6 +273,7 @@ Works with:
 
 - [Documentation by goal](docs/README.md)
 - [Installation](docs/guide/INSTALLATION.en.md)
+- [Updating](docs/guide/UPDATING.en.md)
 - [Quickstart](docs/guide/QUICKSTART.en.md)
 - [Development Method](docs/development/DEVELOPMENT_METHOD.md)
 - [Safety Gates](docs/development/SAFETY_GATES.md)
@@ -278,4 +297,4 @@ The next step is not a longer prompt. It is to **keep the speed while bringing k
 
 ---
 
-**Sentrith v1.0.0 — first public release.**
+**Sentrith v0.2.0** — 0.x series: the contract is still evolving. See [Versioning](docs/meta/VERSIONING.md).

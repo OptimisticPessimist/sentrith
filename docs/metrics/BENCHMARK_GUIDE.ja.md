@@ -83,6 +83,38 @@ standard側だけ難しいタスクでは比較になりません。
 
 テンプレート未導入、または標準workflowを使わない状態で記録します。
 
+## hook自動計測を使う場合(推奨)
+
+Sentrithのcontractを外した状態へ切り替えます。
+
+```bash
+sentrith usage baseline start
+```
+
+Agent instruction fileが `.sentrith-private/baseline-stash/` へ退避され、以降の記録が `baseline` になります。計測hookとデータは動いたままです。
+
+**新しいAgent sessionを開始してから**、普通に開発してください。手動記録は不要です。
+
+進捗はいつでも確認できます。
+
+```bash
+sentrith usage status
+```
+
+十分たまったら戻します。
+
+```bash
+sentrith usage baseline stop
+```
+
+退避したfileが復元され、記録は `standard` へ戻ります。
+
+phaseの優先順位は `--phase` > `.ai-usage/phase`(このコマンドが書くmarker) > `SENTRITH_PHASE` > `standard` です。
+
+markerが環境変数より上位なのは、hookがAgent processから起動されるためです。Agent起動後にexportした変数はhookへ届きません。
+
+## 手動記録の場合
+
 例:
 
 ```bash

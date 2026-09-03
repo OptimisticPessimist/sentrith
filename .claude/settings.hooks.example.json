@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "./bin/sentrith usage hook claude --phase standard",
+            "command": "./bin/sentrith usage hook claude",
             "timeout": 5
           }
         ]
@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "./bin/sentrith usage hook claude --phase standard",
+            "command": "./bin/sentrith usage hook claude",
             "timeout": 5
           }
         ]

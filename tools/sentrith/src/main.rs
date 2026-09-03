@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE_HEADER: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes\n";
+const USAGE_HEADER_V1: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes\n";
+const USAGE_HEADER: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes,head_sha,verification\n";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -21,6 +23,7 @@ fn main() {
         "guard" => guard_check(),
         "review-hint" => review_hint(),
         "diff-budget" => diff_budget(),
+        "hooks" => hooks_command(&args[1..]),
         "usage" => usage_command(&args[1..]),
         "version" | "--version" | "-V" => {
             println!("sentrith {}", env!("CARGO_PKG_VERSION"));
@@ -50,6 +53,12 @@ Commands:
   sentrith review-hint
   sentrith diff-budget
 
+  sentrith hooks install [--agent claude|codex|all] [--dry-run]
+  sentrith hooks status [--agent claude|codex|all]
+
+  sentrith usage status [--min-samples 5] [--agent <name>]
+  sentrith usage baseline start|stop|status
+
   sentrith usage record --agent <codex|claude|copilot|gemini|other> --task <name> [options]
   sentrith usage run codex --task <name> [--phase standard] -- <codex exec args...>
   sentrith usage run copilot --task <name> [--phase standard] -- <copilot args...>
@@ -62,6 +71,8 @@ Commands:
   sentrith usage contribute --agent <name> [--metric auto|credits|cost_usd|tokens] [options]
   sentrith usage aggregate [--dir docs/metrics/contributions] [--publish]
   sentrith usage report [--compare] [--agent <name>] [--file <path>]
+  sentrith usage report --tasks [--agent <name>] [--file <path>]
+  sentrith usage report --churn [--days 14] [--agent <name>] [--file <path>]
   sentrith usage publish [options]
   sentrith usage note <text> [--file <path>]
 
@@ -81,16 +92,365 @@ Usage record options:
   --notes <text>
   --file <path>
 
+Phase resolution (highest first):
+  --phase            explicit flag
+  .ai-usage/phase    marker written by `usage baseline start`
+  SENTRITH_PHASE     environment variable
+  standard           default
+
 Provider measurement:
   GitHub Copilot snapshot uses `gh api` only when explicitly requested.
   Other commands are local/deterministic and make no model calls.
   Raw prompts, source code, repository names, transcripts, and session IDs
   are never included in community contribution files.
+
+Success semantics:
+  Hook-captured rows derive success from repository evidence only:
+  commit reached + last recorded test outcome. Undecidable rows are `unknown`
+  and are excluded from success-rate denominators.
 "#);
 }
 
 fn repo_file(path: &str) -> PathBuf {
     Path::new(path).to_path_buf()
+}
+
+// ---------------------------------------------------------------------------
+// Minimal JSON model
+//
+// Editing a user's settings file by hand is the main friction point in enabling
+// measurement, but corrupting that file is worse than the friction. This keeps
+// the zero-dependency rule while allowing a parse -> edit -> serialize cycle.
+// Object keys are stored as an ordered Vec so round-tripping preserves order,
+// and numbers stay as their original text so no precision is invented.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum Json {
+    Null,
+    Bool(bool),
+    Num(String),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Obj(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn set(&mut self, key: &str, value: Json) {
+        if let Json::Obj(entries) = self {
+            if let Some(slot) = entries.iter_mut().find(|(k, _)| k == key) {
+                slot.1 = value;
+            } else {
+                entries.push((key.to_string(), value));
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Json::Obj(entries) = self {
+            entries.retain(|(k, _)| k != key);
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Json::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+struct JsonParser<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(s: &'a str) -> Self {
+        JsonParser { b: s.as_bytes(), i: 0 }
+    }
+
+    fn ws(&mut self) {
+        while self.i < self.b.len() && (self.b[self.i] as char).is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
+    fn expect(&mut self, c: u8) -> Result<(), String> {
+        if self.peek() == Some(c) {
+            self.i += 1;
+            Ok(())
+        } else {
+            Err(format!("expected '{}' at byte {}", c as char, self.i))
+        }
+    }
+
+    fn value(&mut self) -> Result<Json, String> {
+        self.ws();
+        match self.peek().ok_or("unexpected end of JSON")? {
+            b'{' => self.object(),
+            b'[' => self.array(),
+            b'"' => Ok(Json::Str(self.string()?)),
+            b't' => self.literal("true", Json::Bool(true)),
+            b'f' => self.literal("false", Json::Bool(false)),
+            b'n' => self.literal("null", Json::Null),
+            _ => self.number(),
+        }
+    }
+
+    fn literal(&mut self, text: &str, value: Json) -> Result<Json, String> {
+        if self.b[self.i..].starts_with(text.as_bytes()) {
+            self.i += text.len();
+            Ok(value)
+        } else {
+            Err(format!("invalid literal at byte {}", self.i))
+        }
+    }
+
+    fn number(&mut self) -> Result<Json, String> {
+        let start = self.i;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.' | b'e' | b'E') {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if start == self.i {
+            return Err(format!("invalid value at byte {}", self.i));
+        }
+        Ok(Json::Num(String::from_utf8_lossy(&self.b[start..self.i]).to_string()))
+    }
+
+    /// Read exactly four hex digits of a `\u` escape.
+    fn hex4(&mut self) -> Result<u32, String> {
+        let hex = self.b.get(self.i..self.i + 4).ok_or("truncated \\u escape")?;
+        if !hex.iter().all(|c| c.is_ascii_hexdigit()) {
+            return Err("invalid \\u escape".into());
+        }
+        let code = u32::from_str_radix(&String::from_utf8_lossy(hex), 16)
+            .map_err(|_| "invalid \\u escape".to_string())?;
+        self.i += 4;
+        Ok(code)
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        self.expect(b'"')?;
+        let mut out = String::new();
+        loop {
+            let c = self.peek().ok_or("unterminated string")?;
+            self.i += 1;
+            match c {
+                b'"' => return Ok(out),
+                b'\\' => {
+                    let e = self.peek().ok_or("unterminated escape")?;
+                    self.i += 1;
+                    match e {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{8}'),
+                        b'f' => out.push('\u{c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let code = self.hex4()?;
+                            let ch = if (0xD800..=0xDBFF).contains(&code) {
+                                // High surrogate: a non-BMP character such as an
+                                // emoji is encoded as a pair. Decoding the halves
+                                // separately would rewrite the user's setting as
+                                // two replacement characters.
+                                if !self.b[self.i..].starts_with(b"\\u") {
+                                    return Err("unpaired high surrogate in JSON string".into());
+                                }
+                                self.i += 2;
+                                let low = self.hex4()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err("invalid low surrogate in JSON string".into());
+                                }
+                                let combined =
+                                    0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                                char::from_u32(combined)
+                                    .ok_or("invalid surrogate pair in JSON string")?
+                            } else if (0xDC00..=0xDFFF).contains(&code) {
+                                return Err("unpaired low surrogate in JSON string".into());
+                            } else {
+                                char::from_u32(code).ok_or("invalid \\u escape")?
+                            };
+                            out.push(ch);
+                        }
+                        _ => return Err("invalid escape".into()),
+                    }
+                }
+                _ => {
+                    // Copy the whole UTF-8 sequence, not just this byte.
+                    let len = utf8_len(c);
+                    let end = (self.i - 1 + len).min(self.b.len());
+                    out.push_str(&String::from_utf8_lossy(&self.b[self.i - 1..end]));
+                    self.i = end;
+                }
+            }
+        }
+    }
+
+    fn array(&mut self) -> Result<Json, String> {
+        self.expect(b'[')?;
+        let mut items = Vec::new();
+        self.ws();
+        if self.peek() == Some(b']') {
+            self.i += 1;
+            return Ok(Json::Arr(items));
+        }
+        loop {
+            items.push(self.value()?);
+            self.ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.i += 1;
+                }
+                Some(b']') => {
+                    self.i += 1;
+                    return Ok(Json::Arr(items));
+                }
+                _ => return Err(format!("expected ',' or ']' at byte {}", self.i)),
+            }
+        }
+    }
+
+    fn object(&mut self) -> Result<Json, String> {
+        self.expect(b'{')?;
+        let mut entries = Vec::new();
+        self.ws();
+        if self.peek() == Some(b'}') {
+            self.i += 1;
+            return Ok(Json::Obj(entries));
+        }
+        loop {
+            self.ws();
+            let key = self.string()?;
+            self.ws();
+            self.expect(b':')?;
+            let value = self.value()?;
+            entries.push((key, value));
+            self.ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.i += 1;
+                }
+                Some(b'}') => {
+                    self.i += 1;
+                    return Ok(Json::Obj(entries));
+                }
+                _ => return Err(format!("expected ',' or '}}' at byte {}", self.i)),
+            }
+        }
+    }
+}
+
+fn utf8_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
+fn json_parse(text: &str) -> Result<Json, String> {
+    let mut p = JsonParser::new(text);
+    let v = p.value()?;
+    p.ws();
+    if p.i != p.b.len() {
+        return Err(format!("trailing data at byte {}", p.i));
+    }
+    Ok(v)
+}
+
+fn json_write_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn json_render(v: &Json, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    let pad_inner = "  ".repeat(indent + 1);
+    match v {
+        Json::Null => out.push_str("null"),
+        Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Json::Num(n) => out.push_str(n),
+        Json::Str(s) => json_write_string(out, s),
+        Json::Arr(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push_str("[\n");
+            for (i, item) in items.iter().enumerate() {
+                out.push_str(&pad_inner);
+                json_render(item, indent + 1, out);
+                if i + 1 < items.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push(']');
+        }
+        Json::Obj(entries) => {
+            if entries.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push_str("{\n");
+            for (i, (k, val)) in entries.iter().enumerate() {
+                out.push_str(&pad_inner);
+                json_write_string(out, k);
+                out.push_str(": ");
+                json_render(val, indent + 1, out);
+                if i + 1 < entries.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&pad);
+            out.push('}');
+        }
+    }
+}
+
+fn json_to_string(v: &Json) -> String {
+    let mut out = String::new();
+    json_render(v, 0, &mut out);
+    out.push('\n');
+    out
 }
 
 fn read_text(path: &Path) -> String {
@@ -140,6 +500,20 @@ fn preflight() -> Result<(), String> {
         }
         if slines > 120 {
             warnings.push(format!("STATE.md is {slines} lines; consider memory-audit."));
+        }
+    }
+
+    let profile = repo_file("docs/ai/PROFILE.md");
+    if profile.exists() {
+        let ftxt = read_text(&profile);
+        if ftxt.contains("Status: not initialized") {
+            warnings.push("Engineering profile not selected; run project-bootstrap profile questions.".to_string());
+        }
+        let flines = ftxt.lines().count();
+        if flines > 100 {
+            warnings.push(format!(
+                "PROFILE.md is {flines} lines; it loads on ordinary tasks, keep it an index."
+            ));
         }
     }
 
@@ -311,12 +685,1237 @@ fn diff_budget() -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// hooks install
+// ---------------------------------------------------------------------------
+
+/// Sentrith owns hooks whose command starts with one of the executable forms it
+/// installs. Matching only the command token keeps an unrelated path such as
+/// /workspace/sentrith/scripts/run-linter in the user's settings.
+fn first_shell_token(command: &str) -> Option<String> {
+    let mut token = String::new();
+    let mut quote = None;
+
+    for ch in command.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                // Keep backslashes inside quotes. This matters for Windows
+                // paths such as "C:\\Program Files\\sentrith.exe".
+                token.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            c if c.is_whitespace() || matches!(c, ';' | '&' | '|') => break,
+            _ => token.push(ch),
+        }
+    }
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn is_sentrith_command(cmd: &str) -> bool {
+    let Some(token) = first_shell_token(cmd) else {
+        return false;
+    };
+    let normalized = token.replace('\\', "/").to_ascii_lowercase();
+    normalized == "sentrith"
+        || normalized == "sentrith.exe"
+        || normalized == "bin/sentrith"
+        || normalized == "bin/sentrith.exe"
+        || normalized.ends_with("/bin/sentrith")
+        || normalized.ends_with("/bin/sentrith.exe")
+}
+
+fn count_sentrith_hooks(value: &Json) -> usize {
+    match value {
+        Json::Obj(entries) => entries
+            .iter()
+            .map(|(key, value)| {
+                let own = usize::from(
+                    key == "command"
+                        && value
+                            .as_str()
+                            .map(is_sentrith_command)
+                            .unwrap_or(false),
+                );
+                own + count_sentrith_hooks(value)
+            })
+            .sum(),
+        Json::Arr(items) => items.iter().map(count_sentrith_hooks).sum(),
+        _ => 0,
+    }
+}
+
+fn is_usage_hook_command(cmd: &str, agent: &str) -> bool {
+    let segments = shell_command_segments(cmd);
+    let Some((tokens, _)) = segments.first() else {
+        return false;
+    };
+    segments.len() == 1
+        && tokens.first().map(|token| is_sentrith_command(token)).unwrap_or(false)
+        && tokens.get(1).map(String::as_str) == Some("usage")
+        && tokens.get(2).map(String::as_str) == Some("hook")
+        && tokens.get(3).map(String::as_str) == Some(agent)
+}
+
+fn count_usage_hooks(value: &Json, agent: &str) -> usize {
+    match value {
+        Json::Obj(entries) => entries
+            .iter()
+            .map(|(key, value)| {
+                let own = usize::from(
+                    key == "command"
+                        && value
+                            .as_str()
+                            .map(|command| is_usage_hook_command(command, agent))
+                            .unwrap_or(false),
+                );
+                own + count_usage_hooks(value, agent)
+            })
+            .sum(),
+        Json::Arr(items) => items.iter().map(|item| count_usage_hooks(item, agent)).sum(),
+        _ => 0,
+    }
+}
+
+fn sentrith_hook_count(text: &str) -> usize {
+    let Ok(settings) = json_parse(text) else {
+        return 0;
+    };
+    settings
+        .get("hooks")
+        .map(count_sentrith_hooks)
+        .unwrap_or(0)
+}
+
+fn sentrith_usage_hook_count(text: &str, agent: &str) -> usize {
+    let Ok(settings) = json_parse(text) else {
+        return 0;
+    };
+    settings
+        .get("hooks")
+        .map(|hooks| count_usage_hooks(hooks, agent))
+        .unwrap_or(0)
+}
+
+fn hook_target_matches_agent(target_agent: &str, requested_agent: Option<&str>) -> bool {
+    requested_agent.map_or(true, |requested| requested == target_agent)
+}
+
+/// Rewrite the example's ./bin/sentrith invocation for the current platform.
+/// On native Windows, hook commands run through cmd.exe, where ./bin/...
+/// does not resolve.
+fn platform_command(cmd: &str) -> String {
+    if cfg!(windows) {
+        cmd.replace("./bin/sentrith", "bin\\sentrith.exe")
+    } else {
+        cmd.to_string()
+    }
+}
+
+fn map_commands(v: &mut Json) {
+    match v {
+        Json::Obj(entries) => {
+            for (k, val) in entries.iter_mut() {
+                if k == "command" {
+                    if let Json::Str(s) = val {
+                        *s = platform_command(s);
+                    }
+                } else {
+                    map_commands(val);
+                }
+            }
+        }
+        Json::Arr(items) => {
+            for item in items {
+                map_commands(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drop Sentrith-owned entries from a hooks object, leaving other tools' hooks
+/// in place. Empty matcher groups and empty events are removed so repeated
+/// installs do not accumulate husks.
+/// Remove hook entries whose `command` matches `predicate`, then drop any
+/// matcher group and any event left with no hooks. Shared by
+/// `strip_sentrith_hooks` (drop all Sentrith entries, for idempotent
+/// reinstall) and `is_workflow_check_command` (drop only the advisory
+/// checks, keeping usage capture, for baseline measurement).
+/// A group or event whose array was already empty before this ran is left
+/// exactly as found -- only an array stripping itself just emptied out gets
+/// pruned. Blanket-pruning any empty array (an earlier version of this
+/// function did) reports a change, and so a "reduction", for a settings file
+/// where nothing actually matched `predicate`; that contradicts what callers
+/// rely on this function's return value change to mean.
+fn strip_hooks_matching(hooks: &mut Json, predicate: impl Fn(&str) -> bool) {
+    let Json::Obj(events) = hooks else { return };
+    let new_events: Vec<(String, Json)> = std::mem::take(events)
+        .into_iter()
+        .filter_map(|(name, mut groups)| {
+            let Json::Arr(group_list) = &mut groups else {
+                return Some((name, groups));
+            };
+            if group_list.is_empty() {
+                return Some((name, groups));
+            }
+            let new_groups: Vec<Json> = std::mem::take(group_list)
+                .into_iter()
+                .filter_map(|mut group| {
+                    let Some(Json::Arr(inner)) = group.get("hooks").cloned() else {
+                        return Some(group);
+                    };
+                    if inner.is_empty() {
+                        return Some(group);
+                    }
+                    let kept: Vec<Json> = inner
+                        .into_iter()
+                        .filter(|h| {
+                            !h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(&predicate)
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    if kept.is_empty() {
+                        return None;
+                    }
+                    group.set("hooks", Json::Arr(kept));
+                    Some(group)
+                })
+                .collect();
+            if new_groups.is_empty() {
+                return None;
+            }
+            *group_list = new_groups;
+            Some((name, groups))
+        })
+        .collect();
+    *events = new_events;
+}
+
+fn strip_sentrith_hooks(hooks: &mut Json) {
+    strip_hooks_matching(hooks, is_sentrith_command);
+}
+
+/// Sentrith's SessionStart/Stop advisory checks (preflight, closeout-check,
+/// guard, review-hint, diff-budget). They print Sentrith-flavored text into
+/// the agent's context on every turn, which would contaminate a baseline
+/// session that is supposed to measure work without Sentrith active. This is
+/// deliberately narrower than `is_sentrith_command`: usage capture
+/// (`usage hook ...`) must keep running during a baseline, since it is what
+/// records the baseline turns at all.
+const WORKFLOW_CHECK_SUBCOMMANDS: &[&str] =
+    &["preflight", "closeout-check", "guard", "review-hint", "diff-budget"];
+
+fn is_workflow_check_command(cmd: &str) -> bool {
+    if !is_sentrith_command(cmd) {
+        return false;
+    }
+    let Some((tokens, _)) = shell_command_segments(cmd).into_iter().next() else {
+        return false;
+    };
+    tokens
+        .get(1)
+        .map(|sub| WORKFLOW_CHECK_SUBCOMMANDS.contains(&sub.as_str()))
+        .unwrap_or(false)
+}
+
+/// Append the example's Sentrith groups into the target hooks object.
+fn merge_sentrith_hooks(target: &mut Json, source: &Json) -> usize {
+    let Json::Obj(src_events) = source else { return 0 };
+    let mut added = 0;
+    for (event, src_groups) in src_events {
+        let Json::Arr(src_list) = src_groups else { continue };
+        let mut owned: Vec<Json> = Vec::new();
+        for group in src_list {
+            if let Some(Json::Arr(inner)) = group.get("hooks") {
+                let sentrith_only: Vec<Json> = inner
+                    .iter()
+                    .filter(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(is_sentrith_command)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect();
+                if !sentrith_only.is_empty() {
+                    added += sentrith_only.len();
+                    let mut g = group.clone();
+                    g.set("hooks", Json::Arr(sentrith_only));
+                    owned.push(g);
+                }
+            }
+        }
+        if owned.is_empty() {
+            continue;
+        }
+        match target.get(event).cloned() {
+            Some(Json::Arr(mut existing)) => {
+                existing.extend(owned);
+                target.set(event, Json::Arr(existing));
+            }
+            _ => target.set(event, Json::Arr(owned)),
+        }
+    }
+    added
+}
+
+struct HookTarget {
+    agent: &'static str,
+    example: &'static str,
+    settings: &'static str,
+    /// Claude keeps hooks inside settings.json alongside unrelated settings and
+    /// also supports statusLine; Codex uses a dedicated hooks file.
+    with_status_line: bool,
+}
+
+const HOOK_TARGETS: &[HookTarget] = &[
+    HookTarget {
+        agent: "claude",
+        example: ".claude/settings.hooks.example.json",
+        settings: ".claude/settings.json",
+        with_status_line: true,
+    },
+    HookTarget {
+        agent: "codex",
+        example: ".codex/hooks.example.json",
+        settings: ".codex/hooks.json",
+        with_status_line: false,
+    },
+];
+
+fn hooks_command(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("hooks requires install or status".into());
+    }
+    let (opts, _) = parse_options(&args[1..])?;
+    match args[0].as_str() {
+        "install" => hooks_install(&opts),
+        "status" => hooks_status(&opts),
+        x => Err(format!("unknown hooks subcommand: {x}")),
+    }
+}
+
+fn selected_targets(opts: &BTreeMap<String, String>) -> Vec<&'static HookTarget> {
+    let want = opts.get("agent").map(String::as_str).unwrap_or("all");
+    HOOK_TARGETS
+        .iter()
+        .filter(|t| want == "all" || want == t.agent)
+        .collect()
+}
+
+fn hooks_status(opts: &BTreeMap<String, String>) -> Result<(), String> {
+    for t in selected_targets(opts) {
+        let path = repo_file(t.settings);
+        if !path.exists() {
+            println!("SENTRITH-HOOKS [{}]: not installed ({} missing)", t.agent, t.settings);
+            continue;
+        }
+        let n = sentrith_usage_hook_count(&read_text(&path), t.agent);
+        if n == 0 {
+            println!("SENTRITH-HOOKS [{}]: {} exists but has no capture hook", t.agent, t.settings);
+        } else {
+            println!("SENTRITH-HOOKS [{}]: installed ({} capture hooks in {})", t.agent, n, t.settings);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn copy_file_permissions(original: &Path, replacement: &Path) -> Result<(), String> {
+    let permissions = fs::metadata(original)
+        .map_err(|e| e.to_string())?
+        .permissions();
+    fs::set_permissions(replacement, permissions).map_err(|e| e.to_string())
+}
+
+/// Replace `destination` with `replacement`'s content. When `backup_destination`
+/// is given, a copy of `destination`'s pre-replacement content is written
+/// there first, carrying as much of `destination`'s security metadata as
+/// this platform's tooling supports -- on Windows that copy is made by the OS
+/// as part of the same atomic `ReplaceFileW` call and is documented to carry
+/// the original's full security descriptor, which this project has no other
+/// way to reproduce for a brand-new file without a new dependency; elsewhere
+/// it is a plain copy plus the mode bits `copy_file_permissions` already
+/// knows how to carry over.
+#[cfg(not(windows))]
+fn replace_file_preserving_security(
+    replacement: &Path,
+    destination: &Path,
+    backup_destination: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(backup) = backup_destination {
+        // `fs::copy` opens its destination without refusing to follow an
+        // existing symlink there -- the same class of attack fixed for the
+        // `hooks_install` backup and the restore temp file in earlier
+        // rounds; this call is a third, previously-missed spot creating a
+        // backup the identical way. `create_secure_file` refuses to reuse or
+        // follow anything already at the path; streaming through the
+        // already-open handle it returns (rather than a second, separate
+        // open by path, which is what `fs::copy` does internally) closes
+        // the window entirely.
+        let mut dest = create_secure_file(backup)?;
+        let mut src = fs::File::open(destination).map_err(|e| e.to_string())?;
+        std::io::copy(&mut src, &mut dest).map_err(|e| e.to_string())?;
+        drop(dest);
+        copy_file_permissions(destination, backup)?;
+    }
+    fs::rename(replacement, destination).map_err(|e| e.to_string())
+}
+
+/// A swap or write into `destination` has already committed by the time a
+/// caller might see this `Err` -- it's only reached when a step *after* that
+/// succeeded call fails. Originally written for `replace_file_preserving_security`'s
+/// Windows path (`ReplaceFileW` committing before a later metadata step could
+/// fail), and now reused by `reduce_hook_settings_for_baseline` for the same
+/// shape of problem on every platform: its own swap can succeed and a later
+/// digest write can still fail, and callers rely on `Err` meaning `live` is
+/// untouched (`restore_hook_settings_backup`'s divergence check fails closed
+/// on a missing digest, treating an un-rolled-back reduction as a user edit
+/// and relocating the only copy of the original into `baseline-hook-conflicts`
+/// without ever restoring `live`). Best-effort restores `destination`'s
+/// content from `backup` before surfacing the original error, so the
+/// function's contract holds even when this specific step fails. Without a
+/// backup to roll back from, the error is annotated instead: there is
+/// nothing this function can do to undo the swap.
+///
+/// Restores through `restore_file_content` (the same atomic,
+/// permission-preserving swap `restore_hook_settings_backup`'s normal path
+/// already uses) rather than a plain `fs::copy` onto `destination`: a
+/// read-only destination -- Unix mode `0400`, or the Windows read-only
+/// attribute -- is exactly the state a rolled-back settings file is often
+/// already in, since preserving that original restriction is the whole
+/// point of this file's replacement helpers, and `fs::copy` fails outright
+/// against it while `fs::rename` (which the swap uses) does not.
+fn roll_back_committed_replacement(
+    destination: &Path,
+    backup: Option<&Path>,
+    original_error: String,
+) -> String {
+    let Some(backup) = backup else {
+        return format!(
+            "{original_error} (the replacement of {} already committed and could not be rolled back: no backup was requested for this call)",
+            destination.display()
+        );
+    };
+    let tmp = sibling_temp_path(destination, "sentrith-baseline-rollback-tmp");
+    match restore_file_content(destination, backup, &tmp) {
+        Ok(()) => format!(
+            "{original_error} (the replacement was rolled back from {}; {} is unchanged)",
+            backup.display(),
+            destination.display()
+        ),
+        Err(rollback_error) => format!(
+            "{original_error} (the replacement already committed and rolling it back from {} also failed: {rollback_error}; {} may not match its backup -- resolve manually)",
+            backup.display(),
+            destination.display()
+        ),
+    }
+}
+
+/// Atomically overwrite `destination` with `source`'s content, staged
+/// through the freshly created, exclusively-owned `tmp` path. Shared by
+/// `restore_hook_settings_backup`'s normal restore and
+/// `roll_back_committed_replacement`'s rollback -- both are "put a
+/// known-good copy back in place of whatever `destination` currently
+/// holds," and this is the one place that knows how to do that safely:
+/// `create_secure_file` refuses to reuse or follow anything already at
+/// `tmp` (closing the symlink-follow window a direct `fs::copy` onto a
+/// predictable temp path would open), and `replace_file_preserving_security`
+/// -- unlike `fs::copy` straight onto `destination` -- does not require
+/// `destination` to already be writable: `fs::rename` only needs write
+/// permission on the containing directory, and the Windows implementation
+/// explicitly clears and restores the read-only attribute around
+/// `ReplaceFileW`. `destination`'s own current permissions (not `source`'s)
+/// are what `tmp` is widened or narrowed to match on Unix, since `tmp` is
+/// standing in for `destination`'s next content, not `source`'s.
+fn restore_file_content(destination: &Path, source: &Path, tmp: &Path) -> Result<(), String> {
+    let mut dest = create_secure_file(tmp)?;
+    let mut src = fs::File::open(source).map_err(|e| e.to_string())?;
+    std::io::copy(&mut src, &mut dest).map_err(|e| e.to_string())?;
+    drop(dest);
+    finish_restore_swap(destination, tmp)
+}
+
+/// `restore_file_content` for a caller that already holds the bytes and must
+/// not reopen their source. `restore_hook_settings_backup` reads its backup
+/// exactly once, through a handle that refused to follow a symlink; handing
+/// that content here (rather than the path it came from) is what keeps the
+/// restore from reopening a path another process may have substituted in the
+/// meantime.
+fn restore_file_content_from_memory(
+    destination: &Path,
+    content: &str,
+    tmp: &Path,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut dest = create_secure_file(tmp)?;
+    dest.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
+    drop(dest);
+    finish_restore_swap(destination, tmp)
+}
+
+/// The half both restore paths share once `tmp` holds the content to install:
+/// match `destination`'s current mode (not the source's -- `tmp` is standing
+/// in for `destination`'s next content), then swap atomically.
+fn finish_restore_swap(destination: &Path, tmp: &Path) -> Result<(), String> {
+    #[cfg(not(windows))]
+    copy_file_permissions(destination, tmp)?;
+    replace_file_preserving_security(tmp, destination, None)
+}
+
+#[cfg(windows)]
+fn replace_file_preserving_security(
+    replacement: &Path,
+    destination: &Path,
+    backup_destination: Option<&Path>,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileAttributesW(file_name: *const u16) -> u32;
+        fn GetLastError() -> u32;
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+        fn SetFileAttributesW(file_name: *const u16, attributes: u32) -> i32;
+    }
+
+    let replaced: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let replacement: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let backup_wide: Vec<u16> = backup_destination
+        .map(|p| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect())
+        .unwrap_or_default();
+    let backup_ptr = if backup_destination.is_some() {
+        backup_wide.as_ptr()
+    } else {
+        std::ptr::null()
+    };
+    let original_attributes = unsafe { GetFileAttributesW(replaced.as_ptr()) };
+    if original_attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(format!(
+            "GetFileAttributesW failed with OS error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let was_readonly = original_attributes & FILE_ATTRIBUTE_READONLY != 0;
+    if was_readonly
+        && unsafe {
+            SetFileAttributesW(
+                replaced.as_ptr(),
+                original_attributes & !FILE_ATTRIBUTE_READONLY,
+            )
+        } == 0
+    {
+        return Err(format!(
+            "SetFileAttributesW failed with OS error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let ok = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            backup_ptr,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let error = unsafe { GetLastError() };
+        if was_readonly {
+            let _ = unsafe { SetFileAttributesW(replaced.as_ptr(), original_attributes) };
+        }
+        return Err(format!("ReplaceFileW failed with OS error {error}"));
+    }
+
+    if was_readonly {
+        let new_attributes = unsafe { GetFileAttributesW(replaced.as_ptr()) };
+        if new_attributes == INVALID_FILE_ATTRIBUTES {
+            let error = format!(
+                "GetFileAttributesW failed after replacement with OS error {}",
+                unsafe { GetLastError() }
+            );
+            return Err(roll_back_committed_replacement(destination, backup_destination, error));
+        }
+        if unsafe {
+            SetFileAttributesW(replaced.as_ptr(), new_attributes | FILE_ATTRIBUTE_READONLY)
+        } == 0
+        {
+            let error = format!(
+                "SetFileAttributesW failed after replacement with OS error {}",
+                unsafe { GetLastError() }
+            );
+            return Err(roll_back_committed_replacement(destination, backup_destination, error));
+        }
+    }
+
+    Ok(())
+}
+
+/// Create `path` fresh, exclusively, with a DACL granting access only to its
+/// owner, SYSTEM, and Administrators -- never the parent directory's
+/// inherited ACL, which may be broader than whatever restriction the file
+/// this is standing in for (e.g. `live`) actually has. Used for temp files
+/// that briefly hold sensitive content before a `ReplaceFileW` swap:
+/// `ReplaceFileW` is documented to retain the *destination's* own security
+/// descriptor after the swap, so this file's DACL only needs to hold for
+/// that window, not to replicate `live`'s exact (possibly complex,
+/// inherited) ACL long-term -- a fixed, deliberately narrow ACL is simpler
+/// and just as effective for that purpose.
+#[cfg(windows)]
+fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        lp_security_descriptor: *mut std::ffi::c_void,
+        b_inherit_handle: i32,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut std::ffi::c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn GetLastError() -> u32;
+        fn CreateFileW(
+            file_name: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *const SecurityAttributes,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+    }
+
+    // D:P protects the DACL from inheriting anything from the parent;
+    // (A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA) grants full access to Owner,
+    // SYSTEM, and Administrators only -- nobody else.
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)\0".encode_utf16().collect();
+    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut())
+    } == 0
+    {
+        return Err(format!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed with OS error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let sa = SecurityAttributes {
+        n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+        lp_security_descriptor: sd,
+        b_inherit_handle: 0,
+    };
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &sa,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    let create_error = unsafe { GetLastError() };
+    unsafe { LocalFree(sd) };
+    if handle as isize == INVALID_HANDLE_VALUE {
+        return Err(format!("CreateFileW failed for {} with OS error {create_error}", path.display()));
+    }
+    Ok(unsafe { fs::File::from_raw_handle(handle as *mut std::ffi::c_void) })
+}
+
+/// Create `path` fresh and exclusively, never exposing whatever gets written
+/// to it more broadly than necessary: on Unix, at mode 0600 from the moment
+/// `open()` creates it; on Windows, via `create_file_owner_only`'s narrow
+/// DACL. Either way, `create_new`/`CREATE_NEW` refuses to reuse an existing
+/// file or follow a symlink at this (often predictable) path -- a stale
+/// leftover from an interrupted older run, or one placed there in a shared
+/// writable repository or pointing somewhere unexpected, is removed first
+/// rather than written through. Shared by every caller that stages
+/// potentially sensitive content (a full settings file, a backup of one)
+/// before either swapping it into place or leaving it as a standing copy.
+fn create_secure_file(path: &Path) -> Result<fs::File, String> {
+    let _ = fs::remove_file(path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("failed to prepare {}: {e}", path.display()))
+    }
+    #[cfg(windows)]
+    {
+        create_file_owner_only(path)
+    }
+}
+
+/// Write `content` to a securely created `tmp` (see `create_secure_file`).
+fn write_secure_temp_file(tmp: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = create_secure_file(tmp)?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))
+}
+
+/// Write `content` to `path`, replacing anything already there -- including
+/// a symlink, which this refuses to follow -- via an exclusively created
+/// temp file and a rename, the same shape `hooks_install` already used for a
+/// brand-new settings file. `path` itself may not exist yet, so this cannot
+/// go through `replace_file_preserving_security` (which needs a real
+/// destination to read attributes from on Windows); `rename` alone still
+/// closes the symlink risk, since POSIX and Windows both replace whatever
+/// directory entry -- symlink or not -- currently sits at the destination
+/// rather than dereferencing it.
+///
+/// Deliberately does *not* use `create_secure_file`: that narrows `path` to
+/// an owner-only mode, which is correct for content that needs long-term
+/// restriction (a settings backup, a reduced-settings temp file) but wrong
+/// here. `hooks_install`'s own fresh-install path already learned this the
+/// hard way -- a brand-new file's restrictive creation mode becomes its
+/// *permanent* permissions when nothing later widens it, which broke a
+/// sandboxed process running as a different account trying to read it. The
+/// baseline phase marker and the hook-edit journal hold no secrets and may
+/// need the same broad readability, so this stages through an
+/// ordinary-permission exclusive create instead.
+fn write_ordinary_file_without_following_a_symlink(path: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    let tmp = sibling_temp_path(path, "sentrith-write-tmp");
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("failed to prepare {}: {e}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// `path` with `suffix` *appended* -- deliberately not `Path::with_extension`,
+/// which **replaces** whatever extension is already there and so collapses
+/// distinct paths onto one temp path. In `hook-settings-backup/` alone,
+/// `with_extension` maps both `settings.json.reduced-digest` and
+/// `settings.json.restored` to the same `settings.json.sentrith-write-tmp`;
+/// two files being staged concurrently (or one retried while the other's temp
+/// file is still around) would then silently overwrite each other's staging
+/// area. Appending keeps the mapping injective: distinct sources always get
+/// distinct temp paths.
+fn sibling_temp_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Whether a directory entry exists at `path` *as an entry*, without
+/// following it. `Path::exists` answers "does this resolve to something",
+/// which is a different question and the wrong one whenever a symlink is
+/// involved: a dangling symlink (its target gone, or -- for a relative link
+/// -- simply not resolvable from where the link now sits) makes `exists`
+/// return false even though the entry is right there and matters. Both
+/// baseline restore loops depend on this distinction in both directions:
+/// a stashed entry that must still be moved back, and a destination entry
+/// whose presence must block a rename that would otherwise silently delete it.
+fn entry_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// Open `path` for reading, refusing to follow a symlink at that path, and
+/// confirm the *opened handle* is a regular file.
+///
+/// The point is the ordering: a `symlink_metadata` check followed by a
+/// separate `File::open` is a check-then-use race -- during an active
+/// baseline another process has a long window to substitute the path in
+/// between, so the thing validated and the thing opened need not be the same
+/// file. Validating the handle this returns closes that gap: whatever is
+/// read from it is the same object whose type was checked.
+///
+/// `O_NOFOLLOW` (Unix) and `FILE_FLAG_OPEN_REPARSE_POINT` (Windows) make the
+/// open itself refuse to traverse a link rather than quietly reading the
+/// target, so a substituted symlink fails here instead of returning the
+/// wrong content. The `is_file` check on top rejects directories and other
+/// special files that a plain open would accept.
+fn open_regular_file_no_follow(path: &Path) -> Result<fs::File, OpenRefusal> {
+    // Reject a non-regular entry before opening at all. On Linux, macOS, the
+    // BSDs, and Windows the flags below already make this redundant (the
+    // open itself refuses), and there it is only belt-and-braces. It is the
+    // *only* guard on an unknown Unix, where `O_NOFOLLOW` falls back to 0:
+    // there a symlink-to-regular-file would open successfully, and the
+    // `is_file` check at the end would not catch it -- metadata on an open
+    // handle describes the target, not the link. That leaves a narrow
+    // check-then-use window on such a platform, which is worth having over
+    // no defence at all.
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(OpenRefusal::NotRegular(format!(
+                "{} is a symlink, directory, or other special file",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(OpenRefusal::Transient(format!(
+                "failed to inspect {}: {e}",
+                path.display()
+            )));
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Spelled out per-OS rather than pulled from libc: this project
+        // deliberately has no dependencies, and O_NOFOLLOW is not a shared
+        // constant across Unixes. Getting this wrong is not a silent
+        // no-op -- on FreeBSD, Linux's 0x20000 is `O_DIRECTORY`, which
+        // would make every open of a regular file fail with ENOTDIR and,
+        // via `NotRegular` below, permanently break `baseline stop`.
+        #[cfg(target_os = "linux")]
+        const O_NOFOLLOW: i32 = 0o400000;
+        // macOS and the BSDs share 0x0100.
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
+        const O_NOFOLLOW: i32 = 0x0100;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )))]
+        const O_NOFOLLOW: i32 = 0;
+        // A zero flag is the deliberate fallback for an unknown Unix:
+        // guessing a wrong non-zero value risks colliding with an unrelated
+        // flag, which fails *closed in the wrong direction* (every open
+        // rejected). With 0 the open loses its no-follow guarantee and the
+        // `symlink_metadata` pre-check at the top of this function becomes
+        // the only defence -- a narrow check-then-use window, but strictly
+        // better than a CLI that cannot run at all.
+        if O_NOFOLLOW != 0 {
+            options.custom_flags(O_NOFOLLOW);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|e| {
+        // Classify by asking the filesystem what is actually there, not by
+        // matching errno numbers: those differ per OS (ELOOP is 40 on Linux
+        // but 62 on macOS), and a first attempt at this hardcoded Linux's
+        // values, which made every macOS symlink look transient.
+        //
+        // Consulting the path again here does not reintroduce a
+        // check-then-use race on the *content*: the open already failed, so
+        // nothing is read through it either way. This only decides how to
+        // describe a failure that has already happened. The worst a
+        // substitution racing this classification can achieve is a
+        // "transient, retry" message instead of a "tampered" one -- no file
+        // is trusted or written in either case.
+        match fs::symlink_metadata(path) {
+            // Something is there and it is not a regular file: positive
+            // proof of the substitution this guards against.
+            Ok(meta) if !meta.is_file() => OpenRefusal::NotRegular(format!(
+                "{} is a symlink, directory, or other special file: {e}",
+                path.display()
+            )),
+            // A regular file that still would not open, or a path we cannot
+            // stat either: a permission glitch, or a Windows sharing
+            // violation, which this codebase has repeatedly confirmed needs
+            // no special conditions to occur. Proves nothing about what is
+            // there -- only that this attempt could not tell.
+            _ => OpenRefusal::Transient(format!("failed to open {}: {e}", path.display())),
+        }
+    })?;
+    // On Windows the open above *succeeds* for a reparse point (that is what
+    // the flag asks for), so this is what rejects it there. It also rejects
+    // directories and other special files on every platform.
+    let is_file = file
+        .metadata()
+        .map_err(|e| OpenRefusal::Transient(format!("failed to inspect {}: {e}", path.display())))?
+        .is_file();
+    if !is_file {
+        return Err(OpenRefusal::NotRegular(format!(
+            "{} is not a regular file (found a symlink, directory, or other special file)",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+/// Why `open_regular_file_no_follow` declined, split by whether the answer is
+/// *evidence about what is at the path* or merely *this attempt could not
+/// tell*. Callers must not collapse these: treating a transient failure as
+/// proof of substitution turns an ordinary retryable hiccup (a Windows
+/// sharing violation, a permission glitch) into an unrecoverable,
+/// resolve-by-hand error that blocks the rest of `baseline stop`, while
+/// treating proven substitution as transient would silently retry into the
+/// attack it exists to catch.
+enum OpenRefusal {
+    NotRegular(String),
+    Transient(String),
+}
+
+impl std::fmt::Display for OpenRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenRefusal::NotRegular(m) | OpenRefusal::Transient(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::fmt::Debug for OpenRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+/// Confirm every directory component from `root` down to (and including)
+/// `leaf`'s parent is a real directory rather than a symlink.
+///
+/// `O_NOFOLLOW` and `symlink_metadata` only constrain a path's **final**
+/// component; both happily traverse a symlinked *directory* on the way there.
+/// Under this codebase's stated threat model -- something can plant entries at
+/// predictable, git-ignored paths for the whole span of an active baseline --
+/// swapping `hook-settings-backup/.claude` for a link to an attacker-owned
+/// directory costs exactly what swapping the leaf costs, and yields a "backup"
+/// that passes every leaf-level check while holding content of the attacker's
+/// choosing. That content is written back into a hook-settings file whose
+/// `command` strings the agent then executes.
+///
+/// `root` itself is not checked: it is the caller's own already-established
+/// base (the stash directory), not something derived from data.
+fn ancestors_are_real_directories(root: &Path, leaf: &Path) -> Result<(), String> {
+    let Ok(relative) = leaf.strip_prefix(root) else {
+        return Ok(());
+    };
+    let mut current = root.to_path_buf();
+    // `parent()` drops the leaf itself: its own type is checked by the
+    // no-follow open, which is strictly stronger than a metadata peek.
+    let Some(parent_of_leaf) = relative.parent() else {
+        return Ok(());
+    };
+    for component in parent_of_leaf.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!(
+                "refusing to inspect {} through a parent-directory component",
+                leaf.display()
+            ));
+        }
+        current.push(component);
+        let meta = fs::symlink_metadata(&current)
+            .map_err(|e| format!("failed to inspect {}: {e}", current.display()))?;
+        if !meta.is_dir() {
+            return Err(format!(
+                "{} is not a real directory (found a symlink or other special file); \
+                 something replaced it while the baseline was active",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Create `path` one component at a time, refusing to traverse a symlink or
+/// other special entry. `create_dir_all` follows symlinked ancestors, which
+/// is unsafe for the git-ignored baseline stash: contract files are later
+/// moved there and trusted again by `baseline stop`.
+fn create_real_directory_tree(path: &Path) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::ParentDir => {
+                return Err(format!(
+                    "refusing to create {} through a parent-directory component",
+                    path.display()
+                ));
+            }
+            Component::Normal(_) => current.push(component.as_os_str()),
+        }
+
+        if !entry_exists(&current) {
+            fs::create_dir(&current)
+                .map_err(|e| format!("failed to create {}: {e}", current.display()))?;
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|e| format!("failed to inspect {}: {e}", current.display()))?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "{} is not a real directory (found a symlink or other special file)",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hooks_install(opts: &BTreeMap<String, String>) -> Result<(), String> {
+    let dry_run = opts.contains_key("dry-run");
+    let mut touched = 0;
+
+    for t in selected_targets(opts) {
+        let example_path = repo_file(t.example);
+        if !example_path.exists() {
+            println!("SENTRITH-HOOKS [{}]: skipped, {} not found", t.agent, t.example);
+            continue;
+        }
+        let mut example = json_parse(&read_text(&example_path))
+            .map_err(|e| format!("{}: {e}", t.example))?;
+        map_commands(&mut example);
+
+        let settings_path = repo_file(t.settings);
+        if settings_path.is_symlink() {
+            // Replacing a symlinked settings file (common under dotfile
+            // managers) would remove the link and install a plain file at
+            // the repository path, permanently disconnecting it from
+            // whatever it pointed at -- installation would report success
+            // while silently breaking the managed link. Skipped rather than
+            // resolved-and-written-through: matches how baseline reduction
+            // already refuses a symlinked settings file, and avoids writing
+            // through a link to a target this code has no way to vet.
+            println!(
+                "SENTRITH-HOOKS [{}]: skipped, {} is a symlink (dotfile-managed settings aren't supported by hooks install; edit the link's target directly, or replace the link with a regular file first)",
+                t.agent, t.settings
+            );
+            continue;
+        }
+        let existed = settings_path.exists();
+        let mut settings = if existed {
+            // Read fallibly rather than through `read_text`, which folds a
+            // read failure (invalid UTF-8, a transient permission error)
+            // into the same empty string as a genuinely empty file --
+            // silently treating the whole existing configuration as
+            // nonexistent and about to be replaced with Sentrith-only
+            // settings, discarding whatever it actually held.
+            let raw = fs::read_to_string(&settings_path).map_err(|e| {
+                format!(
+                    "failed to read {}: {e}; fix or move it before running hooks install",
+                    t.settings
+                )
+            })?;
+            if raw.trim().is_empty() {
+                Json::Obj(Vec::new())
+            } else {
+                json_parse(&raw).map_err(|e| {
+                    format!(
+                        "{} is not valid JSON ({e}); fix or move it before running hooks install",
+                        t.settings
+                    )
+                })?
+            }
+        } else {
+            Json::Obj(Vec::new())
+        };
+        if !matches!(settings, Json::Obj(_)) {
+            return Err(format!("{} must contain a JSON object", t.settings));
+        }
+
+        let mut hooks = settings.get("hooks").cloned().unwrap_or(Json::Obj(Vec::new()));
+        if !matches!(hooks, Json::Obj(_)) {
+            return Err(format!("{}: \"hooks\" must be an object", t.settings));
+        }
+        // Removing our own entries first makes install idempotent and lets an
+        // upgrade replace commands that changed between versions.
+        strip_sentrith_hooks(&mut hooks);
+        let added = match example.get("hooks") {
+            Some(src) => merge_sentrith_hooks(&mut hooks, src),
+            None => 0,
+        };
+        if matches!(&hooks, Json::Obj(e) if e.is_empty()) {
+            settings.remove("hooks");
+        } else {
+            settings.set("hooks", hooks);
+        }
+
+        let mut status_note = String::new();
+        if t.with_status_line {
+            if let Some(sl) = example.get("statusLine").cloned() {
+                let current = settings.get("statusLine").cloned();
+                let ours = current
+                    .as_ref()
+                    .and_then(|c| c.get("command"))
+                    .and_then(|c| c.as_str())
+                    .map(is_sentrith_command)
+                    .unwrap_or(false);
+                match current {
+                    None => {
+                        settings.set("statusLine", sl);
+                        status_note = "; statusLine set".into();
+                    }
+                    Some(_) if ours => {
+                        settings.set("statusLine", sl);
+                        status_note = "; statusLine updated".into();
+                    }
+                    Some(_) => {
+                        status_note =
+                            "; kept your existing statusLine (cost capture falls back to transcript-only)"
+                                .into();
+                    }
+                }
+            }
+        }
+
+        let rendered = json_to_string(&settings);
+        // Never write output we cannot read back.
+        json_parse(&rendered).map_err(|e| format!("internal: produced invalid JSON ({e})"))?;
+
+        if dry_run {
+            println!("--- {} (dry run) ---\n{}", t.settings, rendered);
+            continue;
+        }
+
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if existed {
+            let backup = settings_path.with_extension("json.sentrith-bak");
+            // `fs::copy` opens its destination without refusing to follow an
+            // existing symlink there: a `*.json.sentrith-bak` symlink left
+            // at this predictable path (or pointing anywhere else) would
+            // otherwise get silently overwritten with the settings content
+            // instead of the backup itself. `create_secure_file` refuses to
+            // reuse or follow anything already at the path; streaming
+            // through the handle it returns (rather than a second, separate
+            // open via `fs::copy`) means the destination is never reopened
+            // by path after that check.
+            let mut dest = create_secure_file(&backup).map_err(|e| e.to_string())?;
+            let mut src = fs::File::open(&settings_path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut src, &mut dest).map_err(|e| e.to_string())?;
+            drop(dest);
+            #[cfg(not(windows))]
+            copy_file_permissions(&settings_path, &backup)?;
+        }
+        if existed {
+            let tmp = settings_path.with_extension("json.sentrith-tmp");
+            // `rendered` merges the user's existing configuration -- which
+            // may hold unrelated secrets -- with Sentrith's hooks;
+            // write_secure_temp_file keeps it from sitting exposed under
+            // default/inherited permissions even briefly, and never reuses
+            // or follows a stale file or symlink left at this predictable
+            // path. copy_file_permissions afterward widens or narrows the
+            // temp file to settings_path's actual mode before the swap.
+            write_secure_temp_file(&tmp, &rendered)?;
+            #[cfg(not(windows))]
+            copy_file_permissions(&settings_path, &tmp)?;
+            replace_file_preserving_security(&tmp, &settings_path, None)?;
+        } else {
+            // A fresh install has nothing pre-existing to protect --
+            // `rendered` is only Sentrith's own default hooks -- so this uses
+            // ordinary default/inherited permissions rather than
+            // write_secure_temp_file's narrow, owner-only creation the way
+            // the `existed` branch does. Nothing widens a brand-new file's
+            // permissions afterward the way copy_file_permissions does for
+            // an existing one, so that narrow creation would become this
+            // file's *permanent* permissions -- confirmed empirically: it
+            // locked the file to Owner/SYSTEM/Administrators only on
+            // Windows, where normal new files in the same directory inherit
+            // access for several other accounts (breaking a sandboxed agent
+            // process running as one of them).
+            // `write_ordinary_file_without_following_a_symlink` still stages
+            // through an exclusively created temp file and a rename rather
+            // than a single fs::write straight to settings_path: an
+            // interrupted or partial write to the final path directly would
+            // leave truncated JSON there, and a retry would then see an
+            // "existing" file it can't parse, requiring manual deletion to
+            // recover from an install that itself reported failure.
+            write_ordinary_file_without_following_a_symlink(&settings_path, &rendered)?;
+        }
+        touched += 1;
+
+        println!(
+            "SENTRITH-HOOKS [{}]: {} hook(s) installed into {}{}{}",
+            t.agent,
+            added,
+            t.settings,
+            status_note,
+            if existed { " (backup: *.json.sentrith-bak)" } else { " (created)" }
+        );
+    }
+
+    if !dry_run && touched > 0 {
+        println!("Restart the agent session so it re-reads the settings.");
+    }
+    Ok(())
+}
+
 fn usage_command(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage requires record, report, or note".into());
     }
     match args[0].as_str() {
         "record" => usage_record(&args[1..]),
+        "status" => usage_status(&args[1..]),
+        "baseline" => usage_baseline(&args[1..]),
         "run" => usage_run(&args[1..]),
         "hook" => usage_hook(&args[1..]),
         "claude-status" => usage_claude_status(&args[1..]),
@@ -381,30 +1980,16 @@ fn usage_record(args: &[String]) -> Result<(), String> {
         return Err("--agent must be codex, claude, copilot, gemini, or other".into());
     }
 
-    let phase = opts.get("phase").map(String::as_str).unwrap_or("standard");
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
+    let phase = phase.as_str();
     if !["baseline", "standard", "other"].contains(&phase) {
-        return Err("--phase must be baseline, standard, or other".into());
+        return Err("--phase (or SENTRITH_PHASE) must be baseline, standard, or other".into());
     }
 
     let file = opts
         .get("file")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
-
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let exists = file.exists();
-
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&file)
-        .map_err(|e| e.to_string())?;
-
-    if !exists {
-        f.write_all(USAGE_HEADER.as_bytes()).map_err(|e| e.to_string())?;
-    }
 
     let values = [
         now_unix(),
@@ -424,21 +2009,15 @@ fn usage_record(args: &[String]) -> Result<(), String> {
         opts.get("source").cloned().unwrap_or_else(|| "manual".to_string()),
         opts.get("session-id").cloned().unwrap_or_default(),
         opts.get("notes").cloned().unwrap_or_default(),
+        opts.get("head-sha").cloned().unwrap_or_default(),
+        opts.get("verification").cloned().unwrap_or_default(),
     ];
-    let row = values.iter().map(|x| csv_escape(x)).collect::<Vec<_>>().join(",");
-    writeln!(f, "{row}").map_err(|e| e.to_string())?;
+    append_usage_row(&file, &values)?;
 
     println!("SENTRITH-USAGE: recorded {agent} / {phase} / {task} -> {}", file.display());
     Ok(())
 }
 
-#[derive(Default, Clone)]
-struct UsageRow {
-    agent: String,
-    phase: String,
-    success: String,
-    nums: BTreeMap<&'static str, Option<f64>>,
-}
 
 fn parse_csv_line(line: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -463,9 +2042,40 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     out
 }
 
-fn parse_num(s: Option<&String>) -> Option<f64> {
-    let s = s?;
-    if s.is_empty() { None } else { s.parse().ok() }
+/// Split CSV text into logical records. A quoted field may contain newlines
+/// (`csv_escape` produces them), so splitting on physical lines would cut one
+/// record in half and corrupt it on the next rewrite.
+fn split_csv_records(text: &str) -> Vec<String> {
+    let mut records = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                current.push(c);
+                if quoted && chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    quoted = !quoted;
+                }
+            }
+            '\r' if !quoted => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                records.push(std::mem::take(&mut current));
+            }
+            '\n' if !quoted => records.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        records.push(current);
+    }
+    records
 }
 
 fn usage_report(args: &[String]) -> Result<(), String> {
@@ -478,98 +2088,510 @@ fn usage_report(args: &[String]) -> Result<(), String> {
         println!("SENTRITH-USAGE: no data file: {}", file.display());
         return Ok(());
     }
-
-    let text = fs::read_to_string(&file).map_err(|e| e.to_string())?;
-    let mut lines = text.lines();
-    let header = lines.next().ok_or("usage file is empty")?;
-    let headers = parse_csv_line(header);
-    let idx: BTreeMap<String, usize> = headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.clone(), i))
-        .collect();
-
-    let numeric = [
-        "input_tokens", "cached_input_tokens", "output_tokens", "credits", "cost_usd",
-        "tool_calls", "duration_seconds", "rework_count",
-    ];
-
-    let mut rows = Vec::new();
-    for line in lines {
-        if line.trim().is_empty() { continue; }
-        let cols = parse_csv_line(line);
-        let get = |name: &str| -> Option<String> {
-            idx.get(name).and_then(|i| cols.get(*i)).cloned()
-        };
-        let agent = get("agent").unwrap_or_default();
-        if let Some(filter) = opts.get("agent") {
-            if &agent != filter { continue; }
-        }
-
-        let mut row = UsageRow {
-            agent,
-            phase: get("phase").unwrap_or_default(),
-            success: get("success").unwrap_or_default(),
-            nums: BTreeMap::new(),
-        };
-        for name in numeric {
-            row.nums.insert(name, parse_num(get(name).as_ref()));
-        }
-        rows.push(row);
+    if opts.contains_key("churn") {
+        return usage_report_churn(&file, &opts);
+    }
+    if opts.contains_key("tasks") {
+        return usage_report_tasks(&file, &opts);
     }
 
+    // Every view is per task. Hook capture writes one row per turn, so
+    // summarizing raw rows divides each metric by however many turns happened
+    // to precede a commit, which makes phases with different turn counts
+    // incomparable.
+    let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str))?;
     if rows.is_empty() {
         println!("SENTRITH-USAGE: no matching rows");
         return Ok(());
     }
 
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let by_phase = tasks_by_phase(&refs);
     if opts.contains_key("compare") {
-        let base: Vec<_> = rows.iter().filter(|r| r.phase == "baseline").cloned().collect();
-        let std: Vec<_> = rows.iter().filter(|r| r.phase == "standard").cloned().collect();
-        let b = summarize(&base);
-        let s = summarize(&std);
+        let b = phase_summary(by_phase.get("baseline").map(Vec::as_slice).unwrap_or(&[]));
+        let s = phase_summary(by_phase.get("standard").map(Vec::as_slice).unwrap_or(&[]));
         print_summary("baseline", &b);
         print_summary("standard", &s);
         println!("\n[standard vs baseline]");
-        for name in numeric {
-            println!("{name}: {}", pct_text(b.get(name).copied().flatten(), s.get(name).copied().flatten()));
+        for name in NUMERIC_COLUMNS {
+            println!(
+                "{name}: {}",
+                pct_text(b.get(name).copied().flatten(), s.get(name).copied().flatten())
+            );
         }
-        let bs = b.get("success_rate").copied().flatten();
-        let ss = s.get("success_rate").copied().flatten();
-        if let (Some(a), Some(bv)) = (bs, ss) {
+        if let (Some(a), Some(bv)) = (
+            b.get("success_rate").copied().flatten(),
+            s.get("success_rate").copied().flatten(),
+        ) {
             println!("success_rate: {:+.1} percentage points", bv - a);
         }
+        println!("\nValues are per task; turns of the same task are summed first.");
     } else {
-        let mut groups: BTreeMap<(String, String), Vec<UsageRow>> = BTreeMap::new();
-        for r in rows {
-            groups.entry((r.agent.clone(), r.phase.clone())).or_default().push(r);
+        let mut groups: BTreeMap<(String, String), Vec<Vec<&BTreeMap<String, String>>>> = BTreeMap::new();
+        for task in group_tasks(&refs) {
+            let r = task.last().copied();
+            let key = (
+                r.and_then(|r| r.get("agent")).cloned().unwrap_or_default(),
+                r.and_then(|r| r.get("phase")).cloned().unwrap_or_default(),
+            );
+            groups.entry(key).or_default().push(task);
         }
-        for ((agent, phase), rs) in groups {
-            let s = summarize(&rs);
-            print_summary(&format!("{agent} / {phase}"), &s);
+        for ((agent, phase), tasks) in groups {
+            let summary = phase_summary(&tasks);
+            print_summary(&format!("{agent} / {phase}"), &summary);
         }
+        println!("\nValues are per task. Success breakdown: sentrith usage report --tasks");
+        println!("Progress and next step: sentrith usage status");
     }
     Ok(())
 }
 
-fn summarize(rows: &[UsageRow]) -> BTreeMap<&'static str, Option<f64>> {
-    let names = [
-        "input_tokens", "cached_input_tokens", "output_tokens", "credits", "cost_usd",
-        "tool_calls", "duration_seconds", "rework_count",
-    ];
+const NUMERIC_COLUMNS: &[&str] = &[
+    "input_tokens", "cached_input_tokens", "output_tokens", "credits", "cost_usd",
+    "tool_calls", "duration_seconds", "rework_count",
+];
+
+/// Per-task averages for one phase or agent group.
+fn phase_summary(tasks: &[Vec<&BTreeMap<String, String>>]) -> BTreeMap<&'static str, Option<f64>> {
     let mut out = BTreeMap::new();
-    for name in names {
-        let vals: Vec<f64> = rows.iter().filter_map(|r| r.nums.get(name).copied().flatten()).collect();
-        out.insert(name, if vals.is_empty() { None } else { Some(vals.iter().sum::<f64>() / vals.len() as f64) });
+    for name in NUMERIC_COLUMNS {
+        out.insert(*name, mean(&per_task_values(tasks, name)));
     }
-    let success_rate = if rows.is_empty() {
-        None
-    } else {
-        Some(rows.iter().filter(|r| r.success == "yes").count() as f64 / rows.len() as f64 * 100.0)
-    };
-    out.insert("success_rate", success_rate);
-    out.insert("tasks", Some(rows.len() as f64));
+    out.insert("success_rate", decided_success_rate(tasks));
+    out.insert("tasks", Some(tasks.len() as f64));
     out
+}
+
+/// Group all rows into tasks before assigning a task to its closing phase.
+/// A baseline task may close after baseline stop, so filtering rows by phase
+/// before calling group_tasks would split one task into two partial tasks.
+fn tasks_by_phase<'a>(
+    rows: &[&'a BTreeMap<String, String>],
+) -> BTreeMap<String, Vec<Vec<&'a BTreeMap<String, String>>>> {
+    tasks_by_phase_from_tasks(group_tasks(rows))
+}
+
+fn tasks_by_phase_from_tasks<'a>(
+    tasks: Vec<Vec<&'a BTreeMap<String, String>>>,
+) -> BTreeMap<String, Vec<Vec<&'a BTreeMap<String, String>>>> {
+    let mut by_phase: BTreeMap<String, Vec<Vec<&'a BTreeMap<String, String>>>> = BTreeMap::new();
+    for task in tasks {
+        let phase = task
+            .last()
+            .and_then(|r| r.get("phase"))
+            .cloned()
+            .unwrap_or_default();
+        by_phase.entry(phase).or_default().push(task);
+    }
+    by_phase
+}
+
+/// Apply a model filter after task grouping so a task that changes models is
+/// never split into multiple partial tasks. Mixed-model tasks are excluded
+/// from model-specific metrics because assigning their totals to one model
+/// would be misleading.
+fn filter_tasks_by_model<'a>(
+    tasks: Vec<Vec<&'a BTreeMap<String, String>>>,
+    model: Option<&str>,
+) -> Vec<Vec<&'a BTreeMap<String, String>>> {
+    let Some(wanted) = model else {
+        return tasks;
+    };
+
+    tasks
+        .into_iter()
+        .filter(|task| {
+            let models: BTreeSet<String> = task
+                .iter()
+                .filter_map(|row| row.get("model"))
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .collect();
+            models.len() == 1 && models.contains(wanted)
+        })
+        .collect()
+}
+
+/// Group turn rows into tasks: rows without a session id stand alone;
+/// within one agent/session pair, a change of `head_sha` closes the current
+/// task at the row that observed the new commit.
+fn group_tasks<'a>(rows: &[&'a BTreeMap<String, String>]) -> Vec<Vec<&'a BTreeMap<String, String>>> {
+    let mut tasks: Vec<Vec<&'a BTreeMap<String, String>>> = Vec::new();
+    let mut open: BTreeMap<(String, String), Vec<&'a BTreeMap<String, String>>> = BTreeMap::new();
+    for row in rows.iter().copied() {
+        let sid = row.get("session_id").cloned().unwrap_or_default();
+        if sid.is_empty() {
+            tasks.push(vec![row]);
+            continue;
+        }
+        let agent = row.get("agent").cloned().unwrap_or_default();
+        let key = (agent, sid);
+        open.entry(key.clone()).or_default().push(row);
+
+        // `head_sha` is written only for a turn that produced a commit, so any
+        // value closes the task. Comparing against a previous SHA instead would
+        // miss a session whose first captured turn commits — including the case
+        // where no test ran and the outcome is `unknown`, which carries no other
+        // signal that a task ended.
+        let committed = !row.get("head_sha").map(String::as_str).unwrap_or("").is_empty();
+        // Manual ledger rows may carry an outcome without a SHA.
+        let decided = matches!(
+            row.get("success").map(String::as_str).unwrap_or(""),
+            "yes" | "no"
+        );
+
+        if committed || decided {
+            if let Some(g) = open.remove(&key) {
+                tasks.push(g);
+            }
+        }
+    }
+    for (_, g) in open {
+        if !g.is_empty() {
+            tasks.push(g);
+        }
+    }
+    tasks
+}
+
+fn usage_report_tasks(file: &Path, opts: &BTreeMap<String, String>) -> Result<(), String> {
+    let rows = load_usage_rows(file, opts.get("agent").map(String::as_str))?;
+    if rows.is_empty() {
+        println!("SENTRITH-USAGE: no matching rows");
+        return Ok(());
+    }
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let by_phase = tasks_by_phase(&refs);
+    for (phase, group) in by_phase {
+        let mut yes = 0usize;
+        let mut no = 0usize;
+        let mut unknown = 0usize;
+        let mut cost = 0.0;
+        let mut cost_n = 0usize;
+        let mut tokens = 0.0;
+        let mut tokens_n = 0usize;
+        let mut turns = 0usize;
+        for t in &group {
+            turns += t.len();
+            match t.last().copied().and_then(|r| r.get("success")).map(String::as_str).unwrap_or("") {
+                "yes" => yes += 1,
+                "no" => no += 1,
+                _ => unknown += 1,
+            }
+            let refs: Vec<&BTreeMap<String, String>> = t.iter().copied().collect();
+            if let Some(c) = sum_field(&refs, "cost_usd") {
+                cost += c;
+                cost_n += 1;
+            }
+            let i = sum_field(&refs, "input_tokens").unwrap_or(0.0);
+            let o = sum_field(&refs, "output_tokens").unwrap_or(0.0);
+            if i > 0.0 || o > 0.0 {
+                tokens += i + o;
+                tokens_n += 1;
+            }
+        }
+        let n = group.len();
+        println!("\n[tasks: {phase}]");
+        println!("tasks: {n} (turns: {turns})");
+        println!("success: yes={yes} no={no} unknown={unknown}");
+        if yes + no > 0 {
+            println!(
+                "success rate (yes/(yes+no)): {:.1}%",
+                yes as f64 / (yes + no) as f64 * 100.0
+            );
+        } else {
+            println!("success rate: - (no decided tasks)");
+        }
+        if cost_n > 0 {
+            println!("avg cost USD / task: {:.4}", cost / cost_n as f64);
+            if yes > 0 {
+                println!("cost USD / successful task: {:.4}", cost / yes as f64);
+            }
+        }
+        if tokens_n > 0 {
+            println!("avg tokens / task: {:.0}", tokens / tokens_n as f64);
+        }
+    }
+    println!("\nSuccess uses objective proxies (commit reached + last recorded test outcome); unknown tasks are excluded from the rate.");
+    Ok(())
+}
+
+/// One-screen answer to "am I measuring, and how far am I from a number?".
+fn usage_status(args: &[String]) -> Result<(), String> {
+    let (opts, _) = parse_options(args)?;
+    let min: usize = opts.get("min-samples").and_then(|x| x.parse().ok()).unwrap_or(5);
+    let file = opts
+        .get("file")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
+
+    println!("== capture ==");
+    let mut hooks_ready = false;
+    let requested_agent = opts.get("agent").map(String::as_str);
+    for t in HOOK_TARGETS {
+        let path = repo_file(t.settings);
+        let installed =
+            path.exists() && sentrith_usage_hook_count(&read_text(&path), t.agent) > 0;
+        if installed && hook_target_matches_agent(t.agent, requested_agent) {
+            hooks_ready = true;
+        }
+        println!(
+            "{:<7} {}",
+            t.agent,
+            if installed { "hooks installed" } else { "hooks NOT installed" }
+        );
+    }
+
+    println!("\n== phase ==");
+    if baseline_active() {
+        println!("baseline mode ACTIVE (contract stashed); turns record phase=baseline");
+    } else {
+        println!("recording phase: {}", resolve_phase(None));
+    }
+
+    println!("\n== data ==");
+    if !file.exists() {
+        println!("no usage file yet: {}", file.display());
+        println!("\n== next ==");
+        if !hooks_ready {
+            println!("1. sentrith hooks install");
+            println!("2. sentrith usage baseline start   (measure without the contract first)");
+        } else {
+            println!("1. sentrith usage baseline start   (measure without the contract first)");
+        }
+        return Ok(());
+    }
+
+    let rows = load_usage_rows(&file, opts.get("agent").map(String::as_str))?;
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let by_phase = tasks_by_phase(&refs);
+    let mut counts: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
+    for (phase, tasks) in by_phase {
+        let mut e = (tasks.len(), 0, 0, 0);
+        for t in tasks {
+            match t.last().and_then(|r| r.get("success")).map(String::as_str).unwrap_or("") {
+                "yes" => e.1 += 1,
+                "no" => e.2 += 1,
+                _ => e.3 += 1,
+            }
+        }
+        counts.insert(phase, e);
+    }
+    println!("turns recorded: {}", rows.len());
+    for (phase, (n, yes, no, unknown)) in &counts {
+        println!("{phase:<9} tasks: {n:<4} (yes {yes}, no {no}, unknown {unknown})");
+    }
+
+    let base_n = counts.get("baseline").map(|c| c.0).unwrap_or(0);
+    let std_n = counts.get("standard").map(|c| c.0).unwrap_or(0);
+
+    println!("\n== next ==");
+    if base_n < min {
+        println!(
+            "collect {} more baseline task(s) ({}/{}).",
+            min - base_n,
+            base_n,
+            min
+        );
+        if !baseline_active() {
+            println!("  sentrith usage baseline start");
+        }
+    } else if std_n < min {
+        if baseline_active() {
+            println!("baseline is complete ({base_n}/{min}). Restore the contract:");
+            println!("  sentrith usage baseline stop");
+        } else {
+            println!(
+                "collect {} more standard task(s) ({}/{}); just keep working normally.",
+                min - std_n,
+                std_n,
+                min
+            );
+        }
+    } else {
+        println!("comparable ({base_n} baseline / {std_n} standard). Compare with:");
+        println!("  sentrith usage report --compare");
+        println!("  sentrith usage report --tasks");
+        println!("  sentrith usage report --churn");
+    }
+
+    let decided: usize = counts.values().map(|c| c.1 + c.2).sum();
+    let unknown: usize = counts.values().map(|c| c.3).sum();
+    if unknown > decided && unknown > 0 {
+        println!(
+            "\nNote: {unknown} task(s) are `unknown` (no commit, or no test run observed)."
+        );
+        println!("Success rate uses decided tasks only; commit your work so tasks can be scored.");
+    }
+    Ok(())
+}
+
+/// One item recovered from `git ... --numstat -z` output: either a commit
+/// header's timestamp (only present when the header format is
+/// `"COMMIT <unix time>"`) or a file path that commit touched.
+///
+/// `-z` matters for correctness, not just convenience: without it, a rename
+/// with a common path prefix is rendered as a single human-readable field
+/// like `old.txt => new.txt` (verified against a real repo), which
+/// line-oriented tab-splitting stores as one literal, unmatchable "path" -
+/// silently breaking churn tracking across the rename. With `-z`, a rename is
+/// added/deleted counts followed by an *empty* NUL-terminated field, then the
+/// old and new paths as two further NUL-terminated fields; a non-renamed
+/// entry is counts plus a single NUL-terminated path. The destination path is
+/// recorded, since that is what a later edit touches.
+enum NumstatZItem {
+    Commit(f64),
+    Path(String),
+    /// A rename record. Kept separate from `Path` because the two callers of
+    /// `parse_numstat_z` need different halves of it: the measured commit's
+    /// file set uses only `new` (that is the file's identity going forward,
+    /// and counting both names would double-count one logical file in the
+    /// churn denominator); scanning later history for touches must check
+    /// both `old` and `new`, since a later commit may rename the measured
+    /// file again before ever touching it under the newer name.
+    Rename { old: String, new: String },
+}
+
+/// Parse `-z`-delimited numstat output, optionally interleaved with
+/// `COMMIT <unix time>` header lines from a custom `--format`. Git also
+/// inserts a bare newline right after each NUL-terminated header when diff
+/// data follows it; that is a formatting artifact of `-z`, not content, and
+/// is stripped rather than treated as part of the next field.
+fn parse_numstat_z(text: &str) -> Vec<NumstatZItem> {
+    let mut items = Vec::new();
+    let mut fields = text.split('\0').peekable();
+    while let Some(field) = fields.next() {
+        let field = field.trim_start_matches('\n');
+        if field.is_empty() {
+            continue;
+        }
+        if let Some(rest) = field.strip_prefix("COMMIT ") {
+            if let Ok(t) = rest.trim().parse::<f64>() {
+                items.push(NumstatZItem::Commit(t));
+            }
+            continue;
+        }
+        let mut parts = field.splitn(3, '\t');
+        let (Some(_added), Some(_deleted), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        // Binary files report `-\t-\t<path>` instead of numeric counts, but
+        // both callers of this parser (the measured commit's file set, and
+        // later history's touched-path set) use only the path, never the
+        // counts -- so a binary file is exactly as real a churn entry as a
+        // text one. Excluding it here would drop it from both sets
+        // uniformly: an all-binary commit would show no files at all, and a
+        // mixed commit would undercount its denominator, inflating the
+        // reported share of files re-modified.
+        if path.is_empty() {
+            // Rename: the next two NUL-terminated fields are old and new
+            // paths. Git does not report renames for binary files as `-`/`-`
+            // rows, so this branch is reached only for text renames.
+            let Some(old_path) = fields.next() else { continue };
+            let Some(new_path) = fields.next() else { continue };
+            if !old_path.is_empty() && !new_path.is_empty() {
+                items.push(NumstatZItem::Rename {
+                    old: old_path.to_string(),
+                    new: new_path.to_string(),
+                });
+            }
+        } else {
+            items.push(NumstatZItem::Path(path.to_string()));
+        }
+    }
+    items
+}
+
+/// Whether a commit timestamp `t` counts as later rework of a commit made at
+/// `t0`, within `days`. Both bounds matter: `sha..HEAD` selects commits by
+/// ancestry, not time, so a side-branch commit merged in later but authored
+/// before `t0` must not be treated as rework that happened after it.
+fn within_churn_window(t: f64, t0: f64, days: f64) -> bool {
+    t >= t0 && t <= t0 + days * 86400.0
+}
+
+/// File-level churn: how many files of `sha` were modified again by later
+/// commits within `days`. A rework proxy computable retroactively from git.
+fn churn_for_commit(sha: &str, days: f64) -> Option<(usize, usize)> {
+    // A rename in the measured commit records only its destination: that is
+    // the file's identity going forward, and counting the old name too would
+    // count one logical file twice in the denominator below.
+    let files: BTreeSet<String> = parse_numstat_z(&git(&["show", "--numstat", "-z", "--format=", sha]))
+        .into_iter()
+        .filter_map(|item| match item {
+            NumstatZItem::Path(p) => Some(p),
+            NumstatZItem::Rename { new, .. } => Some(new),
+            NumstatZItem::Commit(_) => None,
+        })
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    let t0: f64 = git(&["show", "-s", "--format=%ct", sha]).trim().parse().ok()?;
+    let range = format!("{sha}..HEAD");
+    let log = git(&["log", "--numstat", "-z", "--format=COMMIT %ct", range.as_str()]);
+    let mut touched = BTreeSet::new();
+    let mut in_window = false;
+    for item in parse_numstat_z(&log) {
+        match item {
+            NumstatZItem::Commit(t) => in_window = within_churn_window(t, t0, days),
+            NumstatZItem::Path(p) => {
+                if in_window {
+                    touched.insert(p);
+                }
+            }
+            // A later rename touches the file under both names: the measured
+            // commit's file set may hold either one, depending on whether the
+            // measured commit itself renamed the file.
+            NumstatZItem::Rename { old, new } => {
+                if in_window {
+                    touched.insert(old);
+                    touched.insert(new);
+                }
+            }
+        }
+    }
+    let changed = files.iter().filter(|f| touched.contains(f.as_str())).count();
+    Some((changed, files.len()))
+}
+
+fn usage_report_churn(file: &Path, opts: &BTreeMap<String, String>) -> Result<(), String> {
+    let days: f64 = opts.get("days").and_then(|x| x.parse().ok()).unwrap_or(14.0);
+    let rows = load_usage_rows(file, opts.get("agent").map(String::as_str))?;
+    // A recorded `head_sha` is by construction a commit observed during that
+    // turn, so every one counts. Requiring a transition from a previous SHA
+    // would drop each session's first commit, including sessions that contain
+    // exactly one.
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    let mut per_phase: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for r in &rows {
+        let sha = r.get("head_sha").cloned().unwrap_or_default();
+        if sha.is_empty() || !done.insert(sha.clone()) {
+            continue;
+        }
+        if let Some((changed, total)) = churn_for_commit(&sha, days) {
+            let phase = r.get("phase").cloned().unwrap_or_default();
+            per_phase
+                .entry(phase)
+                .or_default()
+                .push(changed as f64 / total as f64 * 100.0);
+        }
+    }
+    if per_phase.is_empty() {
+        println!("SENTRITH-CHURN: no recorded commits found in usage data");
+        return Ok(());
+    }
+    for (phase, rates) in per_phase {
+        let avg = rates.iter().sum::<f64>() / rates.len() as f64;
+        println!(
+            "SENTRITH-CHURN [{phase}]: commits={} avg share of files re-modified within {:.0} days: {:.1}%",
+            rates.len(),
+            days,
+            avg
+        );
+    }
+    println!("File-level churn is a rework proxy computed retroactively from git history.");
+    Ok(())
 }
 
 fn print_summary(label: &str, s: &BTreeMap<&'static str, Option<f64>>) {
@@ -618,14 +2640,15 @@ struct PublishStats {
     credits_per_success: Option<f64>,
 }
 
-fn load_usage_rows(path: &Path, agent_filter: Option<&str>, model_filter: Option<&str>) -> Result<Vec<BTreeMap<String, String>>, String> {
+fn load_usage_rows(path: &Path, agent_filter: Option<&str>) -> Result<Vec<BTreeMap<String, String>>, String> {
     let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut lines = text.lines();
-    let header = lines.next().ok_or("usage file is empty")?;
+    let records = split_csv_records(&text);
+    let mut records = records.iter();
+    let header = records.next().ok_or("usage file is empty")?;
     let headers = parse_csv_line(header);
     let mut rows = Vec::new();
 
-    for line in lines {
+    for line in records {
         if line.trim().is_empty() { continue; }
         let cols = parse_csv_line(line);
         let mut row = BTreeMap::new();
@@ -634,9 +2657,6 @@ fn load_usage_rows(path: &Path, agent_filter: Option<&str>, model_filter: Option
         }
         if let Some(a) = agent_filter {
             if row.get("agent").map(String::as_str).unwrap_or("") != a { continue; }
-        }
-        if let Some(m) = model_filter {
-            if row.get("model").map(String::as_str).unwrap_or("") != m { continue; }
         }
         rows.push(row);
     }
@@ -659,32 +2679,71 @@ fn sum_field(rows: &[&BTreeMap<String, String>], key: &str) -> Option<f64> {
     if vals.is_empty() { None } else { Some(vals.iter().sum::<f64>()) }
 }
 
-fn publish_stats(rows: &[&BTreeMap<String, String>]) -> PublishStats {
-    let successes = rows.iter()
-        .filter(|r| r.get("success").map(String::as_str) == Some("yes"))
-        .count();
-    let tasks = rows.len();
-    let success_rate = if tasks == 0 { None } else { Some(successes as f64 / tasks as f64 * 100.0) };
-    let total_credits = sum_field(rows, "credits");
+/// A task's outcome is the outcome of the turn that closed it.
+fn task_success(task: &[&BTreeMap<String, String>]) -> &'static str {
+    match task.last().and_then(|r| r.get("success")).map(String::as_str) {
+        Some("yes") => "yes",
+        Some("no") => "no",
+        _ => "unknown",
+    }
+}
+
+/// Success rate over decided tasks only (`yes` / (`yes` + `no`)).
+/// `unknown`/blank tasks are undecidable evidence, not failures.
+fn decided_success_rate(tasks: &[Vec<&BTreeMap<String, String>>]) -> Option<f64> {
+    let yes = tasks.iter().filter(|t| task_success(t) == "yes").count();
+    let no = tasks.iter().filter(|t| task_success(t) == "no").count();
+    if yes + no == 0 { None } else { Some(yes as f64 / (yes + no) as f64 * 100.0) }
+}
+
+/// Per-task totals for one column: turns of the same task are summed first, so
+/// averaging afterwards yields a value per task rather than per turn.
+/// A manual record has no session id and forms its own task, so single-row
+/// behavior is unchanged.
+fn per_task_values(tasks: &[Vec<&BTreeMap<String, String>>], key: &str) -> Vec<f64> {
+    tasks.iter().filter_map(|t| sum_field(t, key)).collect()
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+fn publish_stats_for_tasks(tasks: &[Vec<&BTreeMap<String, String>>]) -> PublishStats {
+    let successes = tasks.iter().filter(|t| task_success(t) == "yes").count();
+    let success_rate = decided_success_rate(tasks);
+    let all_rows: Vec<&BTreeMap<String, String>> =
+        tasks.iter().flat_map(|task| task.iter().copied()).collect();
+    let total_credits = sum_field(&all_rows, "credits");
     let credits_per_success = match (total_credits, successes) {
         (Some(c), n) if n > 0 => Some(c / n as f64),
         _ => None,
     };
 
     PublishStats {
-        tasks,
+        tasks: tasks.len(),
         successes,
         success_rate,
-        credits_avg: avg_field(rows, "credits"),
-        tool_calls_avg: avg_field(rows, "tool_calls"),
-        rework_avg: avg_field(rows, "rework_count"),
-        input_avg: avg_field(rows, "input_tokens"),
-        cached_input_avg: avg_field(rows, "cached_input_tokens"),
-        output_avg: avg_field(rows, "output_tokens"),
-        duration_avg: avg_field(rows, "duration_seconds"),
+        credits_avg: mean(&per_task_values(tasks, "credits")),
+        tool_calls_avg: mean(&per_task_values(tasks, "tool_calls")),
+        rework_avg: mean(&per_task_values(tasks, "rework_count")),
+        input_avg: mean(&per_task_values(tasks, "input_tokens")),
+        cached_input_avg: mean(&per_task_values(tasks, "cached_input_tokens")),
+        output_avg: mean(&per_task_values(tasks, "output_tokens")),
+        duration_avg: mean(&per_task_values(tasks, "duration_seconds")),
         total_credits,
         credits_per_success,
     }
+}
+
+fn publish_stats(rows: &[&BTreeMap<String, String>]) -> PublishStats {
+    // Hook capture writes one row per turn; task-level statistics must be
+    // computed over tasks, not turns, or every metric is divided by the number
+    // of turns that happened to precede the commit.
+    publish_stats_for_tasks(&group_tasks(rows))
 }
 
 fn change_text(base: Option<f64>, standard: Option<f64>, suffix: &str) -> String {
@@ -733,19 +2792,25 @@ fn usage_publish(args: &[String]) -> Result<(), String> {
     let force = opts.contains_key("force");
     let dry_run = opts.contains_key("dry-run");
 
-    let rows = load_usage_rows(&file, Some(agent), model)?;
-    let baseline_rows: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str) == Some("baseline")).collect();
-    let standard_rows: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str) == Some("standard")).collect();
+    let rows = load_usage_rows(&file, Some(agent))?;
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let tasks = filter_tasks_by_model(group_tasks(&refs), model);
+    let by_phase = tasks_by_phase_from_tasks(tasks);
+    let baseline_tasks = by_phase.get("baseline").map(Vec::as_slice).unwrap_or(&[]);
+    let standard_tasks = by_phase.get("standard").map(Vec::as_slice).unwrap_or(&[]);
 
-    if !force && (baseline_rows.len() < min_samples || standard_rows.len() < min_samples) {
+    // Qualify on the same task counts the table publishes. Counting raw turns
+    // would let five turns of one task pass a five-sample threshold and publish
+    // a one-task benchmark with no small-sample warning.
+    let b = publish_stats_for_tasks(baseline_tasks);
+    let s = publish_stats_for_tasks(standard_tasks);
+
+    if !force && (b.tasks < min_samples || s.tasks < min_samples) {
         return Err(format!(
-            "refusing README publication: baseline={} standard={} but min-samples={}. Add more data or pass --force.",
-            baseline_rows.len(), standard_rows.len(), min_samples
+            "refusing README publication: baseline={} standard={} task(s) but min-samples={}. Add more data or pass --force.",
+            b.tasks, s.tasks, min_samples
         ));
     }
-
-    let b = publish_stats(&baseline_rows);
-    let s = publish_stats(&standard_rows);
 
     let model_name = model.unwrap_or("mixed/unspecified");
     let measured_note_ja = if force && (b.tasks < min_samples || s.tasks < min_samples) {
@@ -866,23 +2931,29 @@ fn json_string_field(s: &str, key: &str) -> Option<String> {
     let pos = s.find(&needle)?;
     let rest = &s[pos + needle.len()..];
     let colon = rest.find(':')?;
-    let rest = rest[colon + 1..].trim_start();
-    if !rest.starts_with('"') { return None; }
-    let mut out = String::new();
-    let mut escaped = false;
-    for c in rest[1..].chars() {
-        if escaped {
-            out.push(c);
-            escaped = false;
-        } else if c == '\\' {
-            escaped = true;
-        } else if c == '"' {
-            return Some(out);
-        } else {
-            out.push(c);
-        }
+    let mut parser = JsonParser::new(rest[colon + 1..].trim_start());
+    match parser.value().ok()? {
+        Json::Str(value) => Some(value),
+        _ => None,
     }
-    None
+}
+
+/// The last string element of a JSON array field. Codex's rollout `command`
+/// field is `["/bin/bash", "-lc", "<the actual shell text>"]`; the shell text
+/// to check against test-command patterns is always the final element.
+fn json_string_array_last(s: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let pos = s.find(&needle)?;
+    let rest = &s[pos + needle.len()..];
+    let colon = rest.find(':')?;
+    let mut parser = JsonParser::new(rest[colon + 1..].trim_start());
+    match parser.value().ok()? {
+        Json::Arr(items) => match items.last()? {
+            Json::Str(value) => Some(value.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn json_number_field(s: &str, key: &str) -> Option<f64> {
@@ -903,13 +2974,1496 @@ fn read_stdin_all() -> Result<String, String> {
     Ok(s)
 }
 
-fn ensure_usage_file(path: &Path) -> Result<(), String> {
+fn with_usage_file_lock<T, F>(path: &Path, operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let lock_path = path.with_extension("csv.lock");
+    let mut guard: Option<File> = None;
+    for _ in 0..500 {
+        match open_usage_lock_file(&lock_path) {
+            Ok(mut file) => match file.try_lock() {
+                Ok(()) => {
+                    let owner = format!("pid={}\ncreated={}\n", std::process::id(), now_unix());
+                    if let Err(e) = file.set_len(0).and_then(|_| file.seek(SeekFrom::Start(0))) {
+                        return Err(e.to_string());
+                    }
+                    if let Err(e) = file.write_all(owner.as_bytes()) {
+                        return Err(e.to_string());
+                    }
+                    guard = Some(file);
+                    break;
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.to_string()),
+            },
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let Some(guard) = guard else {
+        return Err(format!("timed out waiting for usage lock: {}", lock_path.display()));
+    };
+
+    let result = operation();
+    // Keep the lock file in place. Removing it after unlocking reintroduces a
+    // race where another process can acquire a newly created file and the
+    // cleanup from this process deletes that new owner's lock. The OS-managed
+    // lock is released when this handle is dropped, including after a crash.
+    drop(guard);
+    result
+}
+
+/// Open a usage data file without following a substituted symlink.
+/// The type check is performed on the opened handle before the caller can read
+/// or write it, so a symlink at a predictable usage path cannot redirect an
+/// operation to an unrelated file.
+fn open_usage_file(path: &Path, create: bool) -> Result<File, String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(format!(
+                "{} is a symlink, directory, or other special file",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if create && e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to inspect {}: {e}", path.display())),
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(target_os = "linux")]
+        const O_NOFOLLOW: i32 = 0o400000;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
+        const O_NOFOLLOW: i32 = 0x0100;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )))]
+        const O_NOFOLLOW: i32 = 0;
+        if O_NOFOLLOW != 0 {
+            options.custom_flags(O_NOFOLLOW);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    let file = options
+        .open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let is_file = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect {}: {e}", path.display()))?
+        .is_file();
+    if !is_file {
+        return Err(format!(
+            "{} is not a regular file (found a symlink, directory, or other special file)",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+/// Open the persistent usage lock without following a substituted symlink.
+/// The type check is performed on the opened handle before it can be locked or
+/// truncated, so a symlink at the predictable lock path cannot redirect either
+/// operation to an unrelated file.
+fn open_usage_lock_file(path: &Path) -> Result<File, String> {
+    open_usage_file(path, true)
+}
+
+fn ensure_usage_file(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    if !path.exists() {
-        fs::write(path, USAGE_HEADER).map_err(|e| e.to_string())?;
+    let mut file = open_usage_file(path, true)?;
+    if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
+        file.write_all(USAGE_HEADER.as_bytes()).map_err(|e| e.to_string())?;
+        return Ok(file);
     }
+
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|e| e.to_string())?;
+    if migrate_usage_file_if_needed(path, &text)? {
+        file = open_usage_file(path, false)?;
+    }
+    Ok(file)
+}
+
+/// Upgrade a schema-v1 usage file in place by rewriting the header and padding
+/// old rows with empty `head_sha`/`verification` columns. Unknown headers are
+/// left untouched.
+fn migrate_usage_file_if_needed(path: &Path, text: &str) -> Result<bool, String> {
+    // Split on logical records: a quoted field may span physical lines, and
+    // appending columns per physical line would inject commas into it.
+    let records = split_csv_records(&text);
+    let mut records = records.iter();
+    let Some(header) = records.next() else { return Ok(false); };
+    if header.trim_end() == USAGE_HEADER.trim_end() {
+        return Ok(false);
+    }
+    if header.trim_end() != USAGE_HEADER_V1.trim_end() {
+        return Ok(false);
+    }
+    let mut out = String::from(USAGE_HEADER);
+    for record in records {
+        if record.trim().is_empty() {
+            continue;
+        }
+        out.push_str(record);
+        out.push_str(",,");
+        out.push('\n');
+    }
+    let tmp = sibling_temp_path(path, "sentrith-migrate-tmp");
+    let result = (|| {
+        let mut file = create_secure_file(&tmp)?;
+        file.write_all(out.as_bytes()).map_err(|e| e.to_string())?;
+        drop(file);
+        #[cfg(not(windows))]
+        copy_file_permissions(path, &tmp)?;
+        replace_file_preserving_security(&tmp, path, None)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map(|()| true)
+}
+
+fn phase_marker_path() -> PathBuf {
+    PathBuf::from(".ai-usage/phase")
+}
+
+/// Phase precedence: explicit flag > `.ai-usage/phase` marker > SENTRITH_PHASE
+/// > "standard".
+///
+/// The marker outranks the environment variable because hooks are spawned by
+/// the agent process: a variable exported after the agent started never reaches
+/// them, while `usage baseline start` writes a marker every hook can read.
+fn resolve_phase_value(
+    explicit: Option<&str>,
+    marker: Option<&str>,
+    env_value: Option<&str>,
+) -> String {
+    for candidate in [explicit, marker, env_value] {
+        if let Some(p) = candidate {
+            if !p.trim().is_empty() {
+                return p.trim().to_string();
+            }
+        }
+    }
+    "standard".to_string()
+}
+
+fn read_phase_marker(path: &Path) -> Option<String> {
+    let value = read_regular_file_no_follow(path)?;
+    match value.trim() {
+        "baseline" => Some("baseline".into()),
+        "standard" => Some("standard".into()),
+        _ => None,
+    }
+}
+
+fn resolve_phase(explicit: Option<&str>) -> String {
+    let marker_path = phase_marker_path();
+    let marker = read_phase_marker(&marker_path);
+    resolve_phase_value(
+        explicit,
+        marker.as_deref(),
+        env::var("SENTRITH_PHASE").ok().as_deref(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// usage baseline
+//
+// A baseline must be measured with the Sentrith contract inactive, which is
+// otherwise a manual and error-prone step. These commands stash the agent
+// instruction files and restore them, so the measurement is reversible.
+// Hook configuration and `.ai-usage/` are deliberately left in place: they are
+// what performs the measurement.
+// ---------------------------------------------------------------------------
+
+const BASELINE_STASH_PATHS: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".github/copilot-instructions.md",
+    ".github/prompts",
+    ".agents",
+    ".claude/skills",
+];
+
+/// Hook-settings files whose advisory-check entries (see
+/// `WORKFLOW_CHECK_SUBCOMMANDS`) are edited out, not moved, for the duration
+/// of a baseline. Unlike `BASELINE_STASH_PATHS`, the live file keeps
+/// existing throughout: usage capture still needs it.
+const BASELINE_HOOK_SETTINGS_PATHS: &[&str] = &[".claude/settings.json", ".codex/hooks.json"];
+
+fn baseline_stash_dir() -> PathBuf {
+    PathBuf::from(".sentrith-private/baseline-stash")
+}
+
+/// A cheap, non-cryptographic content digest used purely to detect whether a
+/// file changed between two points in time on this machine -- not a security
+/// boundary, so `std::hash`'s built-in hasher (no dependency needed) is
+/// entirely adequate; nothing here defends against a motivated adversary
+/// crafting a collision, only against accidentally comparing stale bytes.
+fn content_digest(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Strip a hook-settings file's advisory-check entries for the duration of a
+/// baseline, backing up the original so `baseline stop` can restore it
+/// verbatim rather than reconstructing it from the shipped example (which
+/// may not match what the user actually has). Returns `Ok(false)` when there
+/// is nothing to do: no file, empty file, no `hooks` field, or no entry
+/// actually matched.
+/// `rel_path` is only a naming key for the backup under `stash`; `live` is the
+/// file actually read and written. Kept separate (rather than deriving `live`
+/// from `rel_path` via `repo_file` internally) so this is testable with an
+/// arbitrary temp-directory path instead of depending on the process's
+/// current directory, the same reasoning that shaped `inspect_stash`.
+fn reduce_hook_settings_for_baseline(
+    rel_path: &str,
+    live: &Path,
+    stash: &Path,
+) -> Result<bool, String> {
+    // A symlinked settings file (common under dotfile managers) must not be
+    // touched: `fs::write` follows the link and would reduce whatever it
+    // points at -- possibly shared across other projects -- and restoring by
+    // rename would later replace the symlink itself with a plain file,
+    // permanently breaking the link. The caller aborts and rolls back the
+    // whole baseline start on this Err, rather than proceeding with this
+    // path's hooks silently left active.
+    if live.is_symlink() {
+        return Err(format!(
+            "{} is a symlink; leaving it untouched for baseline rather than rewriting or breaking whatever it points at",
+            live.display()
+        ));
+    }
+    if !live.exists() {
+        return Ok(false);
+    }
+    // Read fallibly rather than through `read_text`, which folds a read
+    // failure (invalid UTF-8, a transient permission error) into the same
+    // empty string as a genuinely empty file. That would make this return
+    // `Ok(false)` -- "nothing to reduce" -- for a file that actually still
+    // holds live Sentrith hooks; `baseline_start` would then report success
+    // while this path's advisory hooks stay active for the whole baseline,
+    // contaminating the very sample the baseline exists to keep contract-free.
+    let original = fs::read_to_string(live).map_err(|e| {
+        format!("failed to read {}: {e}; left untouched for baseline", live.display())
+    })?;
+    if original.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut settings = json_parse(&original).map_err(|e| {
+        format!(
+            "{} is not valid JSON ({e}); left untouched for baseline",
+            live.display()
+        )
+    })?;
+    let Some(mut hooks) = settings.get("hooks").cloned() else {
+        return Ok(false);
+    };
+    let before = json_to_string(&hooks);
+    strip_hooks_matching(&mut hooks, is_workflow_check_command);
+    if json_to_string(&hooks) == before {
+        return Ok(false);
+    }
+    if matches!(&hooks, Json::Obj(e) if e.is_empty()) {
+        settings.remove("hooks");
+    } else {
+        settings.set("hooks", hooks);
+    }
+    let reduced = json_to_string(&settings);
+    // Never write output we cannot read back.
+    json_parse(&reduced).map_err(|e| {
+        format!(
+            "internal: reduced {} would be invalid JSON ({e})",
+            live.display()
+        )
+    })?;
+
+    let backup_dir = stash.join("hook-settings-backup");
+    let backup = backup_dir.join(rel_path);
+    if let Some(parent) = backup.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    // Everything up to here can fail without having touched `live` at all, so
+    // returning `Err` is always safe: the caller skips this path rather than
+    // getting stuck with it silently reduced and never restored (a disk
+    // filling up mid-write, or the process exiting, must not be able to leave
+    // `live` reduced with nothing recording that it needs restoring).
+    let tmp = sibling_temp_path(live, "sentrith-baseline-tmp");
+    // `write_secure_temp_file` never lets the full reduced settings --
+    // unrelated secrets included -- sit exposed under default/inherited
+    // permissions even briefly; `copy_file_permissions` below still narrows
+    // (or widens) the result to match `live`'s actual mode on Unix, since
+    // the temp file's own fixed mode is only meant to hold for this window,
+    // not to be the final permissions.
+    write_secure_temp_file(&tmp, &reduced)?;
+    #[cfg(not(windows))]
+    copy_file_permissions(live, &tmp)?;
+    // `backup` is created here, atomically with the live replacement on
+    // Windows via `ReplaceFileW`'s own backup parameter (the only way this
+    // project can carry over a restricted file's full security descriptor to
+    // a brand-new path without a new dependency), and just before the rename
+    // elsewhere -- either way, before `live` holds anything but the original.
+    replace_file_preserving_security(&tmp, live, Some(&backup))?;
+
+    // The digest is written only after the swap above actually commits --
+    // not before it, the way an earlier version of this function did. A
+    // digest written first and left orphaned by a failed swap (e.g. Windows
+    // reporting a sharing violation because something else has the settings
+    // file open, which needs no special conditions to trigger) is
+    // indistinguishable, to `restore_hook_settings_backup`'s no-backup
+    // branch, from a genuinely completed-and-uncleaned restore: `live` was
+    // never touched by this call, but that stale digest alone would get
+    // read as unrecoverable data loss forever after, with the phase marker
+    // stuck at `baseline` and no CLI path to recover.
+    //
+    // The digest -- not the full reduced content -- is what `restore` later
+    // compares against; storing only a digest means there is no second copy
+    // of settings content (which may itself hold something sensitive) sitting
+    // at whatever permissions a fresh file gets by default. This directory is
+    // git-ignored, same as HOOK_EDITS.txt and STASHED.txt -- a symlink
+    // planted at this predictable path wouldn't show up in `git status`
+    // either, so this goes through the same symlink-safe helper.
+    let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
+    if let Err(e) = write_ordinary_file_without_following_a_symlink(
+        &digest_path,
+        &content_digest(&reduced).to_string(),
+    ) {
+        // Writing the digest last, once `live` is confirmed already
+        // reduced, means every earlier failure in this function leaves
+        // `live` untouched -- but this one can't: the swap above already
+        // committed. Without a digest, `restore_hook_settings_backup` has
+        // no way to tell "reduced, but the digest write just failed" apart
+        // from "a user edited this file during baseline", and fails closed
+        // into the latter: it relocates `backup` -- the only copy of the
+        // true original -- into `baseline-hook-conflicts` as something to
+        // merge by hand, without ever touching `live`. `baseline_start`'s
+        // rollback then treats that as `Recoverable` and reports the
+        // working tree unchanged, leaving `live` reduced (hooks disabled)
+        // with nothing recording that it still needs restoring. There is no
+        // such ambiguity here -- this call knows for certain `live`
+        // currently holds `reduced` and `backup` holds the true original --
+        // so roll the swap back directly instead of leaving that to be
+        // misdiagnosed later.
+        return Err(roll_back_committed_replacement(
+            live,
+            Some(&backup),
+            format!("failed to record the baseline snapshot for {}: {e}", live.display()),
+        ));
+    }
+    Ok(true)
+}
+
+/// Whether a `restore_hook_settings_backup` failure still leaves `live`'s
+/// pre-baseline original recoverable -- a genuine edit safely moved to
+/// `baseline-hook-conflicts` (or, at worst, left at its known stash backup
+/// path), or a cleanup-only failure after `live` was already confirmed
+/// correct -- or leaves nothing at all to fall back on: the backup is gone
+/// with no way to tell whether `live` is still reduced. `baseline_stop`
+/// blocks its own cleanup only for `Unrecoverable`; a `Recoverable` failure
+/// must never hold the contract-file restoration hostage to an unrelated
+/// hook-settings issue that's already safely handled elsewhere -- the whole
+/// reason the conflict-preservation path exists in the first place.
+/// Implements `From<String>` as `Recoverable` so every existing `?` on a
+/// plain `String` error inside `restore_hook_settings_backup` keeps working
+/// unchanged; only the specific sites that truly leave nothing recoverable
+/// need to name `Unrecoverable` explicitly.
+enum RestoreFailure {
+    Recoverable(String),
+    Unrecoverable(String),
+}
+
+impl RestoreFailure {
+    fn is_unrecoverable(&self) -> bool {
+        matches!(self, RestoreFailure::Unrecoverable(_))
+    }
+}
+
+impl From<String> for RestoreFailure {
+    fn from(message: String) -> Self {
+        RestoreFailure::Recoverable(message)
+    }
+}
+
+impl std::fmt::Display for RestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestoreFailure::Recoverable(m) | RestoreFailure::Unrecoverable(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::fmt::Debug for RestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+/// Restores `live` from its baseline backup if one exists. Returns
+/// `Ok(true)` when `live` is now *confirmed* to hold the pre-baseline
+/// original -- whether that took an actual file replacement in this call, or
+/// this call only finished trailing cleanup (backup and/or digest removal)
+/// left behind by an earlier attempt that already replaced `live` -- and
+/// `Ok(false)` only when there is nothing at all to indicate this path was
+/// ever reduced in the first place (no backup, no digest). Callers that
+/// cross-check this against a journal of paths that *should* have been
+/// reduced rely on that distinction: collapsing every no-file-operation
+/// outcome into `false` would make an already-fully-restored path
+/// indistinguishable from one whose reduction was never followed up on.
+fn restore_hook_settings_backup(rel_path: &str, live: &Path, stash: &Path) -> Result<bool, RestoreFailure> {
+    let backup_dir = stash.join("hook-settings-backup");
+    let backup = backup_dir.join(rel_path);
+    let digest_path = backup_dir.join(format!("{rel_path}.reduced-digest"));
+    // Durable proof that Sentrith's own restore actually committed for this
+    // path -- written by `finish_hook_restore_cleanup` before it touches
+    // backup or digest. Neither the backup's absence nor a digest mismatch
+    // is reliable proof on its own: the backup could have been deleted
+    // externally while `live` is still reduced, and a mismatch only proves
+    // `live` is no longer the *exact* reduced snapshot -- an unrelated edit
+    // made on top of the still-reduced file would produce the same mismatch
+    // without hooks ever actually being restored. Only this marker's
+    // presence is unambiguous. Removed only by `baseline_stop`, once it can
+    // confirm its own journal no longer needs it (see
+    // `finish_hook_restore_cleanup`'s doc comment) -- never here.
+    let marker_path = backup_dir.join(format!("{rel_path}.restored"));
+    // `backup` could be substituted with a symlink after `reduce_hook_settings_for_baseline`
+    // created it -- e.g. pointing at `live` itself -- during the whole
+    // window an active baseline is open. Pointed at `live`, a followed link
+    // would make the retry-cleanup equality check below trivially true by
+    // reading `live` against itself, misdiagnosing an untouched, still-
+    // reduced `live` as "already restored" and deleting the digest and the
+    // (symlinked) backup -- discarding the only record that this happened.
+    //
+    // Read it exactly once, here, through a handle that refused to follow a
+    // link, and use *that content* for both the comparison and the restore
+    // below. An earlier version validated the path with `symlink_metadata`
+    // and then let the two consumers reopen it by name, which is a
+    // check-then-use race: a substitution landing between the check and
+    // either reopen would still be followed. Nothing below reopens `backup`
+    // for reading, so there is no second open left to race against.
+    //
+    // The open only constrains the path's final component, so the directory
+    // components leading to it are checked separately first -- a symlinked
+    // `hook-settings-backup/.claude` would otherwise hand over an
+    // attacker-chosen "backup" that passes every leaf-level check. That
+    // check covers the digest and marker too: all three share this parent.
+    let backup_content = if entry_exists(&backup) {
+        ancestors_are_real_directories(stash, &backup).map_err(RestoreFailure::Unrecoverable)?;
+        match open_regular_file_no_follow(&backup) {
+            Ok(mut file) => {
+                use std::io::Read;
+                let mut content = String::new();
+                match file.read_to_string(&mut content) {
+                    Ok(_) => Some(content),
+                    // Unreadable (invalid UTF-8, a transient I/O error) is
+                    // not proof of substitution: fall through to divergence
+                    // detection, which fails closed and preserves rather
+                    // than destroying anything.
+                    Err(_) => None,
+                }
+            }
+            // Proven to be (or to lie behind) a symlink: this is the
+            // substitution being guarded against.
+            Err(OpenRefusal::NotRegular(e)) => {
+                return Err(RestoreFailure::Unrecoverable(format!(
+                    "{} was reduced during baseline, but its backup at {} is not a regular file \
+                     ({e}) -- something replaced it while the baseline was active, so its content \
+                     cannot be trusted and the original could not be recovered from it. \
+                     Resolve manually.",
+                    live.display(),
+                    backup.display()
+                )));
+            }
+            // Could not tell -- a permission glitch, or a Windows sharing
+            // violation, which needs no special conditions to occur.
+            // Deliberately `Recoverable`, matching how the `live` read below
+            // already treats its own transient failures: escalating this to
+            // `Unrecoverable` would let an ordinary retryable hiccup block
+            // `baseline_stop` before it restores the contract files, which
+            // is the safety-critical half of the operation.
+            Err(OpenRefusal::Transient(e)) => {
+                return Err(RestoreFailure::Recoverable(format!(
+                    "could not read the baseline backup for {} ({e}); left the backup and digest \
+                     in place so `baseline stop` can be retried.",
+                    live.display()
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    // `entry_exists`, not `backup.exists()`: this branch is the "no backup
+    // at all" case, and a dangling symlink at the path is emphatically not
+    // that -- it is a substitution, already rejected above. Using `exists()`
+    // here would let such an entry fall through into this branch and be
+    // treated as a plain missing backup.
+    if !entry_exists(&backup) {
+        if marker_path.exists() {
+            // Retain the marker until the digest is confirmed gone: if this
+            // removal fails (a transient sharing violation), the marker
+            // must still be here for a retry to find, or a later call would
+            // see a digest with no marker and misclassify this exact,
+            // already-proven-restored path as unrecoverable. A prior attempt
+            // may have already removed the digest before failing on
+            // something else, so only attempt this when there's actually
+            // something left to remove.
+            if digest_path.exists() {
+                fs::remove_file(&digest_path).map_err(|e| {
+                    format!("could not remove orphaned digest {}: {e}", digest_path.display())
+                })?;
+            }
+            return Ok(true);
+        }
+        if digest_path.exists() {
+            // Unrecoverable: with the backup gone and no restore marker,
+            // there is nothing durable indicating this path's restore ever
+            // committed. `live`'s current content is deliberately not
+            // consulted here -- it can neither confirm nor rule out a real
+            // restore, only whether it still matches the reduced snapshot,
+            // which an edit made without restoring anything would also
+            // change.
+            return Err(RestoreFailure::Unrecoverable(format!(
+                "{} was reduced during baseline, but its backup is missing and there is no durable \
+                 record that it was ever restored -- the original could not be recovered. \
+                 Resolve manually.",
+                live.display()
+            )));
+        }
+        return Ok(false);
+    }
+
+    // A retry after an earlier attempt: the live replacement below already
+    // succeeded, but a later step (removing the backup or digest) failed and
+    // the function returned Err. `live` now holds the *restored* original,
+    // not the reduced content the digest describes, so comparing it against
+    // the digest here would misread this state as a conflict and bury an
+    // already-correct file's backup for no reason. `reduce_hook_settings_for_baseline`
+    // only ever creates a backup when the reduction actually changed
+    // something, so `live` cannot legitimately equal `backup`'s content
+    // unless the replacement already happened -- that equality is what
+    // distinguishes this case from a genuinely fresh restore, without
+    // needing any separate persisted state. Once detected, skip straight to
+    // cleanup rather than touching `live` or running divergence detection
+    // again.
+    //
+    // Read both fallibly and require both to succeed: `read_text` folds a
+    // read failure into the same empty string on both sides, which would
+    // otherwise make an unreadable `live` and an unreadable (or genuinely
+    // empty) `backup` compare equal and falsely take this path -- deleting
+    // the backup while `live` was never actually verified to hold the
+    // restored content. `backup_content` was already read once, above,
+    // through a handle that refused to follow a symlink; comparing against
+    // that (rather than reopening `backup` by name here) is what keeps a
+    // substitution from slipping in between the validation and this use.
+    if let (Ok(live_content), Some(backup_content)) =
+        (fs::read_to_string(live), backup_content.as_ref())
+    {
+        if &live_content == backup_content {
+            // `live` is already confirmed correct at this point; any
+            // failure finishing cleanup is a leftover-artifact problem, not
+            // evidence live might still be reduced.
+            return finish_hook_restore_cleanup(&backup, &digest_path, &marker_path, live).map_err(RestoreFailure::from);
+        }
+    }
+
+    // Read `live` fallibly, up front, before touching the backup or digest
+    // at all: a failure here (a transient sharing violation, a permission
+    // glitch) is not evidence of a conflict -- it just means this attempt
+    // cannot tell either way. Returning early on it, rather than folding it
+    // into the divergence check below the way `read_text` would, keeps a
+    // retry able to tell a real conflict from a transient one once the
+    // failure clears; folding it in would treat "can't read" the same as
+    // "confirmed different" and permanently move the backup to
+    // baseline-hook-conflicts for something never actually verified to be
+    // an edit.
+    let live_content = fs::read_to_string(live).map_err(|e| {
+        format!(
+            "failed to read {} to check for changes made during baseline: {e}; \
+             left the backup and digest in place so this can be retried",
+            live.display()
+        )
+    })?;
+
+    // Fail closed: a missing, unreadable, or malformed digest means there is
+    // no way to tell whether `live` was edited during baseline, and treating
+    // that as "not diverged" would silently overwrite a genuine edit with
+    // the stale backup -- the retry-cleanup check above already handles the
+    // one case where a missing/mismatched digest is actually safe (`live`
+    // already restored), so anything reaching this line with an unreadable
+    // digest is a genuinely unexplained state, not a known-safe one.
+    let diverged = read_text(&digest_path)
+        .trim()
+        .parse::<u64>()
+        .map(|expected| expected != content_digest(&live_content))
+        .unwrap_or(true);
+    if diverged {
+        // Move the conflict out of the stash entirely (rather than leaving it
+        // there and refusing to clean up) so restoring the contract files --
+        // the safety-critical half of `baseline stop` -- is never held
+        // hostage by an unrelated hook-settings edit made during baseline.
+        // Derived from `stash`'s own parent rather than a fresh cwd-relative
+        // path, so it lands next to the stash wherever that actually is
+        // (matters for tests, and keeps the eventual rename on one volume).
+        let conflict_root = stash.parent().unwrap_or(stash);
+        let conflict_dir = conflict_root.join("baseline-hook-conflicts");
+        // A conflict from an *earlier* baseline may still be sitting here
+        // unresolved -- nothing blocks starting a new baseline while one is
+        // pending. Never rename onto it: that would silently destroy the
+        // only copy of the original the user was told to merge by hand.
+        // Walk numbered variants until an unused path is found instead.
+        let mut conflict = conflict_dir.join(rel_path);
+        if conflict.exists() {
+            let mut n = 1u32;
+            loop {
+                let candidate = conflict_dir.join(format!("{rel_path}.conflict-{n}"));
+                if !candidate.exists() {
+                    conflict = candidate;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        if let Some(parent) = conflict.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if fs::rename(&backup, &conflict).is_ok() {
+            // Only safe to drop the digest once the original is confirmed
+            // preserved outside the stash: with the backup gone from its
+            // known path, nothing else records that this path was ever
+            // diverged. If this removal itself fails, the backup being gone
+            // (moved to `conflict`) plus a surviving digest is exactly the
+            // state `restore_hook_settings_backup`'s no-backup branch reads
+            // as unrecoverable data loss on a later call -- so that failure
+            // is surfaced now, with the conflict's location already at
+            // hand, instead of ignored and rediscovered from scratch later.
+            if let Err(e) = fs::remove_file(&digest_path) {
+                return Err(RestoreFailure::Unrecoverable(format!(
+                    "{} was edited while baseline was active; the original was safely preserved at \
+                     {} (merge the change by hand), but removing its now-orphaned digest at {} \
+                     failed: {e}. Remove that digest manually so this path is no longer treated as \
+                     needing recovery.",
+                    live.display(),
+                    conflict.display(),
+                    digest_path.display()
+                )));
+            }
+            // Recoverable: the original is safely preserved outside the
+            // stash, waiting to be merged by hand -- not a reason to block
+            // baseline_stop's contract-file restoration.
+            return Err(RestoreFailure::Recoverable(format!(
+                "{} was edited while baseline was active; refusing to overwrite it. \
+                 The pre-baseline original is kept at {}: merge the change by hand.",
+                live.display(),
+                conflict.display()
+            )));
+        }
+        // Preserving the original at `conflict` failed too (e.g. a sharing
+        // violation or an unwritable conflict directory). The backup is
+        // still sitting at its original path -- deliberately NOT removing
+        // the digest here: without it, a retry's divergence check reads a
+        // missing digest as "not diverged" and silently overwrites the edit
+        // with the stale backup, exactly the loss this whole check exists to
+        // prevent. Keeping the digest means a retry re-detects the same
+        // conflict and tries preservation again instead.
+        //
+        // Still Recoverable: the backup remains at its known stash path
+        // (never moved, never deleted), so it is not lost -- just not yet
+        // relocated to the dedicated conflicts directory.
+        return Err(RestoreFailure::Recoverable(format!(
+            "{} was edited while baseline was active; refusing to overwrite it. \
+             Preserving the pre-baseline original at {} also failed; it remains at {} -- \
+             do not delete it. Resolve whatever is blocking {}, then retry `baseline stop`.",
+            live.display(),
+            conflict.display(),
+            backup.display(),
+            conflict.display()
+        )));
+    }
+
+    // `backup` is left at its original, already-known path until the
+    // replacement below actually commits: staging through a separate `tmp`
+    // (rather than renaming `backup` itself onto `live`) means an
+    // interruption at any point up to and including a failed replace still
+    // leaves `backup` exactly where a retried restore looks for it, instead
+    // of orphaning the original content at a temp path nothing else knows to
+    // check. See `restore_file_content`'s doc comment for why this goes
+    // through it rather than a direct `fs::copy` onto `live`.
+    //
+    // Writes the content already read above rather than reopening `backup`
+    // by name -- the same reason the equality check does: reopening here
+    // would reintroduce exactly the check-then-use window the no-follow
+    // read closed, letting a substitution land between validation and this
+    // restore and put the wrong content into `live`.
+    let Some(backup_content) = backup_content else {
+        return Err(RestoreFailure::Recoverable(format!(
+            "{} was reduced during baseline, but its backup at {} could not be read; \
+             left the backup and digest in place so this can be retried.",
+            live.display(),
+            backup.display()
+        )));
+    };
+    let tmp = sibling_temp_path(live, "sentrith-baseline-restore-tmp");
+    restore_file_content_from_memory(live, &backup_content, &tmp)
+        .map_err(|e| format!("failed to restore {}: {e}", live.display()))?;
+    finish_hook_restore_cleanup(&backup, &digest_path, &marker_path, live).map_err(RestoreFailure::from)
+}
+
+/// Durably record that `live` is restored, then remove the now-obsolete
+/// backup and digest, once `live` already holds the restored content --
+/// whether that replacement just happened or was confirmed on a retry (see
+/// the equality check at the top of `restore_hook_settings_backup`). Split
+/// out so both paths share the same cleanup and the same failure handling.
+///
+/// Deliberately does *not* remove the marker itself: `baseline_stop` durably
+/// removes a restored path from its own journal after this returns, and
+/// that journal rewrite can itself fail or be interrupted. If the marker
+/// were already gone by then, a retry would have nothing left to prove the
+/// restore happened, re-entering the exact stuck state this marker exists
+/// to prevent -- so the caller, not this function, removes it, only once
+/// it can confirm the journal itself no longer needs it.
+fn finish_hook_restore_cleanup(
+    backup: &Path,
+    digest_path: &Path,
+    marker_path: &Path,
+    live: &Path,
+) -> Result<bool, String> {
+    // Written first, before backup or digest is touched, and safe to redo if
+    // an earlier attempt already wrote it: its presence is the durable proof
+    // that `live` was actually restored, independent of what a later edit
+    // might do to `live`'s content or of whether the backup gets deleted out
+    // from under this before cleanup finishes. `fs::write` would follow an
+    // existing symlink at this predictable path -- the same class of attack
+    // fixed for the backup, the reduce temp file, and the restore temp file
+    // -- and during an active baseline there is a real window (from
+    // `baseline start` to `baseline stop`) for something to plant one here.
+    // `create_secure_file` refuses to reuse or follow anything already at
+    // the path; the file it returns is already empty, so nothing further
+    // needs to be written to it.
+    drop(create_secure_file(marker_path).map_err(|e| {
+        format!("restored {} but could not durably record that: {e}", live.display())
+    })?);
+    // Defensive: on Windows, a read-only file refuses to delete. In this
+    // codebase the backup created during reduce does not currently end up
+    // read-only even from a read-only original -- `replace_file_preserving_security`
+    // clears the destination's read-only attribute before ReplaceFileW runs,
+    // so ReplaceFileW's backup is made from the already-cleared file -- but
+    // clearing it here anyway (rather than assuming that stays true) costs
+    // nothing and closes the failure mode for good if that ever changes. Not
+    // ignoring the removal failure matters regardless of the cause: an
+    // unremovable backup keeps `hook-settings-backup` non-empty, which later
+    // fails the stash directory's removal and strands the phase marker at
+    // `baseline`.
+    if let Ok(metadata) = fs::metadata(backup) {
+        let mut perms = metadata.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(backup, perms);
+        }
+    }
+    fs::remove_file(backup).map_err(|e| {
+        format!("restored {} but could not remove its backup {}: {e}", live.display(), backup.display())
+    })?;
+    // Only removed once the backup is confirmed gone. If this step or the one
+    // above fails, the digest may still describe the pre-restore reduced
+    // content while `live` already holds the restored original -- exactly
+    // the mismatch the equality check at the top of the caller exists to
+    // recognize, so a retry still finds its way back here rather than
+    // running divergence detection against a digest that no longer applies.
+    fs::remove_file(digest_path).map_err(|e| {
+        format!("restored {} but could not remove its digest {}: {e}", live.display(), digest_path.display())
+    })?;
+    // The marker is intentionally left in place here -- see this function's
+    // doc comment. `marker_path` is still taken as a parameter (rather than
+    // dropped now that this function no longer touches it) so every call
+    // site stays explicit about which marker belongs to this restore.
+    let _ = marker_path;
+    Ok(true)
+}
+
+fn usage_baseline(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage baseline requires start, stop, or status".into());
+    }
+    match args[0].as_str() {
+        "start" => baseline_start(),
+        "stop" => baseline_stop(),
+        "status" => baseline_status(),
+        x => Err(format!("unknown usage baseline command: {x}")),
+    }
+}
+
+fn baseline_active() -> bool {
+    baseline_stash_dir().exists()
+}
+
+fn baseline_status() -> Result<(), String> {
+    let phase = read_phase_marker(&phase_marker_path())
+        .unwrap_or_else(|| "standard (no valid marker)".into());
+    if baseline_active() {
+        println!("SENTRITH-BASELINE: active; contract stashed in {}", baseline_stash_dir().display());
+        let edited = read_text(&baseline_stash_dir().join("HOOK_EDITS.txt"))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        if edited > 0 {
+            println!("SENTRITH-BASELINE: advisory-check hooks reduced in {edited} path(s); usage capture unaffected");
+        }
+    } else {
+        println!("SENTRITH-BASELINE: inactive");
+    }
+    println!("SENTRITH-BASELINE: recorded phase = {phase}");
+    Ok(())
+}
+
+fn baseline_start() -> Result<(), String> {
+    if baseline_active() {
+        return Err(format!(
+            "baseline already active ({} exists); run `sentrith usage baseline stop` first",
+            baseline_stash_dir().display()
+        ));
+    }
+    // Set the phase marker up front. If this fails, nothing has moved yet and
+    // the working tree is untouched; doing it after the moves would leave the
+    // contract stashed with no marker on an early return.
+    //
+    // `.ai-usage` is git-ignored, so a symlink planted at `phase` here
+    // wouldn't show up in normal `git status` -- `fs::write` would follow it
+    // and overwrite whatever it points at with "baseline\n" before any
+    // contract file is stashed.
+    fs::create_dir_all(".ai-usage")
+        .map_err(|e| format!("failed to prepare .ai-usage: {e}"))?;
+    write_ordinary_file_without_following_a_symlink(&phase_marker_path(), "baseline\n")
+        .map_err(|e| format!("failed to write the phase marker: {e}"))?;
+
+    let stash = baseline_stash_dir();
+    if let Err(e) = create_real_directory_tree(&stash) {
+        let _ = fs::remove_file(phase_marker_path());
+        return Err(format!("failed to prepare baseline stash: {e}"));
+    }
+    let manifest = stash.join("STASHED.txt");
+
+    // The manifest is written before each move, so an interrupted run still
+    // leaves a record of what was stashed. Losing the manifest would strand the
+    // moved files, and `baseline stop` deletes the stash directory once it has
+    // restored everything the manifest names.
+    let mut moved: Vec<String> = Vec::new();
+    let mut failure: Option<String> = None;
+    for path in BASELINE_STASH_PATHS {
+        let src = repo_file(path);
+        if !src.exists() {
+            continue;
+        }
+        let dst = stash.join(path);
+        if let Some(parent) = dst.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                failure = Some(format!("failed to prepare stash for {path}: {e}"));
+                break;
+            }
+        }
+        let mut planned = moved.clone();
+        planned.push((*path).to_string());
+        // Git-ignored, same as HOOK_EDITS.txt and the phase marker -- a
+        // symlink planted here between iterations wouldn't show up in
+        // `git status`, and plain `fs::write` would follow it.
+        if let Err(e) =
+            write_ordinary_file_without_following_a_symlink(&manifest, &(planned.join("\n") + "\n"))
+        {
+            failure = Some(format!("failed to record stash manifest: {e}"));
+            break;
+        }
+        if let Err(e) = fs::rename(&src, &dst) {
+            failure = Some(format!("failed to stash {path}: {e}"));
+            break;
+        }
+        moved.push((*path).to_string());
+    }
+
+    if let Some(err) = failure {
+        // Roll back so a partial stash never leaves the project without its
+        // contract files, and never leaves files only inside the stash.
+        let rollback_failed = rollback_moved_paths(&moved, &stash, Path::new("."));
+        if rollback_failed.is_empty() {
+            let _ = fs::remove_file(&manifest);
+            let _ = fs::remove_dir_all(&stash);
+            let _ = fs::remove_file(phase_marker_path());
+            return Err(format!("{err}; rolled back, the working tree is unchanged"));
+        }
+        return Err(format!(
+            "{err}; rollback incomplete for: {}. Files are still in {} — restore them manually.",
+            rollback_failed.join(", "),
+            stash.display()
+        ));
+    }
+
+    if moved.is_empty() {
+        let _ = fs::remove_file(&manifest);
+        let _ = fs::remove_dir_all(&stash);
+        let _ = fs::remove_file(phase_marker_path());
+        return Err("no Sentrith contract files found to stash; is this a Sentrith project?".into());
+    }
+
+    // Reduce advisory-check hooks (preflight/guard/etc.) so a baseline session
+    // does not see Sentrith-flavored Stop/SessionStart output reacting to the
+    // paths this just stashed; usage capture keeps running unmodified. A
+    // settings file that cannot be safely reduced (malformed JSON, a symlink)
+    // aborts the whole baseline start instead of merely warning: leaving its
+    // hooks active would silently contaminate every task recorded as
+    // "baseline" with Sentrith still running, which defeats the point of
+    // measuring one. If recording which files were edited fails partway,
+    // everything rolls back so baseline start stays all-or-nothing either way.
+    let mut hook_edits: Vec<String> = Vec::new();
+    let hook_edits_manifest = stash.join("HOOK_EDITS.txt");
+    let mut hook_edit_failure: Option<String> = None;
+    for path in BASELINE_HOOK_SETTINGS_PATHS {
+        match reduce_hook_settings_for_baseline(path, &repo_file(path), &stash) {
+            Ok(true) => {
+                hook_edits.push((*path).to_string());
+                // The stash is inside `.sentrith-private/`, also git-ignored,
+                // so a symlink planted at this predictable path during the
+                // active baseline wouldn't show up in `git status` either --
+                // same reasoning as the phase marker above.
+                if let Err(e) = write_ordinary_file_without_following_a_symlink(
+                    &hook_edits_manifest,
+                    &(hook_edits.join("\n") + "\n"),
+                ) {
+                    hook_edit_failure = Some(format!("failed to record hook-edit manifest: {e}"));
+                    break;
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                hook_edit_failure = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(err) = hook_edit_failure {
+        // Failures here must block deleting the stash below just as much as a
+        // failed contract-file rollback does: the backup this would discard
+        // is the only copy of that path's original, unreduced hooks, and a
+        // path whose restore failed is still sitting reduced in the working
+        // tree -- deleting the stash on top of that would erase the only way
+        // to recover it while claiming "the working tree is unchanged".
+        //
+        // Scans every candidate path, not just `hook_edits`: the path whose
+        // reduction just failed is never in that list (it never reached
+        // `Ok(true)`), but it can still have a real backup on disk -- if
+        // `replace_file_preserving_security` committed the swap on Windows
+        // and then failed a later step, its own best-effort rollback may
+        // have failed too, leaving live reduced with a backup that
+        // `hook_edits` has no record of. `restore_hook_settings_backup`
+        // already no-ops for a path with no backup, so scanning every
+        // candidate is safe regardless of which ones were ever recorded.
+        let mut hook_restore_failed: Vec<String> = Vec::new();
+        let mut hook_restore_notes: Vec<String> = Vec::new();
+        for path in BASELINE_HOOK_SETTINGS_PATHS.iter().rev() {
+            if let Err(e) = restore_hook_settings_backup(path, &repo_file(path), &stash) {
+                // A Recoverable error is only safe to clean past when its
+                // recovery material was actually moved outside this stash
+                // (the normal divergence/conflict case). Transient failures
+                // deliberately leave backup/digest/marker files here for a
+                // retry; deleting the stash would destroy the original.
+                if e.is_unrecoverable() || hook_restore_artifacts_exist(path, &stash) {
+                    hook_restore_failed.push(format!("{path} ({e})"));
+                } else {
+                    hook_restore_notes.push(format!("{path} ({e})"));
+                }
+            }
+        }
+        let mut rollback_failed = rollback_moved_paths(&moved, &stash, Path::new("."));
+        rollback_failed.extend(hook_restore_failed);
+        if rollback_failed.is_empty() {
+            let _ = fs::remove_file(&hook_edits_manifest);
+            let _ = fs::remove_file(&manifest);
+            let _ = fs::remove_dir_all(&stash);
+            let _ = fs::remove_file(phase_marker_path());
+            if hook_restore_notes.is_empty() {
+                return Err(format!("{err}; rolled back, the working tree is unchanged"));
+            }
+            return Err(format!(
+                "{err}; contract files were rolled back, but hook settings require attention: {}",
+                hook_restore_notes.join(", ")
+            ));
+        }
+        return Err(format!(
+            "{err}; rollback incomplete for: {}. Files are still in {} — restore them manually.",
+            rollback_failed.join(", "),
+            stash.display()
+        ));
+    }
+
+    println!("SENTRITH-BASELINE: started. Stashed {} path(s):", moved.len());
+    for m in &moved {
+        println!("  {m}");
+    }
+    if !hook_edits.is_empty() {
+        println!(
+            "Reduced advisory-check hooks in {} path(s) (usage capture unaffected):",
+            hook_edits.len()
+        );
+        for h in &hook_edits {
+            println!("  {h}");
+        }
+    }
+    println!("Measurement hooks and .ai-usage/ were left active; new turns record phase=baseline.");
+    println!("Git will show these paths as deleted until you run `sentrith usage baseline stop`.");
+    println!("Start a NEW agent session so the stashed instructions are not still in its context.");
+    println!("When you have enough baseline tasks: sentrith usage baseline stop");
+    Ok(())
+}
+
+fn hook_restore_artifacts_exist(rel_path: &str, stash: &Path) -> bool {
+    let backup_dir = stash.join("hook-settings-backup");
+    [
+        backup_dir.join(rel_path),
+        backup_dir.join(format!("{rel_path}.reduced-digest")),
+        backup_dir.join(format!("{rel_path}.restored")),
+    ]
+    .iter()
+    .any(|path| entry_exists(path))
+}
+
+/// Move stashed paths back to their live locations for as many `moved`
+/// entries as possible, in reverse order. Returns the entries that could not
+/// be restored, so the caller can decide whether the stash is safe to
+/// delete. Shared by `baseline_start`'s two rollback points. `root` is the
+/// live tree's root (production callers pass `.`, via `repo_file`'s own
+/// implicit-cwd convention) -- kept as an explicit parameter rather than
+/// resolved internally so this is testable against an isolated temp
+/// directory instead of the test process's actual working directory.
+fn rollback_moved_paths(moved: &[String], stash: &Path, root: &Path) -> Vec<String> {
+    let mut failed = Vec::new();
+    for path in moved.iter().rev() {
+        if let Err(e) = restore_one_stashed_path(path, stash, root) {
+            failed.push(e);
+        }
+    }
+    failed
+}
+
+/// Move one stashed path back to its place under `root`. `Ok(true)` means it
+/// was moved, `Ok(false)` that there was nothing in the stash to move, and
+/// `Err` carries a caller-displayable reason it could not be.
+///
+/// Shared by `baseline_start`'s rollback (via `rollback_moved_paths`) and
+/// `baseline_stop`'s restore loop, which are the same operation in opposite
+/// directions of the same baseline. They were separate near-copies until a
+/// symlink-handling fix landed in one and not the other; per
+/// `tools/sentrith/DECISIONS.md` ADR-20260823-01, the fix for that is to
+/// make there be one implementation, not to remember to patch both.
+///
+/// Uses `entry_exists` on *both* sides rather than `Path::exists`, which
+/// follows links and answers the wrong question in both directions:
+/// - `src`: a contract path that was a valid *relative* symlink at the repo
+///   root (e.g. `AGENTS.md -> ../shared/AGENTS.md`) keeps that same relative
+///   target when moved into the deeper stash, so it commonly dangles from
+///   its new location even though the entry is intact and must be moved
+///   back. `exists()` reads that as "nothing here" and silently skips it,
+///   stranding it in the stash with the contract path missing from the tree.
+/// - `dst`: something recreated at the destination must block the rename, and
+///   a *dangling* symlink recreated there is still something -- `exists()`
+///   returns false for it, so the rename would silently delete it instead of
+///   reporting the conflict this check promises.
+fn restore_one_stashed_path(path: &str, stash: &Path, root: &Path) -> Result<bool, String> {
+    let src = stash.join(path);
+    let dst = root.join(path);
+    if !entry_exists(&src) {
+        return Ok(false);
+    }
+    // Something has already recreated `dst` since it was stashed. Moving the
+    // stashed copy over it would clobber whatever that is; leaving it
+    // silently in place -- without recording this as a failure -- would let
+    // the caller believe the restore fully succeeded and delete the stash,
+    // discarding the stashed copy with no record it was ever there.
+    if entry_exists(&dst) {
+        return Err(format!("{path} (already exists in the working tree)"));
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{path} ({e})"))?;
+    }
+    fs::rename(&src, &dst).map_err(|e| format!("{path} ({e})"))?;
+    Ok(true)
+}
+
+enum StashState {
+    /// Nothing was ever stashed; the directory is safe to remove.
+    Empty,
+    /// The manifest names these paths, in stash order.
+    Listed(Vec<String>),
+    /// Files exist but no manifest explains them. They may be the only copy, so
+    /// they must not be deleted.
+    Unattributable(Vec<String>),
+}
+
+fn inspect_stash(stash: &Path) -> Result<StashState, String> {
+    let listed: Vec<String> = read_text(&stash.join("STASHED.txt"))
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !listed.is_empty() {
+        return Ok(StashState::Listed(listed));
+    }
+    let leftovers: Vec<String> = fs::read_dir(stash)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        // Tracked by HOOK_EDITS.txt, a separate manifest for a separate
+        // restore mechanism (edit-in-place, not move); not a sign of an
+        // unattributable stash on its own.
+        .filter(|n| n != "STASHED.txt" && n != "HOOK_EDITS.txt" && n != "hook-settings-backup")
+        .collect();
+    if leftovers.is_empty() {
+        Ok(StashState::Empty)
+    } else {
+        Ok(StashState::Unattributable(leftovers))
+    }
+}
+
+fn remove_empty_stash_parents(stash: &Path, entries: &[String]) -> Result<(), String> {
+    let mut parents = BTreeSet::new();
+    for entry in entries {
+        let mut parent = Path::new(entry).parent();
+        while let Some(relative) = parent {
+            if relative.as_os_str().is_empty() || relative == Path::new(".") {
+                break;
+            }
+            parents.insert(relative.to_path_buf());
+            parent = relative.parent();
+        }
+    }
+
+    let mut parents: Vec<PathBuf> = parents.into_iter().collect();
+    parents.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for relative in parents {
+        let path = stash.join(relative);
+        match fs::remove_dir(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // An unexpected file keeps the directory in place. The root
+            // removal below will fail too, so the marker and stash remain.
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(e) => {
+                return Err(format!(
+                    "could not remove empty baseline stash parent {}: {e}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn finish_baseline_stop_cleanup(
+    stash: &Path,
+    manifest: &Path,
+    marker: &Path,
+    entries: &[String],
+    hook_edits: &[String],
+) -> Result<(), String> {
+    remove_empty_stash_parents(stash, entries)?;
+    let hook_backup_entries: Vec<String> = hook_edits
+        .iter()
+        .map(|p| format!("hook-settings-backup/{p}"))
+        .collect();
+    remove_empty_stash_parents(stash, &hook_backup_entries)?;
+
+    // The manifests must outlive any failure to remove the stash itself.
+    // Removing them first (as this used to) and *then* having `remove_dir`
+    // fail with `DirectoryNotEmpty` -- which any surviving leftover causes:
+    // an un-removed `.restored` marker, a backup kept by a `Recoverable`
+    // hook-restore failure -- leaves a stash with contents and no manifest
+    // explaining them. `inspect_stash` reads exactly that as
+    // `Unattributable` and refuses to touch it, so the next `baseline stop`
+    // stops permanently with the phase marker still reading `baseline`,
+    // needing manual recovery. Checking emptiness up front instead keeps
+    // that state reachable only as a *retryable* failure, with the
+    // manifests still on disk to attribute the leftovers.
+    let manifest_names = ["STASHED.txt", "HOOK_EDITS.txt"];
+    let leftovers: Vec<String> = match fs::read_dir(stash) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| !manifest_names.contains(&n.as_str()))
+            .collect(),
+        // Already gone: nothing left to clean up, and nothing to explain.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(format!(
+                "restored files, but could not inspect the baseline stash {}: {e}; \
+                 the manifest, marker, and stash were kept",
+                stash.display()
+            ));
+        }
+    };
+    if !leftovers.is_empty() {
+        return Err(format!(
+            "restored files, but {} still contains: {}. The manifest and phase marker were kept \
+             so this stays attributable -- resolve those, then run `sentrith usage baseline stop` \
+             again.",
+            stash.display(),
+            leftovers.join(", ")
+        ));
+    }
+
+    let _ = fs::remove_file(stash.join("HOOK_EDITS.txt"));
+    match fs::remove_file(manifest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "restored files, but could not remove the baseline manifest {}: {e}; the marker and stash were kept",
+                manifest.display()
+            ));
+        }
+    }
+
+    match fs::remove_dir(stash) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "restored files, but could not remove the baseline stash {}: {e}; the phase marker was kept",
+                stash.display()
+            ));
+        }
+    }
+
+    match fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(marker_error) => {
+            match fs::create_dir_all(stash) {
+                Ok(()) => Err(format!(
+                    "restored files, but could not remove the phase marker {}: {marker_error}; an empty stash was kept so baseline remains active",
+                    marker.display()
+                )),
+                Err(stash_error) => Err(format!(
+                    "baseline cleanup is incomplete: could not remove phase marker {} ({marker_error}) or recreate the stash ({stash_error})",
+                    marker.display()
+                )),
+            }
+        }
+    }
+}
+
+fn baseline_stop() -> Result<(), String> {
+    let stash = baseline_stash_dir();
+    if !stash.exists() {
+        return Err("no active baseline to stop".into());
+    }
+    let manifest = stash.join("STASHED.txt");
+    // Restore by scanning the fixed candidate list -- the same one `start`
+    // reduces from -- rather than *only* trusting HOOK_EDITS.txt. That
+    // manifest is written only after a path's live file has already been
+    // reduced, so an interruption in between would otherwise leave a
+    // reduced file with nothing telling `stop` to restore it.
+    // `restore_hook_settings_backup` already no-ops when a path has no
+    // backup, so scanning every candidate is safe regardless of whether it
+    // was ever actually recorded.
+    //
+    // The journal is still cross-checked, in the other direction: `Ok(false)`
+    // ("nothing to restore") is only actually safe for a path the journal
+    // never claimed was reduced. For a path it *does* name, `Ok(false)`
+    // means the expected backup is missing without ever having been
+    // restored -- external cleanup, a partial manual recovery -- and
+    // treating that the same as "never reduced" would report success while
+    // `live` is still silently sitting in its reduced state.
+    // `restore_hook_settings_backup`'s `Ok(true)` already means "`live` is
+    // confirmed restored" even when this call only finished trailing
+    // cleanup left behind by an earlier attempt, so that alone doesn't
+    // false-positive here -- but the journal itself has to be updated
+    // durably as each path is confirmed, not just once at the very end:
+    // otherwise a later retry, after an unrelated failure elsewhere in this
+    // same run, would see the *original* journal still naming an
+    // already-fully-restored-and-cleaned-up path and misread that renewed
+    // `Ok(false)` (nothing left to do) as the same anomaly all over again.
+    let hook_edits_manifest = stash.join("HOOK_EDITS.txt");
+    let mut journaled: Vec<String> = read_text(&hook_edits_manifest)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let hook_edits: Vec<String> = BASELINE_HOOK_SETTINGS_PATHS.iter().map(|s| s.to_string()).collect();
+    let mut hook_edits_restored = 0;
+    let mut hook_restore_failed: Vec<String> = Vec::new();
+    for path in &hook_edits {
+        match restore_hook_settings_backup(path, &repo_file(path), &stash) {
+            Ok(true) => {
+                hook_edits_restored += 1;
+                // `restore_hook_settings_backup` deliberately leaves this
+                // path's durable restore marker in place -- it is only safe
+                // to remove once the journal itself no longer needs it to
+                // recognize this path as done, which for a journaled path
+                // means *after* the write below actually lands.
+                let marker = stash.join("hook-settings-backup").join(format!("{path}.restored"));
+                if journaled.iter().any(|p| p == path) {
+                    let mut without_path = journaled.clone();
+                    without_path.retain(|p| p != path);
+                    // Propagate a failed write rather than accepting the
+                    // path as durably cleared regardless: if this doesn't
+                    // actually land on disk, a retry re-reads the *old*
+                    // on-disk journal (still naming this path) and hits the
+                    // exact permanently-stuck failure this durable removal
+                    // exists to prevent -- ignoring the error would silently
+                    // trade one bug for the illusion of having fixed it.
+                    // Also refuses to follow a symlink planted at this
+                    // predictable, git-ignored path during the long window
+                    // between `baseline start` and `stop` -- same reasoning
+                    // as the phase marker and this journal's initial write.
+                    match write_ordinary_file_without_following_a_symlink(
+                        &hook_edits_manifest,
+                        &(without_path.join("\n") + "\n"),
+                    ) {
+                        Ok(()) => {
+                            journaled = without_path;
+                            let _ = fs::remove_file(&marker);
+                        }
+                        Err(e) => hook_restore_failed.push(format!(
+                            "{path} (restored, but could not durably record that in the baseline journal: {e})"
+                        )),
+                    }
+                } else {
+                    // Never journaled (or already durably removed by an
+                    // earlier, successful call within this same run) -- no
+                    // journal write is gating this path, so the marker can
+                    // be cleared immediately.
+                    let _ = fs::remove_file(&marker);
+                }
+            }
+            Ok(false) => {
+                if journaled.iter().any(|p| p == path) {
+                    hook_restore_failed.push(format!(
+                        "{path} (journaled as reduced during this baseline, but no backup was found to restore from)"
+                    ));
+                }
+            }
+            Err(e) => {
+                println!("SENTRITH-BASELINE: warning: {e}");
+                // A recoverable failure (a genuine edit, safely preserved
+                // outside the stash or at worst left at its known backup
+                // path) is deliberately non-blocking -- the whole reason
+                // that preservation exists is so it never holds the
+                // contract-file restoration below hostage. An unrecoverable
+                // one means there is nothing left indicating whether `live`
+                // is still reduced, which is exactly as dangerous as the
+                // journaled-but-missing case above and needs the same
+                // treatment.
+                if e.is_unrecoverable() {
+                    hook_restore_failed.push(format!("{path} ({e})"));
+                }
+            }
+        }
+    }
+    if !hook_restore_failed.is_empty() {
+        // Keep the baseline active rather than reporting success: the
+        // journal says these paths' hooks were reduced, and there is no
+        // evidence they were ever restored. Clearing the phase marker here
+        // would silently label following turns `standard` while Sentrith's
+        // advisory hooks are still missing for these paths.
+        return Err(format!(
+            "baseline stop found reduced hook settings it could not confirm were restored: {}. \
+             The stash is kept at {} and the phase marker still reads `baseline`. \
+             Resolve manually, then run `sentrith usage baseline stop` again.",
+            hook_restore_failed.join(", "),
+            stash.display()
+        ));
+    }
+
+    let entries = match inspect_stash(&stash)? {
+        StashState::Listed(paths) => paths,
+        StashState::Empty => {
+            finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path(), &[], &hook_edits)?;
+            println!("SENTRITH-BASELINE: stopped; the stash was empty. Phase is standard again.");
+            return Ok(());
+        }
+        StashState::Unattributable(leftovers) => {
+            return Err(format!(
+                "{} has no manifest but still contains: {}. Move them back manually; nothing was deleted.",
+                stash.display(),
+                leftovers.join(", ")
+            ));
+        }
+    };
+
+    let mut restored = 0;
+    let mut failed = Vec::new();
+    // Shares `restore_one_stashed_path` with `baseline_start`'s rollback
+    // rather than repeating its logic: this loop used to be a near-copy, and
+    // a symlink-handling fix landed in the other copy but not this one.
+    // The empty root reproduces this loop's previous `repo_file(path)`
+    // exactly: `repo_file` is `Path::new(path)`, and `Path::new("").join(p)`
+    // is `p`. `baseline_start`'s rollback passes a real directory instead,
+    // which is why the helper takes one at all.
+    let root = repo_file("");
+    for path in entries.iter().map(String::as_str) {
+        match restore_one_stashed_path(path, &stash, &root) {
+            Ok(true) => restored += 1,
+            Ok(false) => {}
+            Err(e) => failed.push(e),
+        }
+    }
+
+    if !failed.is_empty() {
+        // The marker stays: part of the contract is still stashed, so the
+        // project is not back in `standard`. Clearing it here would silently
+        // label the following turns `standard` while the agent is still running
+        // without its instructions, contaminating the comparison.
+        let mut msg = format!(
+            "restored {restored} path(s), but the baseline is still active because these need manual attention: {}",
+            failed.join(", ")
+        );
+        msg.push_str(&format!(
+            ". The stash is kept at {} and the phase marker still reads `baseline`. Resolve the conflicts and run `sentrith usage baseline stop` again.",
+            stash.display()
+        ));
+        return Err(msg);
+    }
+
+    finish_baseline_stop_cleanup(&stash, &manifest, &phase_marker_path(), &entries, &hook_edits)?;
+    println!("SENTRITH-BASELINE: stopped. Restored {restored} path(s); phase is standard again.");
+    if hook_edits_restored > 0 {
+        println!("Restored advisory-check hooks in {hook_edits_restored} path(s).");
+    }
+    println!("Start a NEW agent session so the contract is loaded before your next task.");
     Ok(())
 }
 
@@ -931,6 +4485,8 @@ struct AutoUsage {
     source: String,
     session_id: String,
     notes: String,
+    head_sha: String,
+    verification: String,
 }
 
 fn num_cell(v: Option<f64>) -> String {
@@ -939,8 +4495,16 @@ fn num_cell(v: Option<f64>) -> String {
     }).unwrap_or_default()
 }
 
+fn append_usage_row(path: &Path, values: &[String]) -> Result<(), String> {
+    with_usage_file_lock(path, || {
+        let mut file = ensure_usage_file(path)?;
+        let row = values.iter().map(|x| csv_escape(x)).collect::<Vec<_>>().join(",");
+        file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+        writeln!(file, "{row}").map_err(|e| e.to_string())
+    })
+}
+
 fn append_auto_usage(path: &Path, u: &AutoUsage) -> Result<(), String> {
-    ensure_usage_file(path)?;
     let values = [
         now_unix(),
         u.agent.clone(),
@@ -959,10 +4523,10 @@ fn append_auto_usage(path: &Path, u: &AutoUsage) -> Result<(), String> {
         u.source.clone(),
         u.session_id.clone(),
         u.notes.clone(),
+        u.head_sha.clone(),
+        u.verification.clone(),
     ];
-    let row = values.iter().map(|x| csv_escape(x)).collect::<Vec<_>>().join(",");
-    let mut f = OpenOptions::new().append(true).open(path).map_err(|e| e.to_string())?;
-    writeln!(f, "{row}").map_err(|e| e.to_string())
+    append_usage_row(path, &values)
 }
 
 fn split_double_dash(args: &[String]) -> (Vec<String>, Vec<String>) {
@@ -986,7 +4550,7 @@ fn usage_run_codex(args: &[String]) -> Result<(), String> {
     let (front, passthrough) = split_double_dash(args);
     let (opts, positional) = parse_options(&front)?;
     let task = opts.get("task").cloned().or_else(|| positional.first().cloned()).ok_or("missing --task")?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
 
     let mut cmd = Command::new("codex");
@@ -1052,7 +4616,7 @@ fn usage_run_copilot(args: &[String]) -> Result<(), String> {
     let (front, passthrough) = split_double_dash(args);
     let (opts, positional) = parse_options(&front)?;
     let task = opts.get("task").cloned().or_else(|| positional.first().cloned()).ok_or("missing --task")?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
 
     let mut cmd = Command::new("copilot");
@@ -1098,22 +4662,516 @@ fn task_path(agent: &str, session: &str) -> PathBuf {
 }
 
 fn write_kv(path: &Path, pairs: &[(&str, String)]) -> Result<(), String> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    if let Some(parent) = path.parent() {
+        create_real_directory_tree(parent)?;
+    }
     let mut s = String::new();
     for (k,v) in pairs {
-        s.push_str(k); s.push('\t'); s.push_str(&v.replace('\n'," ")); s.push('\n');
+        s.push_str(k); s.push('\t'); s.push_str(&v.replace('\n', " ")); s.push('\n');
     }
-    fs::write(path, s).map_err(|e| e.to_string())
+    write_verification_state(path, &s)
 }
 
 fn read_kv(path: &Path) -> BTreeMap<String,String> {
     let mut m = BTreeMap::new();
-    if let Ok(s) = fs::read_to_string(path) {
+    if let Some(s) = read_regular_file_no_follow_raw(path) {
         for line in s.lines() {
             if let Some((k,v)) = line.split_once('\t') { m.insert(k.to_string(),v.to_string()); }
         }
     }
     m
+}
+
+const UNBORN_HEAD: &str = "<unborn>";
+
+fn git_head() -> String {
+    let head = git(&["rev-parse", "HEAD"]);
+    if !head.trim().is_empty() {
+        return head.trim().to_string();
+    }
+    if git(&["rev-parse", "--is-inside-work-tree"]).trim() == "true" {
+        UNBORN_HEAD.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn commit_reached(start_head: &str, head: &str) -> bool {
+    !start_head.is_empty() && !head.is_empty() && head != start_head
+}
+
+fn verif_path(agent: &str, session: &str) -> PathBuf {
+    live_dir().join(format!("{agent}-{session}.verif"))
+}
+
+/// Persist a verification result through a fresh temp file and an atomic swap.
+/// Existing destinations are checked with symlink_metadata first, so a
+/// symlink substituted at the state path is refused rather than followed.
+/// When the destination does not exist, rename creates it without ever
+/// dereferencing a link that races into that path.
+fn write_verification_state(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        create_real_directory_tree(parent)?;
+    }
+    let destination_exists = match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(format!(
+                "{} is a symlink, directory, or other special file",
+                path.display()
+            ));
+        }
+        Ok(_) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(format!("failed to inspect {}: {e}", path.display())),
+    };
+
+    let tmp = sibling_temp_path(path, "sentrith-verif-tmp");
+    write_secure_temp_file(&tmp, content)?;
+    let result = if destination_exists {
+        replace_file_preserving_security(&tmp, path, None)
+    } else {
+        fs::rename(&tmp, path).map_err(|e| e.to_string())
+    };
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Read a small state file through the no-follow, regular-file boundary used
+/// for attacker-plantable paths. A missing, unreadable, or substituted entry
+/// is unavailable evidence, never content a caller may trust.
+fn read_regular_file_no_follow_raw(path: &Path) -> Option<String> {
+    // Live hook state is repository-relative. Validate those ancestors without
+    // following links, while allowing absolute paths supplied by isolated
+    // callers to pass through platform aliases such as macOS
+    // /var -> /private/var.
+    if !path.is_absolute() {
+        ancestors_are_real_directories(Path::new(""), path).ok()?;
+    }
+    use std::io::Read;
+    let mut file = open_regular_file_no_follow(path).ok()?;
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+    Some(content)
+}
+
+fn read_regular_file_no_follow(path: &Path) -> Option<String> {
+    read_regular_file_no_follow_raw(path).map(|content| content.trim().to_string())
+}
+
+fn verification_state_content(pass: bool, task_head: &str) -> String {
+    format!("{}\t{task_head}\n", if pass { "pass" } else { "fail" })
+}
+
+fn verification_for_head(content: &str, task_head: &str) -> Option<bool> {
+    let (outcome, bound_head) = content.trim().split_once('\t')?;
+    if bound_head != task_head {
+        return None;
+    }
+    match outcome {
+        "pass" => Some(true),
+        "fail" => Some(false),
+        _ => None,
+    }
+}
+
+fn read_transcript_boundary(path: &str) -> Option<String> {
+    if path.is_empty() {
+        None
+    } else {
+        fs::read_to_string(path).ok()
+    }
+}
+
+/// Aggregated usage and verification signals from one turn's slice of a
+/// provider transcript. Transcript formats are not stable vendor contracts;
+/// all parsing here is best-effort and must degrade to `seen == false`.
+#[derive(Default)]
+struct TranscriptWindow {
+    input_tokens: f64,
+    cache_creation_tokens: f64,
+    cached_input_tokens: f64,
+    output_tokens: f64,
+    model: String,
+    seen: bool,
+    /// Some(true)=last test command in the window passed, Some(false)=failed.
+    verification: Option<bool>,
+}
+
+/// Return the characters following `marker` up to the next `"`.
+fn extract_id_after(line: &str, marker: &str) -> Option<String> {
+    let pos = line.find(marker)?;
+    let rest = &line[pos + marker.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn finish_shell_segment(
+    segments: &mut Vec<(Vec<String>, String)>,
+    token: &mut String,
+    operator: String,
+) {
+    if !token.is_empty() {
+        segments.last_mut().unwrap().0.push(std::mem::take(token));
+    }
+    if !segments.last().unwrap().0.is_empty() {
+        segments.push((Vec::new(), operator));
+    }
+}
+
+fn shell_command_segments(command: &str) -> Vec<(Vec<String>, String)> {
+    let mut segments = vec![(Vec::new(), String::new())];
+    let mut token = String::new();
+    let mut quote = None;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                token.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '\n' => finish_shell_segment(&mut segments, &mut token, "\n".into()),
+            c if c.is_whitespace() => {
+                if !token.is_empty() {
+                    segments.last_mut().unwrap().0.push(std::mem::take(&mut token));
+                }
+            }
+            ';' => finish_shell_segment(&mut segments, &mut token, ";".into()),
+            '&' => {
+                let operator = if chars.peek() == Some(&'&') {
+                    chars.next();
+                    "&&"
+                } else {
+                    "&"
+                };
+                finish_shell_segment(&mut segments, &mut token, operator.into());
+            }
+            '|' => {
+                let operator = if chars.peek() == Some(&'|') {
+                    chars.next();
+                    "||"
+                } else {
+                    "|"
+                };
+                finish_shell_segment(&mut segments, &mut token, operator.into());
+            }
+            _ => token.push(ch),
+        }
+    }
+    if !token.is_empty() {
+        segments.last_mut().unwrap().0.push(token);
+    }
+    segments.retain(|(tokens, _)| !tokens.is_empty());
+    segments
+}
+
+fn executable_name(token: &str) -> String {
+    token
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or(token)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase()
+}
+
+fn first_non_option_arg(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(String::as_str)
+        .find(|arg| !arg.starts_with('-'))
+}
+
+fn no_test_execution_requested(name: &str, args: &[String]) -> bool {
+    let has = |flag: &str| args.iter().any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")));
+    match name {
+        "cargo" => has("--no-run") || has("--list"),
+        "pytest" | "python" | "python3" | "py" => has("--collect-only") || has("--co"),
+        "go" => has("-list"),
+        "dotnet" => has("--list-tests"),
+        "mvn" => args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-DskipTests" | "-DskipTests=true" | "-Dmaven.test.skip" | "-Dmaven.test.skip=true"
+            )
+        }),
+        "gradle" | "gradlew" => {
+            has("--dry-run") || args.windows(2).any(|w| {
+                matches!(w[0].as_str(), "-x" | "--exclude-task") && w[1] == "test"
+            })
+        }
+        "ctest" => has("-N") || has("--show-only"),
+        "jest" => has("--listTests"),
+        "vitest" => has("--list"),
+        _ => false,
+    }
+}
+
+fn is_test_invocation(tokens: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(token) = tokens.get(index) {
+        if token == "env" || token == "command" {
+            index += 1;
+            continue;
+        }
+        if token
+            .split_once('=')
+            .map(|(name, _)| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            })
+            .unwrap_or(false)
+        {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    let Some(executable) = tokens.get(index) else {
+        return false;
+    };
+    let args = &tokens[index + 1..];
+    let name = executable_name(executable);
+    if no_test_execution_requested(&name, args) {
+        return false;
+    }
+    // `cargo +nightly test` / `cargo +1.75 test`: cargo's own `--help`
+    // documents `Usage: cargo [+toolchain] [OPTIONS] [COMMAND]`. The selector
+    // does not start with `-`, so `first_non_option_arg` would otherwise treat
+    // it as the subcommand and miss the following `test`. This is cargo-only
+    // syntax; `+` has no such meaning for the other runners here.
+    let args: &[String] = if name == "cargo" {
+        match args.first() {
+            Some(a) if a.starts_with('+') => &args[1..],
+            _ => args,
+        }
+    } else {
+        args
+    };
+    let first = first_non_option_arg(args);
+
+    match name.as_str() {
+        "cargo" | "go" | "dotnet" | "mvn" | "gradle" | "gradlew" | "make" | "rake" | "mix" => {
+            first == Some("test")
+        }
+        "npm" | "yarn" | "pnpm" => {
+            first == Some("test") || (first == Some("run") && args.iter().any(|arg| arg == "test"))
+        }
+        "uv" => {
+            let Some(run) = args.iter().position(|arg| arg == "run") else {
+                return false;
+            };
+            is_test_invocation(&args[run + 1..])
+        }
+        "python" | "python3" | "py" => args
+            .windows(2)
+            .any(|window| window[0] == "-m" && matches!(window[1].as_str(), "pytest" | "unittest")),
+        "pytest" | "rspec" | "phpunit" | "vitest" | "jest" | "ctest" | "tox" | "unittest" => true,
+        _ => false,
+    }
+}
+
+/// Recognize a test invocation only when its status controls the shell result.
+/// Text that merely mentions a test command, masked failures, and pipelines
+/// are excluded so a successful wrapper cannot turn a failed test into a pass.
+fn is_test_command(cmd: &str) -> bool {
+    let segments = shell_command_segments(cmd);
+    let matches: Vec<usize> = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (tokens, _))| is_test_invocation(tokens).then_some(index))
+        .collect();
+    if matches.len() != 1 {
+        return false;
+    }
+    let test_index = matches[0];
+    if test_index != 0 {
+        return false;
+    }
+    segments[test_index + 1..].is_empty()
+}
+
+/// Parse the Claude Code transcript JSONL lines after `skip_lines`.
+///
+/// - Token usage is summed once per distinct assistant message id (one API
+///   message is serialized as one transcript line per content block, each
+///   repeating the same usage object).
+/// - `input_tokens` and `cache_creation_input_tokens` are collected separately;
+///   the caller decides how to combine them.
+/// - Test-like Bash `tool_use` blocks are matched to their `tool_result` by
+///   tool id; failure is only observable through `"is_error":true`.
+fn parse_claude_transcript_window(text: &str, skip_lines: usize) -> TranscriptWindow {
+    let mut w = TranscriptWindow::default();
+    let mut counted: BTreeSet<String> = BTreeSet::new();
+    let mut pending_tests: BTreeSet<String> = BTreeSet::new();
+
+    for line in text.lines().skip(skip_lines) {
+        if line.contains("\"type\":\"assistant\"") {
+            if w.model.is_empty() {
+                if let Some(m) = json_string_field(line, "model") {
+                    w.model = m;
+                }
+            }
+            if let Some(id) = extract_id_after(line, "\"id\":\"msg_") {
+                if counted.insert(id) {
+                    // Prefer the structural usage object (assistant content can
+                    // legitimately contain the literal string "usage").
+                    let upos = line
+                        .rfind("\"usage\":{\"input_tokens\"")
+                        .or_else(|| line.rfind("\"usage\""));
+                    if let Some(p) = upos {
+                        let u = &line[p..];
+                        w.seen = true;
+                        w.input_tokens += json_number_field(u, "input_tokens").unwrap_or(0.0);
+                        w.cache_creation_tokens +=
+                            json_number_field(u, "cache_creation_input_tokens").unwrap_or(0.0);
+                        w.cached_input_tokens +=
+                            json_number_field(u, "cache_read_input_tokens").unwrap_or(0.0);
+                        w.output_tokens += json_number_field(u, "output_tokens").unwrap_or(0.0);
+                    }
+                }
+            }
+            if line.contains("\"name\":\"Bash\"") {
+                if let Some(cmd) = json_string_field(line, "command") {
+                    if is_test_command(&cmd) {
+                        if let Some(tid) = extract_id_after(line, "\"id\":\"toolu_") {
+                            pending_tests.insert(format!("toolu_{tid}"));
+                        }
+                    }
+                }
+            }
+        } else if line.contains("\"tool_use_id\":\"") {
+            if let Some(tid) = extract_id_after(line, "\"tool_use_id\":\"") {
+                if pending_tests.contains(&tid) {
+                    let failed = line.contains("\"is_error\":true")
+                        || line.contains("\"is_error\": true");
+                    w.verification = Some(!failed);
+                }
+            }
+        }
+    }
+    w
+}
+
+/// Best-effort scan of a Codex transcript window for test-command outcomes.
+///
+/// Verified against a real `~/.codex/sessions/**/rollout-*.jsonl` file: a
+/// completed shell command is a single `event_msg` / `item_completed` line
+/// whose `payload.item.type` is `"CommandExecution"`, carrying `command` (an
+/// argv array — `["/bin/bash", "-lc", "<shell text>"]`, not a plain string),
+/// `exit_code`, and `id`, all on that one line. Command and result are never
+/// split across lines in this format, so matching only within one line — never
+/// via a flag carried over from an earlier line — cannot misattribute one
+/// command's result to another, even when Codex logs commands in parallel.
+/// `codex exec --json`'s flat `{"command":"...","exit_code":N}` shape is also
+/// accepted, as a fallback for older or differently-shaped output, under the
+/// same same-line-only rule. Codex documents that this format is not a stable
+/// interface, so an unrecognized line is simply skipped rather than guessed at.
+fn scan_codex_window_for_tests(text: &str, skip_lines: usize) -> Option<bool> {
+    let mut result = None;
+    for line in text.lines().skip(skip_lines) {
+        let cmd = json_string_array_last(line, "command").or_else(|| json_string_field(line, "command"));
+        let Some(cmd) = cmd else { continue };
+        if !is_test_command(&cmd) {
+            continue;
+        }
+        if let Some(code) = json_number_field(line, "exit_code") {
+            result = Some(code == 0.0);
+        }
+    }
+    result
+}
+
+/// Carry the latest verification outcome across turns of a session, then
+/// derive the objective success value for a row.
+///
+/// Success semantics (documented in docs/metrics/MEASUREMENT_ARCHITECTURE.*):
+/// commit reached + last verification pass => "yes";
+/// commit reached + last verification fail => "no";
+/// otherwise => "unknown".
+fn update_and_resolve_success(
+    agent: &str,
+    session: &str,
+    window_verification: Option<bool>,
+    committed: bool,
+    task_head: &str,
+) -> String {
+    let vpath = verif_path(agent, session);
+    if let Some(pass) = window_verification {
+        if committed {
+            remove_verification_state(&vpath);
+            return (if pass { "yes" } else { "no" }).into();
+        }
+        let content = verification_state_content(pass, task_head);
+        if let Err(e) = write_verification_state(&vpath, &content) {
+            eprintln!("SENTRITH-WARN: could not persist verification state at {}: {e}", vpath.display());
+            return "unknown".into();
+        }
+    }
+    let carried = read_regular_file_no_follow(&vpath)
+        .and_then(|content| verification_for_head(&content, task_head));
+    let success = if committed {
+        match carried {
+            Some(true) => "yes",
+            Some(false) => "no",
+            _ => "unknown",
+        }
+    } else {
+        "unknown"
+    };
+    if committed {
+        remove_verification_state(&vpath);
+    }
+    success.to_string()
+}
+
+fn remove_live_state_file(path: &Path) {
+    if path.is_absolute() {
+        eprintln!(
+            "SENTRITH-WARN: refusing to remove absolute live-state path {}",
+            path.display()
+        );
+        return;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "SENTRITH-WARN: could not inspect live state at {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    }
+    if let Err(e) = ancestors_are_real_directories(Path::new(""), path) {
+        eprintln!(
+            "SENTRITH-WARN: could not safely remove live state at {}: {e}",
+            path.display()
+        );
+        return;
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "SENTRITH-WARN: could not remove live state at {}: {e}",
+            path.display()
+        ),
+    }
+}
+
+fn remove_verification_state(path: &Path) {
+    remove_live_state_file(path);
 }
 
 fn usage_claude_status(_args: &[String]) -> Result<(), String> {
@@ -1153,66 +5211,161 @@ fn usage_hook(args: &[String]) -> Result<(), String> {
 
 fn usage_hook_claude(args: &[String]) -> Result<(), String> {
     let (opts, _) = parse_options(args)?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
     let input = read_stdin_all()?;
     let event = json_string_field(&input, "hook_event_name").unwrap_or_default();
     let session = json_string_field(&input, "session_id").unwrap_or_else(|| "unknown".into());
+    let transcript = json_string_field(&input, "transcript_path").unwrap_or_default();
 
     if event == "UserPromptSubmit" {
         let prompt = json_string_field(&input, "prompt").unwrap_or_else(|| "Claude turn".into());
         let snap = read_kv(&snapshot_path("claude", &session));
+        let transcript_boundary = read_transcript_boundary(&transcript);
+        let transcript_lines = transcript_boundary
+            .as_ref()
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
         write_kv(&task_path("claude", &session), &[
             ("phase", phase),
             ("task", prompt.chars().take(160).collect()),
             ("start_cost", snap.get("cost_usd").cloned().unwrap_or_else(|| "0".into())),
             ("start_duration_ms", snap.get("duration_ms").cloned().unwrap_or_else(|| "0".into())),
             ("model", snap.get("model").cloned().unwrap_or_default()),
+            ("transcript", transcript),
+            ("transcript_lines", transcript_lines.to_string()),
+            ("transcript_boundary", if transcript_boundary.is_some() { "ready" } else { "unavailable" }.into()),
+            ("start_head", git_head()),
         ])?;
     } else if event == "Stop" {
         let task = read_kv(&task_path("claude", &session));
+        if task.is_empty() {
+            return Ok(());
+        }
         let snap = read_kv(&snapshot_path("claude", &session));
-        if !task.is_empty() && !snap.is_empty() {
+
+        let tp = task
+            .get("transcript")
+            .cloned()
+            .filter(|x| !x.is_empty())
+            .unwrap_or(transcript);
+        let transcript_boundary_ready = task
+            .get("transcript_boundary")
+            .map(|s| s == "ready")
+            .unwrap_or(false);
+        let skip: usize = task
+            .get("transcript_lines")
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0);
+        let window = if tp.is_empty() || !transcript_boundary_ready {
+            TranscriptWindow::default()
+        } else {
+            fs::read_to_string(&tp)
+                .map(|s| parse_claude_transcript_window(&s, skip))
+                .unwrap_or_default()
+        };
+
+        let start_head = task.get("start_head").cloned().unwrap_or_default();
+        let head = git_head();
+        let committed = commit_reached(&start_head, &head);
+        let success = update_and_resolve_success(
+            "claude",
+            &session,
+            window.verification,
+            committed,
+            &start_head,
+        );
+
+        // statusLine snapshot stays as the cost/duration fallback; it may lag
+        // the turn end, which is why tokens now come from the transcript.
+        let cost = if snap.is_empty() {
+            None
+        } else {
             let sc: f64 = task.get("start_cost").and_then(|x| x.parse().ok()).unwrap_or(0.0);
             let ec: f64 = snap.get("cost_usd").and_then(|x| x.parse().ok()).unwrap_or(sc);
+            Some((ec - sc).max(0.0))
+        };
+        let duration = if snap.is_empty() {
+            None
+        } else {
             let sd: f64 = task.get("start_duration_ms").and_then(|x| x.parse().ok()).unwrap_or(0.0);
             let ed: f64 = snap.get("duration_ms").and_then(|x| x.parse().ok()).unwrap_or(sd);
-            let u = AutoUsage {
-                agent: "claude".into(),
-                model: task.get("model").cloned().unwrap_or_default(),
-                phase: task.get("phase").cloned().unwrap_or_else(|| "standard".into()),
-                task: task.get("task").cloned().unwrap_or_else(|| "Claude turn".into()),
-                cost_usd: Some((ec-sc).max(0.0)),
-                duration_seconds: Some(((ed-sd)/1000.0).max(0.0)),
-                source: "claude-statusline-hooks".into(),
-                session_id: session.clone(),
-                notes: "Estimated session-cost delta from official Claude Code statusLine JSON.".into(),
-                ..Default::default()
-            };
-            append_auto_usage(&file, &u)?;
-            let _ = fs::remove_file(task_path("claude", &session));
-        }
+            Some(((ed - sd) / 1000.0).max(0.0))
+        };
+
+        let u = AutoUsage {
+            agent: "claude".into(),
+            model: if !window.model.is_empty() {
+                window.model.clone()
+            } else {
+                task.get("model").cloned().unwrap_or_default()
+            },
+            phase: task.get("phase").cloned().unwrap_or_else(|| "standard".into()),
+            task: task.get("task").cloned().unwrap_or_else(|| "Claude turn".into()),
+            // input includes cache-writes; cache reads are reported separately.
+            input_tokens: if window.seen {
+                Some(window.input_tokens + window.cache_creation_tokens)
+            } else {
+                None
+            },
+            cached_input_tokens: if window.seen { Some(window.cached_input_tokens) } else { None },
+            output_tokens: if window.seen { Some(window.output_tokens) } else { None },
+            cost_usd: cost,
+            duration_seconds: duration,
+            success,
+            source: if window.seen {
+                "claude-transcript-hooks".into()
+            } else {
+                "claude-statusline-hooks".into()
+            },
+            session_id: session.clone(),
+            notes: if window.seen {
+                "Tokens summed from transcript window (input includes cache creation); cost is statusLine session delta when available. Transcript format is not a stable vendor contract.".into()
+            } else {
+                "Transcript unavailable; estimated session-cost delta from statusLine JSON only.".into()
+            },
+            // Recorded only when this turn actually produced a commit, so a
+            // non-empty value means "this turn closed a task". Storing HEAD
+            // unconditionally could not distinguish a first turn that
+            // committed from one that merely inherited an existing HEAD.
+            head_sha: if committed { head } else { String::new() },
+            verification: match window.verification {
+                Some(true) => "pass".into(),
+                Some(false) => "fail".into(),
+                None => String::new(),
+            },
+            ..Default::default()
+        };
+        append_auto_usage(&file, &u)?;
+        remove_live_state_file(&task_path("claude", &session));
     }
     Ok(())
 }
 
-fn latest_token_usage_from_codex_transcript(path: &Path) -> (Option<f64>,Option<f64>,Option<f64>) {
-    let Ok(s) = fs::read_to_string(path) else { return (None,None,None); };
-    let mut last = (None,None,None);
+fn latest_token_usage_from_codex_text(s: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let mut last = (None, None, None);
     for line in s.lines() {
         if line.contains("token_count") || line.contains("total_token_usage") || line.contains("\"usage\"") {
             let i = json_number_field(line, "input_tokens");
             let c = json_number_field(line, "cached_input_tokens");
             let o = json_number_field(line, "output_tokens");
-            if i.is_some() || c.is_some() || o.is_some() { last=(i,c,o); }
+            if i.is_some() || c.is_some() || o.is_some() {
+                last = (i, c, o);
+            }
         }
     }
     last
 }
 
+fn latest_token_usage_from_codex_transcript(path: &Path) -> (Option<f64>, Option<f64>, Option<f64>) {
+    fs::read_to_string(path)
+        .map(|s| latest_token_usage_from_codex_text(&s))
+        .unwrap_or((None, None, None))
+}
+
 fn usage_hook_codex(args: &[String]) -> Result<(), String> {
     let (opts, _) = parse_options(args)?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
     let input = read_stdin_all()?;
     let event = json_string_field(&input, "hook_event_name").unwrap_or_default();
@@ -1222,12 +5375,23 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
 
     if event == "UserPromptSubmit" {
         let prompt = json_string_field(&input, "prompt").unwrap_or_else(|| "Codex turn".into());
-        let (i,c,o) = if transcript.is_empty() {(None,None,None)} else {latest_token_usage_from_codex_transcript(Path::new(&transcript))};
+        let transcript_boundary = read_transcript_boundary(&transcript);
+        let (i, c, o) = transcript_boundary
+            .as_deref()
+            .map(latest_token_usage_from_codex_text)
+            .unwrap_or((None, None, None));
+        let transcript_lines = transcript_boundary
+            .as_ref()
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
         write_kv(&task_path("codex", &session), &[
             ("phase", phase),
             ("task", prompt.chars().take(160).collect()),
             ("model", model),
             ("transcript", transcript),
+            ("transcript_lines", transcript_lines.to_string()),
+            ("transcript_boundary", if transcript_boundary.is_some() { "ready" } else { "unavailable" }.into()),
+            ("start_head", git_head()),
             ("start_input", num_cell(i)),
             ("start_cached", num_cell(c)),
             ("start_output", num_cell(o)),
@@ -1235,10 +5399,42 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
     } else if event == "Stop" {
         let task = read_kv(&task_path("codex", &session));
         if !task.is_empty() {
-            let tp = task.get("transcript").cloned().unwrap_or(transcript);
-            let (ei,ec,eo) = if tp.is_empty() {(None,None,None)} else {latest_token_usage_from_codex_transcript(Path::new(&tp))};
+            let tp = task
+                .get("transcript")
+                .cloned()
+                .filter(|x| !x.is_empty())
+                .unwrap_or(transcript);
+            let transcript_boundary_ready = task
+                .get("transcript_boundary")
+                .map(|s| s == "ready")
+                .unwrap_or(false);
+            let (ei, ec, eo) = if tp.is_empty() || !transcript_boundary_ready {
+                (None, None, None)
+            } else {
+                latest_token_usage_from_codex_transcript(Path::new(&tp))
+            };
             let parse = |k:&str| task.get(k).and_then(|x| x.parse::<f64>().ok());
             let delta = |end:Option<f64>, start:Option<f64>| match (end,start) {(Some(e),Some(s))=>Some((e-s).max(0.0)),(Some(e),None)=>Some(e),_=>None};
+
+            let skip: usize = task.get("transcript_lines").and_then(|x| x.parse().ok()).unwrap_or(0);
+            let verification = if tp.is_empty() || !transcript_boundary_ready {
+                None
+            } else {
+                fs::read_to_string(&tp)
+                    .ok()
+                    .and_then(|s| scan_codex_window_for_tests(&s, skip))
+            };
+            let start_head = task.get("start_head").cloned().unwrap_or_default();
+            let head = git_head();
+            let committed = commit_reached(&start_head, &head);
+            let success = update_and_resolve_success(
+                "codex",
+                &session,
+                verification,
+                committed,
+                &start_head,
+            );
+
             let u = AutoUsage {
                 agent: "codex".into(),
                 model: task.get("model").cloned().unwrap_or_default(),
@@ -1247,13 +5443,20 @@ fn usage_hook_codex(args: &[String]) -> Result<(), String> {
                 input_tokens: delta(ei, parse("start_input")),
                 cached_input_tokens: delta(ec, parse("start_cached")),
                 output_tokens: delta(eo, parse("start_output")),
+                success,
                 source: "codex-hook-transcript-best-effort".into(),
                 session_id: session.clone(),
                 notes: "Best-effort interactive capture: Codex documents transcript_path but warns transcript format is not a stable hook interface. Prefer usage run codex for stable JSON usage.".into(),
+                head_sha: if committed { head } else { String::new() },
+                verification: match verification {
+                    Some(true) => "pass".into(),
+                    Some(false) => "fail".into(),
+                    None => String::new(),
+                },
                 ..Default::default()
             };
             append_auto_usage(&file, &u)?;
-            let _ = fs::remove_file(task_path("codex", &session));
+            remove_live_state_file(&task_path("codex", &session));
         }
     }
     Ok(())
@@ -1342,7 +5545,7 @@ fn usage_task_start(args: &[String]) -> Result<(), String> {
     let (opts, _) = parse_options(args)?;
     let agent = require(&opts, "agent")?;
     let task = require(&opts, "task")?;
-    let phase = opts.get("phase").cloned().unwrap_or_else(|| "standard".into());
+    let phase = resolve_phase(opts.get("phase").map(String::as_str));
     let model = opts.get("model").cloned().unwrap_or_default();
     let category = opts.get("category").cloned().unwrap_or_else(|| "unspecified".into());
 
@@ -1451,10 +5654,23 @@ fn metric_sum(rows: &[&BTreeMap<String,String>], metric: &str) -> Option<f64> {
     }
 }
 
+/// Usage per successful *task*. Counting successful rows would divide by the
+/// number of turns, not the number of tasks.
+fn metric_per_success_for_tasks(
+    tasks: &[Vec<&BTreeMap<String, String>>],
+    metric: &str,
+) -> Option<f64> {
+    let successes = tasks.iter().filter(|t| task_success(t) == "yes").count();
+    if successes == 0 {
+        return None;
+    }
+    let rows: Vec<&BTreeMap<String, String>> =
+        tasks.iter().flat_map(|task| task.iter().copied()).collect();
+    metric_sum(&rows, metric).map(|v| v / successes as f64)
+}
+
 fn metric_per_success(rows: &[&BTreeMap<String,String>], metric: &str) -> Option<f64> {
-    let successes = rows.iter().filter(|r| r.get("success").map(String::as_str) == Some("yes")).count();
-    if successes == 0 { return None; }
-    metric_sum(rows, metric).map(|v| v / successes as f64)
+    metric_per_success_for_tasks(&group_tasks(rows), metric)
 }
 
 fn json_escape(s: &str) -> String {
@@ -1466,13 +5682,20 @@ fn usage_contribute(args: &[String]) -> Result<(), String> {
     let agent = require(&opts, "agent")?;
     let model = opts.get("model").map(String::as_str);
     let file = opts.get("file").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".ai-usage/usage.csv"));
-    let rows = load_usage_rows(&file, Some(agent), model)?;
-    let baseline: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str)==Some("baseline")).collect();
-    let standard: Vec<_> = rows.iter().filter(|r| r.get("phase").map(String::as_str)==Some("standard")).collect();
+    let rows = load_usage_rows(&file, Some(agent))?;
+    let refs: Vec<&BTreeMap<String, String>> = rows.iter().collect();
+    let tasks = filter_tasks_by_model(group_tasks(&refs), model);
+    let by_phase = tasks_by_phase_from_tasks(tasks);
+    let baseline_tasks = by_phase.get("baseline").map(Vec::as_slice).unwrap_or(&[]);
+    let standard_tasks = by_phase.get("standard").map(Vec::as_slice).unwrap_or(&[]);
+
+    // Qualification counts tasks, not captured turns.
+    let baseline_task_count = baseline_tasks.len();
+    let standard_task_count = standard_tasks.len();
 
     let min_samples: usize = opts.get("min-samples").and_then(|x| x.parse().ok()).unwrap_or(10);
-    if !opts.contains_key("force") && (baseline.len() < min_samples || standard.len() < min_samples) {
-        return Err(format!("contribution needs at least {min_samples}+{min_samples} baseline/standard tasks; got {}+{}. Use --force only for experimental data.", baseline.len(), standard.len()));
+    if !opts.contains_key("force") && (baseline_task_count < min_samples || standard_task_count < min_samples) {
+        return Err(format!("contribution needs at least {min_samples}+{min_samples} baseline/standard tasks; got {baseline_task_count}+{standard_task_count}. Use --force only for experimental data."));
     }
 
     let requested = opts.get("metric").map(String::as_str).unwrap_or("auto");
@@ -1483,20 +5706,20 @@ fn usage_contribute(args: &[String]) -> Result<(), String> {
     };
     let mut chosen = None;
     for m in candidates {
-        if metric_per_success(&baseline, m).is_some() && metric_per_success(&standard, m).is_some() {
+        if metric_per_success_for_tasks(baseline_tasks, m).is_some()
+            && metric_per_success_for_tasks(standard_tasks, m).is_some()
+        {
             chosen = Some(m);
             break;
         }
     }
     let metric = chosen.ok_or("no comparable usage metric found in both baseline and standard")?;
-    let bps = metric_per_success(&baseline, metric).unwrap();
-    let sps = metric_per_success(&standard, metric).unwrap();
+    let bps = metric_per_success_for_tasks(baseline_tasks, metric).unwrap();
+    let sps = metric_per_success_for_tasks(standard_tasks, metric).unwrap();
     let change = if bps != 0.0 { (sps-bps)/bps*100.0 } else { 0.0 };
-    let bs = baseline.iter().filter(|r| r.get("success").map(String::as_str)==Some("yes")).count();
-    let ss = standard.iter().filter(|r| r.get("success").map(String::as_str)==Some("yes")).count();
-    let bsr = if baseline.is_empty(){0.0}else{bs as f64/baseline.len() as f64*100.0};
-    let ssr = if standard.is_empty(){0.0}else{ss as f64/standard.len() as f64*100.0};
-    let quality = if baseline.len() >= 10 && standard.len() >= 10 { "qualified" } else { "experimental" };
+    let bsr = decided_success_rate(baseline_tasks).unwrap_or(0.0);
+    let ssr = decided_success_rate(standard_tasks).unwrap_or(0.0);
+    let quality = if baseline_task_count >= 10 && standard_task_count >= 10 { "qualified" } else { "experimental" };
     let model_name = model.unwrap_or("mixed/unspecified");
     let id = format!("{}-{}-{}", agent, now_unix(), std::process::id());
     let out = opts.get("out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("docs/metrics/contributions/{id}.json")));
@@ -1527,8 +5750,8 @@ r#"{{
         json_escape(model_name),
         quality,
         metric,
-        baseline.len(),
-        standard.len(),
+        baseline_task_count,
+        standard_task_count,
         bsr,
         ssr,
         bps,
@@ -1635,5 +5858,2748 @@ mod tests {
     #[test]
     fn pct_change_formats() {
         assert_eq!(pct_text(Some(100.0), Some(75.0)), "-25.0%");
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = env::temp_dir().join(format!(
+            "sentrith-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    fn relative_usage_test_path(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        PathBuf::from(".ai-usage").join(format!(
+            "sentrith-test-{name}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    /// Root bypasses Unix access checks entirely, so any test that simulates
+    /// a permission-based failure (a read-only directory blocking a rename
+    /// or delete) cannot actually produce that failure under root -- the
+    /// operation just succeeds, and asserting on the simulated failure fails
+    /// for a reason unrelated to the behavior under test. Shared by every
+    /// such test so the guard isn't duplicated (or, as happened once
+    /// already, forgotten) at each new call site.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        unsafe { geteuid() == 0 }
+    }
+
+    fn assistant_line(msg_id: &str, input: u64, cache_read: u64, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"model":"claude-fable-5","id":"{msg_id}","type":"message","role":"assistant","content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":{input},"cache_creation_input_tokens":0,"cache_read_input_tokens":{cache_read},"output_tokens":{output},"output_tokens_details":{{"thinking_tokens":1}}}}}}}}"#
+        )
+    }
+
+    fn bash_line(msg_id: &str, tool_id: &str, command: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"model":"claude-fable-5","id":"{msg_id}","type":"message","role":"assistant","content":[{{"type":"tool_use","id":"{tool_id}","name":"Bash","input":{{"command":"{command}","description":"run"}}}}],"usage":{{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}}}}"#
+        )
+    }
+
+    fn tool_result_line(tool_id: &str, is_error: bool) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"tool_use_id":"{tool_id}","type":"tool_result","content":"output","is_error":{is_error}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn transcript_window_sums_tokens_once_per_message_id() {
+        // One API message is serialized as several transcript lines that all
+        // repeat the same usage object; it must be counted once.
+        let text = [
+            assistant_line("msg_old", 999, 999, 999),
+            assistant_line("msg_a", 10, 100, 5),
+            assistant_line("msg_a", 10, 100, 5),
+            assistant_line("msg_b", 20, 200, 7),
+        ]
+        .join("\n");
+
+        let w = parse_claude_transcript_window(&text, 1);
+        assert!(w.seen);
+        assert_eq!(w.input_tokens, 30.0);
+        assert_eq!(w.cached_input_tokens, 300.0);
+        assert_eq!(w.output_tokens, 12.0);
+        assert_eq!(w.model, "claude-fable-5");
+    }
+
+    #[test]
+    fn transcript_window_skips_lines_before_the_turn() {
+        let text = [
+            assistant_line("msg_before", 500, 500, 500),
+            assistant_line("msg_after", 1, 2, 3),
+        ]
+        .join("\n");
+
+        let w = parse_claude_transcript_window(&text, 1);
+        assert_eq!(w.input_tokens, 1.0);
+        assert_eq!(w.output_tokens, 3.0);
+    }
+
+    #[test]
+    fn transcript_window_detects_test_failure_then_pass() {
+        let text = [
+            bash_line("msg_1", "toolu_fail", "cargo test --manifest-path x"),
+            tool_result_line("toolu_fail", true),
+            bash_line("msg_2", "toolu_pass", "cargo test --manifest-path x"),
+            tool_result_line("toolu_pass", false),
+        ]
+        .join("\n");
+
+        assert_eq!(parse_claude_transcript_window(&text, 0).verification, Some(true));
+
+        let only_failure = [
+            bash_line("msg_1", "toolu_fail", "pytest -q"),
+            tool_result_line("toolu_fail", true),
+        ]
+        .join("\n");
+        assert_eq!(
+            parse_claude_transcript_window(&only_failure, 0).verification,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn non_test_commands_do_not_set_verification() {
+        let text = [
+            bash_line("msg_1", "toolu_ls", "ls -la"),
+            tool_result_line("toolu_ls", false),
+        ]
+        .join("\n");
+        assert_eq!(parse_claude_transcript_window(&text, 0).verification, None);
+    }
+
+    #[test]
+    fn test_command_matching_respects_word_boundaries() {
+        assert!(is_test_command("cargo test --manifest-path tools/sentrith/Cargo.toml"));
+        assert!(is_test_command("uv run pytest tests/"));
+        assert!(is_test_command("npm test"));
+        assert!(!is_test_command("git log --oneline"));
+        // `contest` must not match `go test`, `pytest-cov` must not match bare `pytest`
+        assert!(!is_test_command("echo pytestcov"));
+        assert!(!is_test_command("cargo testbench"));
+        assert!(!is_test_command(r#"echo "cargo test""#));
+        assert!(!is_test_command(r#"rg "cargo test" docs"#));
+        assert!(is_test_command("env CI=1 cargo test"));
+        assert!(is_test_command(r#""/opt/project/bin/cargo" test"#));
+        assert!(!is_test_command("cd tools && cargo test"));
+        assert!(!is_test_command("cd tools\ncargo test"));
+        assert!(!is_test_command("cargo fmt --check && cargo test"));
+        assert!(!is_test_command("cargo test && echo done"));
+        assert!(!is_test_command("cargo test || true"));
+        assert!(!is_test_command("cargo test; echo done"));
+        assert!(!is_test_command("cargo test | tee test.log"));
+        assert!(!is_test_command("cargo test --no-run"));
+        assert!(!is_test_command("cargo test --no-run"));
+        assert!(!is_test_command("cargo test -- --list"));
+        // cargo's `Usage: cargo [+toolchain] [OPTIONS] [COMMAND]`: `+nightly`
+        // does not start with `-`, so it must be stripped explicitly or it is
+        // mistaken for the subcommand and the following `test` is missed.
+        assert!(is_test_command("cargo +nightly test"));
+        assert!(is_test_command("cargo +stable test --workspace"));
+        assert!(is_test_command("cargo +1.75.0 test"));
+        assert!(!is_test_command("cargo +nightly test --no-run"));
+        assert!(!is_test_command("cargo +nightly build"));
+        // `+` has no such meaning for other runners; it must not be stripped
+        // there, so this stays unrecognized rather than false-positive.
+        assert!(!is_test_command("npm +nightly test"));
+        assert!(!is_test_command("pytest --collect-only"));
+        assert!(!is_test_command("python -m pytest --collect-only"));
+        assert!(!is_test_command("go test -list ."));
+        assert!(!is_test_command("dotnet test --list-tests"));
+    }
+
+    #[test]
+    fn codex_window_matches_command_and_result_on_the_same_line_only() {
+        let same_line = r#"{"command":"cargo test","exit_code":0}"#;
+        assert_eq!(scan_codex_window_for_tests(same_line, 0), Some(true));
+
+        // A result on a later line is intentionally no longer attributed to an
+        // earlier command; see
+        // `codex_command_result_is_never_borrowed_from_a_different_line` for
+        // why cross-line matching was removed rather than merely narrowed.
+        let split = [
+            r#"{"type":"exec","command":"pytest -q"}"#,
+            r#"{"type":"exec_result","exit_code":1}"#,
+        ]
+        .join("\n");
+        assert_eq!(scan_codex_window_for_tests(&split, 0), None);
+
+        let unrelated = r#"{"command":"ls","exit_code":1}"#;
+        assert_eq!(scan_codex_window_for_tests(unrelated, 0), None);
+
+        let multiline = r#"{"command":"cd tools\ncargo test","exit_code":0}"#;
+        assert_eq!(scan_codex_window_for_tests(multiline, 0), None);
+    }
+
+    #[test]
+    fn codex_window_reads_the_real_command_execution_shape() {
+        // Structure verified against a real `~/.codex/sessions/**/rollout-
+        // *.jsonl` file: `command` is an argv array, not a plain string, and
+        // `exit_code` sits in the same object.
+        let passing = r#"{"payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-1","command":["/bin/bash","-lc","cargo test"],"exit_code":0,"status":"completed"}}}"#;
+        assert_eq!(scan_codex_window_for_tests(passing, 0), Some(true));
+
+        let failing = r#"{"payload":{"item":{"type":"CommandExecution","command":["/bin/bash","-lc","pytest -q"],"exit_code":1}}}"#;
+        assert_eq!(scan_codex_window_for_tests(failing, 0), Some(false));
+
+        let non_test = r#"{"payload":{"item":{"type":"CommandExecution","command":["/bin/bash","-lc","ls -la"],"exit_code":0}}}"#;
+        assert_eq!(scan_codex_window_for_tests(non_test, 0), None);
+    }
+
+    #[test]
+    fn codex_command_result_is_never_borrowed_from_a_different_line() {
+        // Codex can log commands in parallel, so a later line's exit_code may
+        // belong to a different, unrelated command. Same-line-only matching
+        // must not attribute it to an earlier test command that had none of
+        // its own, rather than guessing via a flag carried over from that
+        // earlier line.
+        let interleaved = [
+            r#"{"command":"cargo test"}"#,
+            r#"{"command":"ls","exit_code":0}"#,
+        ]
+        .join("
+");
+        assert_eq!(
+            scan_codex_window_for_tests(&interleaved, 0),
+            None,
+            "must not borrow ls's exit code for cargo test"
+        );
+
+        let interleaved_real_shape = [
+            r#"{"payload":{"item":{"type":"CommandExecution","command":["/bin/bash","-lc","cargo test"]}}}"#,
+            r#"{"payload":{"item":{"type":"CommandExecution","command":["/bin/bash","-lc","ls"],"exit_code":0}}}"#,
+        ]
+        .join("
+");
+        assert_eq!(scan_codex_window_for_tests(&interleaved_real_shape, 0), None);
+    }
+
+    #[test]
+    fn json_string_array_last_reads_the_final_element() {
+        assert_eq!(
+            json_string_array_last(r#"{"command":["/bin/bash","-lc","cargo test"]}"#, "command"),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(json_string_array_last(r#"{"command":[]}"#, "command"), None);
+        assert_eq!(json_string_array_last(r#"{"command":"cargo test"}"#, "command"), None);
+    }
+
+    #[test]
+    fn transcript_boundary_read_failure_is_not_an_empty_transcript() {
+        let missing = temp_path("missing-transcript.jsonl");
+        assert!(read_transcript_boundary(missing.to_str().unwrap()).is_none());
+
+        let present = temp_path("present-transcript.jsonl");
+        fs::write(&present, "before\n").unwrap();
+        assert_eq!(
+            read_transcript_boundary(present.to_str().unwrap()),
+            Some("before\n".into())
+        );
+    }
+
+    #[test]
+    fn usage_lock_waits_for_an_os_owned_lock() {
+        let path = temp_path("usage.csv");
+        let lock = path.with_extension("csv.lock");
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock)
+            .unwrap();
+        holder.try_lock().unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            with_usage_file_lock(&worker_path, || {
+                entered_tx.send(()).unwrap();
+                Ok(())
+            })
+        });
+
+        assert!(
+            entered_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a held OS lock must keep another writer out"
+        );
+        drop(holder);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the waiter should enter after the lock is released");
+        worker.join().unwrap().unwrap();
+        let _ = fs::remove_file(lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_lock_refuses_symlink_without_touching_target() {
+        let path = temp_path("usage.csv");
+        let lock = path.with_extension("csv.lock");
+        let victim = temp_path("usage-lock-victim.txt");
+        fs::write(&victim, "victim-content").unwrap();
+        std::os::unix::fs::symlink(&victim, &lock).unwrap();
+
+        let result = with_usage_file_lock(&path, || Ok(()));
+        assert!(result.is_err(), "a symlinked lock path must be rejected");
+        assert_eq!(read_text(&victim), "victim-content");
+        assert!(lock.is_symlink(), "the rejected symlink must remain untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_ledger_refuses_symlink_without_touching_target() {
+        let path = temp_path("usage.csv");
+        let victim = temp_path("usage-victim.txt");
+        fs::write(&victim, "victim-content").unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let usage = AutoUsage {
+            agent: "claude".into(),
+            task: "symlink-ledger".into(),
+            ..Default::default()
+        };
+        let result = append_auto_usage(&path, &usage);
+        assert!(result.is_err(), "a symlinked usage ledger must be rejected");
+        assert_eq!(read_text(&victim), "victim-content");
+        assert!(path.is_symlink(), "the rejected symlink must remain untouched");
+    }
+
+    #[test]
+    fn v1_usage_file_migrates_to_v2_preserving_rows() {
+        let path = temp_path("usage.csv");
+        let v1_row = "1,claude,m,standard,\"task, with comma\",1,2,3,,,,,yes,0,manual,sess,note";
+        fs::write(&path, format!("{}{}\n", USAGE_HEADER_V1, v1_row)).unwrap();
+
+        ensure_usage_file(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next().unwrap(), USAGE_HEADER.trim_end());
+        let cols = parse_csv_line(lines.next().unwrap());
+        assert_eq!(cols.len(), USAGE_HEADER.trim_end().split(',').count());
+        assert_eq!(cols[4], "task, with comma");
+        assert_eq!(cols[12], "yes");
+        assert_eq!(cols[17], "");
+        assert_eq!(cols[18], "");
+
+        // Migration must be idempotent.
+        ensure_usage_file(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn preexisting_unlocked_usage_lock_file_is_reused() {
+        let path = temp_path("usage.csv");
+        let lock = path.with_extension("csv.lock");
+        fs::write(&lock, "pid=999999\ncreated=0\n").unwrap();
+
+        with_usage_file_lock(&path, || Ok(())).unwrap();
+
+        assert!(lock.exists(), "the persistent lock file must remain for safe reuse");
+        let _ = fs::remove_file(lock);
+    }
+
+    #[test]
+    fn concurrent_first_appends_preserve_migrated_rows() {
+        let path = temp_path("usage.csv");
+        fs::write(&path, USAGE_HEADER_V1).unwrap();
+
+        let first_path = path.clone();
+        let first = thread::spawn(move || {
+            let usage = AutoUsage {
+                agent: "codex".into(),
+                task: "first".into(),
+                ..Default::default()
+            };
+            append_auto_usage(&first_path, &usage)
+        });
+        let second_path = path.clone();
+        let second = thread::spawn(move || {
+            let usage = AutoUsage {
+                agent: "codex".into(),
+                task: "second".into(),
+                ..Default::default()
+            };
+            append_auto_usage(&second_path, &usage)
+        });
+
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 3, "v2 header plus both appended rows");
+        assert!(text.lines().any(|line| line.contains(",first,")));
+        assert!(text.lines().any(|line| line.contains(",second,")));
+    }
+
+    #[test]
+    fn csv_records_survive_newlines_inside_quoted_fields() {
+        let text = "a,b\n\"line one\nline two\",x\n\"has \"\"quote\"\" and\nnewline\",y\n";
+        let records = split_csv_records(text);
+        assert_eq!(records.len(), 3, "one header plus two logical records");
+        assert_eq!(parse_csv_line(&records[1]), vec!["line one\nline two", "x"]);
+        assert_eq!(
+            parse_csv_line(&records[2]),
+            vec!["has \"quote\" and\nnewline", "y"]
+        );
+
+        // CRLF files must split the same way.
+        let crlf = "a,b\r\n\"one\r\ntwo\",x\r\n";
+        assert_eq!(split_csv_records(crlf).len(), 2);
+    }
+
+    #[test]
+    fn migration_does_not_corrupt_multiline_fields() {
+        // `csv_escape` quotes embedded newlines, so a v1 row can span physical
+        // lines. Appending columns per line would inject commas into the field.
+        let path = temp_path("usage.csv");
+        let v1_row = "1,claude,m,standard,\"first line\nsecond line\",1,2,3,,,,,yes,0,manual,sess,note";
+        fs::write(&path, format!("{}{}\n", USAGE_HEADER_V1, v1_row)).unwrap();
+
+        ensure_usage_file(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let records = split_csv_records(&text);
+        assert_eq!(records[0], USAGE_HEADER.trim_end());
+        let cols = parse_csv_line(&records[1]);
+        assert_eq!(
+            cols[4], "first line\nsecond line",
+            "the multiline field must be unchanged"
+        );
+        assert_eq!(cols.len(), USAGE_HEADER.trim_end().split(',').count());
+        assert_eq!(cols[17], "");
+        assert_eq!(cols[18], "");
+    }
+
+    #[test]
+    fn phase_comparison_is_per_task_not_per_turn() {
+        // Codex's repro: a three-turn baseline task and a one-turn standard
+        // task, each totaling 30 tokens. Per-turn averaging would report
+        // 10 vs 30; per task they are equal.
+        let baseline_owned = vec![
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "aaa", "yes", "10"),
+        ];
+        let standard_owned = vec![turn("s2", "bbb", "yes", "30")];
+
+        let baseline: Vec<&BTreeMap<String, String>> = baseline_owned.iter().collect();
+        let standard: Vec<&BTreeMap<String, String>> = standard_owned.iter().collect();
+
+        let b = phase_summary(&group_tasks(&baseline));
+        let s = phase_summary(&group_tasks(&standard));
+
+        assert_eq!(b.get("tasks").copied().flatten(), Some(1.0));
+        assert_eq!(s.get("tasks").copied().flatten(), Some(1.0));
+        assert_eq!(b.get("input_tokens").copied().flatten(), Some(30.0));
+        assert_eq!(s.get("input_tokens").copied().flatten(), Some(30.0));
+        assert_eq!(
+            pct_text(
+                b.get("input_tokens").copied().flatten(),
+                s.get("input_tokens").copied().flatten()
+            ),
+            "+0.0%"
+        );
+    }
+
+    #[test]
+    fn tasks_are_grouped_before_phase_partitioning() {
+        let mut baseline_turn = turn("s1", "", "unknown", "10");
+        baseline_turn.insert("phase".into(), "baseline".into());
+        let standard_turn = turn("s1", "aaa", "yes", "20");
+        let owned = vec![baseline_turn, standard_turn];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+
+        let by_phase = tasks_by_phase(&rows);
+        assert!(by_phase.get("baseline").is_none());
+        let standard = by_phase.get("standard").unwrap();
+        assert_eq!(standard.len(), 1);
+        assert_eq!(standard[0].len(), 2);
+        assert_eq!(
+            publish_stats_for_tasks(standard).input_avg,
+            Some(30.0),
+            "a task crossing baseline stop stays one task"
+        );
+    }
+
+    #[test]
+    fn phase_precedence_flag_then_marker_then_env_then_default() {
+        assert_eq!(
+            resolve_phase_value(Some("other"), Some("baseline"), Some("standard")),
+            "other"
+        );
+        // The marker outranks the environment: a variable exported after the
+        // agent started never reaches the hook process.
+        assert_eq!(
+            resolve_phase_value(None, Some("baseline"), Some("standard")),
+            "baseline"
+        );
+        assert_eq!(resolve_phase_value(None, None, Some("baseline")), "baseline");
+        assert_eq!(resolve_phase_value(None, None, None), "standard");
+        assert_eq!(
+            resolve_phase_value(Some("  "), None, Some("baseline")),
+            "baseline"
+        );
+        assert_eq!(
+            resolve_phase_value(None, Some("baseline\n"), None),
+            "baseline"
+        );
+    }
+
+    #[test]
+    fn phase_marker_accepts_only_supported_values() {
+        let marker = temp_path("phase-marker");
+        fs::write(&marker, "baseline\n").unwrap();
+        assert_eq!(read_phase_marker(&marker).as_deref(), Some("baseline"));
+        fs::write(&marker, "secret-or-unsupported").unwrap();
+        assert_eq!(read_phase_marker(&marker), None);
+        let _ = fs::remove_file(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phase_marker_read_does_not_follow_a_symlink() {
+        let marker = temp_path("phase-marker-symlink");
+        let victim = temp_path("phase-marker-victim");
+        let _ = fs::remove_file(&marker);
+        fs::write(&victim, "baseline").unwrap();
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+
+        assert_eq!(read_phase_marker(&marker), None);
+        assert_eq!(read_text(&victim), "baseline");
+
+        let _ = fs::remove_file(&marker);
+        let _ = fs::remove_file(&victim);
+    }
+
+    #[test]
+    fn json_round_trips_and_preserves_key_order() {
+        let src = r#"{"b":1,"a":[true,false,null,"x\ny"],"n":-1.5e3,"o":{},"e":[]}"#;
+        let v = json_parse(src).unwrap();
+        let rendered = json_to_string(&v);
+        let again = json_parse(&rendered).unwrap();
+        assert_eq!(v, again);
+        if let Json::Obj(entries) = &v {
+            let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, vec!["b", "a", "n", "o", "e"]);
+        } else {
+            panic!("expected object");
+        }
+        assert_eq!(v.get("n").unwrap(), &Json::Num("-1.5e3".into()));
+    }
+
+    #[test]
+    fn json_handles_unicode_and_escapes() {
+        let v = json_parse(r#"{"k":"日本語 é \" \\ tab\there"}"#).unwrap();
+        assert_eq!(v.get("k").unwrap().as_str().unwrap(), "日本語 é \" \\ tab\there");
+        let again = json_parse(&json_to_string(&v)).unwrap();
+        assert_eq!(v, again);
+    }
+
+    #[test]
+    fn json_rejects_malformed_input() {
+        assert!(json_parse("{").is_err());
+        assert!(json_parse(r#"{"a":1}}"#).is_err());
+        assert!(json_parse(r#"{"a" 1}"#).is_err());
+        assert!(json_parse("").is_err());
+        assert!(json_parse(r#"{"a":"\uZZZZ"}"#).is_err());
+    }
+
+    #[test]
+    fn json_decodes_surrogate_pairs_without_corrupting_them() {
+        // A user's settings may contain an emoji. Decoding each half separately
+        // would rewrite it as two replacement characters.
+        let v = json_parse(r#"{"k":"a😀b"}"#).unwrap();
+        assert_eq!(v.get("k").unwrap().as_str().unwrap(), "a\u{1F600}b");
+
+        let round = json_parse(&json_to_string(&v)).unwrap();
+        assert_eq!(round, v);
+        assert!(
+            !json_to_string(&v).contains('\u{FFFD}'),
+            "must not emit replacement characters"
+        );
+
+        // Unpaired surrogates are invalid JSON; refuse rather than corrupt.
+        assert!(json_parse(r#"{"k":"\ud83d"}"#).is_err());
+        assert!(json_parse(r#"{"k":"\ude00"}"#).is_err());
+        assert!(json_parse(r#"{"k":"\ud83dx"}"#).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_migration_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("usage.csv");
+        fs::write(&path, USAGE_HEADER_V1).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        ensure_usage_file(&path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_preserves_readonly_attribute() {
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        fs::write(&original, "{}").unwrap();
+        let mut permissions = fs::metadata(&original).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&original, permissions).unwrap();
+        fs::write(&replacement, "{}").unwrap();
+
+        replace_file_preserving_security(&replacement, &original, None).unwrap();
+
+        assert!(fs::metadata(&original).unwrap().permissions().readonly());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_backup_carries_the_original_security_descriptor() {
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        let backup = temp_path("settings.bak");
+        fs::write(&original, "original-secret").unwrap();
+        let mut permissions = fs::metadata(&original).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&original, permissions).unwrap();
+        fs::write(&replacement, "reduced").unwrap();
+
+        replace_file_preserving_security(&replacement, &original, Some(&backup)).unwrap();
+
+        assert_eq!(read_text(&original), "reduced");
+        assert_eq!(read_text(&backup), "original-secret", "the backup gets the pre-replacement content");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_file_owner_only_grants_no_broad_access() {
+        let path = temp_path("owner-only.txt");
+        let mut file = create_file_owner_only(&path).unwrap();
+        use std::io::Write;
+        file.write_all(b"sensitive").unwrap();
+        drop(file);
+        assert_eq!(read_text(&path), "sensitive");
+
+        // Verified empirically (icacls) that this SDDL grants Full Control
+        // to only Owner Rights, SYSTEM, and Administrators -- none of the
+        // broad, commonly-inherited principals below.
+        let out = std::process::Command::new("icacls").arg(&path).output().unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout);
+        for broad in ["Everyone", "Authenticated Users", "BUILTIN\\Users", "\\Users:"] {
+            assert!(
+                !listing.contains(broad),
+                "expected no broad-access principal {broad:?} in icacls output: {listing}"
+            );
+        }
+        assert!(listing.contains("OWNER RIGHTS"), "expected an explicit owner grant in icacls output: {listing}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_file_owner_only_refuses_to_reuse_an_existing_file() {
+        let path = temp_path("owner-only-existing.txt");
+        fs::write(&path, "pre-existing").unwrap();
+        let result = create_file_owner_only(&path);
+        assert!(result.is_err(), "must not silently reuse a file that already exists at this path");
+        assert_eq!(read_text(&path), "pre-existing", "the pre-existing file must be left untouched");
+    }
+
+    #[test]
+    fn roll_back_committed_replacement_restores_content_from_the_backup() {
+        // Callers rely on Err from replace_file_preserving_security meaning
+        // nothing changed; when ReplaceFileW itself already succeeded and
+        // only a later metadata step failed, this is what makes that
+        // guarantee hold anyway by restoring destination from the backup
+        // that was already created.
+        let destination = temp_path("destination.json");
+        let backup = temp_path("destination.bak");
+        fs::write(&destination, "committed-replacement-content").unwrap();
+        fs::write(&backup, "original-content").unwrap();
+
+        let message = roll_back_committed_replacement(&destination, Some(&backup), "metadata step failed".into());
+
+        assert_eq!(read_text(&destination), "original-content", "destination must be restored from the backup");
+        assert!(message.contains("rolled back"), "the error message must say a rollback happened: {message}");
+    }
+
+    #[test]
+    fn roll_back_committed_replacement_explains_when_no_backup_was_available() {
+        let destination = temp_path("destination-no-backup.json");
+        fs::write(&destination, "committed-replacement-content").unwrap();
+
+        let message = roll_back_committed_replacement(&destination, None, "metadata step failed".into());
+
+        assert_eq!(
+            read_text(&destination),
+            "committed-replacement-content",
+            "with nothing to roll back from, destination is left as the swap left it"
+        );
+        assert!(message.contains("no backup was requested"), "the error message must explain rollback wasn't possible: {message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_replacement_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        fs::write(&original, "{}").unwrap();
+        let mut permissions = fs::metadata(&original).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&original, permissions).unwrap();
+        fs::write(&replacement, "{}").unwrap();
+
+        copy_file_permissions(&original, &replacement).unwrap();
+
+        let mode = fs::metadata(&replacement).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_replacement_backup_carries_content_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        let backup = temp_path("settings.bak");
+        fs::write(&original, "original-secret").unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&replacement, "reduced").unwrap();
+
+        replace_file_preserving_security(&replacement, &original, Some(&backup)).unwrap();
+
+        assert_eq!(read_text(&original), "reduced");
+        assert_eq!(read_text(&backup), "original-secret");
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the backup must carry the original's mode, not the process default"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_replacement_backup_does_not_follow_a_symlink_at_the_destination() {
+        // The same class of attack fixed for the hooks_install backup and
+        // the restore temp file: this is the third spot that used to create
+        // its backup with a plain fs::copy, which follows an existing
+        // symlink at the destination instead of refusing to reuse or follow
+        // it.
+        let original = temp_path("settings.json");
+        let replacement = temp_path("settings.tmp");
+        fs::write(&original, "original-secret").unwrap();
+        fs::write(&replacement, "reduced").unwrap();
+
+        let victim = temp_path("victim.txt");
+        fs::write(&victim, "victim-must-not-be-touched").unwrap();
+        let backup = temp_path("settings.bak");
+        std::os::unix::fs::symlink(&victim, &backup).unwrap();
+
+        replace_file_preserving_security(&replacement, &original, Some(&backup)).unwrap();
+
+        assert_eq!(read_text(&original), "reduced");
+        assert_eq!(read_text(&victim), "victim-must-not-be-touched", "the symlink target must never receive the backup content");
+        assert!(!backup.is_symlink(), "the backup path must end up as a regular file, not the stale symlink");
+        assert_eq!(read_text(&backup), "original-secret");
+    }
+
+    #[test]
+    fn hook_merge_is_idempotent_and_keeps_foreign_hooks() {
+        let example = json_parse(
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#,
+        )
+        .unwrap();
+        let mut settings = json_parse(
+            r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"my-linter"}]}]}}"#,
+        )
+        .unwrap();
+
+        let mut first = String::new();
+        for pass in 0..3 {
+            let mut hooks = settings.get("hooks").cloned().unwrap();
+            strip_sentrith_hooks(&mut hooks);
+            let added = merge_sentrith_hooks(&mut hooks, example.get("hooks").unwrap());
+            assert_eq!(added, 1, "pass {pass}");
+            settings.set("hooks", hooks);
+            let rendered = json_to_string(&settings);
+            if pass == 0 {
+                first = rendered;
+            } else {
+                assert_eq!(rendered, first, "install must be idempotent");
+            }
+        }
+        assert_eq!(first.matches("my-linter").count(), 1);
+        assert_eq!(first.matches("sentrith guard").count(), 1);
+    }
+
+    #[test]
+    fn hook_status_requires_an_owned_command() {
+        let foreign = json_parse(
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/workspace/sentrith/scripts/run-linter"}]}]}}"#,
+        )
+        .unwrap();
+        let owned = json_parse(
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(count_sentrith_hooks(foreign.get("hooks").unwrap()), 0);
+        assert_eq!(count_sentrith_hooks(owned.get("hooks").unwrap()), 1);
+        assert_eq!(
+            sentrith_hook_count(
+                r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo sentrith"}]}]}}"#
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn hook_status_requires_a_capture_command() {
+        let guard_only = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#;
+        let claude_hook = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude --phase standard"}]}]}}"#;
+        let codex_hook = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook codex"}]}]}}"#;
+
+        assert_eq!(sentrith_usage_hook_count(guard_only, "claude"), 0);
+        assert_eq!(sentrith_usage_hook_count(claude_hook, "claude"), 1);
+        assert_eq!(sentrith_usage_hook_count(claude_hook, "codex"), 0);
+        assert_eq!(sentrith_usage_hook_count(codex_hook, "codex"), 1);
+    }
+
+    #[test]
+    fn usage_status_readiness_scopes_requested_agent() {
+        assert!(hook_target_matches_agent("codex", None));
+        assert!(hook_target_matches_agent("codex", Some("codex")));
+        assert!(!hook_target_matches_agent("claude", Some("codex")));
+    }
+
+    #[test]
+    fn hook_matching_does_not_remove_foreign_paths_containing_sentrith() {
+        assert!(is_sentrith_command("./bin/sentrith guard"));
+        assert!(is_sentrith_command("bin\\sentrith.exe guard"));
+        assert!(is_sentrith_command(r#""C:\Program Files\project\bin\sentrith.exe" guard"#));
+        assert!(!is_sentrith_command("/workspace/sentrith/scripts/run-linter"));
+        assert!(!is_sentrith_command("echo sentrith"));
+
+        let mut hooks = json_parse(
+            r#"{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"/workspace/sentrith/scripts/run-linter"},{"type":"command","command":"./bin/sentrith guard"}]}]}"#,
+        )
+        .unwrap();
+        strip_sentrith_hooks(&mut hooks);
+        let rendered = json_to_string(&hooks);
+        assert!(rendered.contains("/workspace/sentrith/scripts/run-linter"));
+        assert!(!rendered.contains("./bin/sentrith guard"));
+    }
+
+    #[test]
+    fn stripping_removes_empty_groups_and_events() {
+        let mut hooks = json_parse(
+            r#"{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith guard"}]}],"Other":[{"matcher":"","hooks":[{"type":"command","command":"keep-me"}]}]}"#,
+        )
+        .unwrap();
+        strip_sentrith_hooks(&mut hooks);
+        assert!(hooks.get("Stop").is_none(), "event with only Sentrith hooks is removed");
+        assert!(hooks.get("Other").is_some(), "foreign event is kept");
+    }
+
+    #[test]
+    fn workflow_check_detection_distinguishes_advisory_checks_from_capture() {
+        assert!(is_workflow_check_command("./bin/sentrith preflight"));
+        assert!(is_workflow_check_command("./bin/sentrith closeout-check"));
+        assert!(is_workflow_check_command("bin\\sentrith.exe guard"));
+        assert!(is_workflow_check_command("./bin/sentrith review-hint"));
+        assert!(is_workflow_check_command("./bin/sentrith diff-budget"));
+        // Usage capture must keep running during a baseline: it is what
+        // records the baseline turns at all.
+        assert!(!is_workflow_check_command("./bin/sentrith usage hook claude"));
+        assert!(!is_workflow_check_command("./bin/sentrith usage hook codex"));
+        assert!(!is_workflow_check_command("./bin/sentrith usage claude-status"));
+        // A foreign command that happens to contain one of the words must not
+        // match; the binary itself must be Sentrith's.
+        assert!(!is_workflow_check_command("my-own-guard-script"));
+        assert!(!is_workflow_check_command("echo preflight"));
+    }
+
+    #[test]
+    fn baseline_hook_reduction_strips_advisory_checks_and_keeps_capture() {
+        let stash = temp_path("stash-reduce");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{
+  "hooks": {
+    "SessionStart": [{"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith preflight"}]}],
+    "Stop": [
+      {"matcher":"","hooks":[
+        {"type":"command","command":"./bin/sentrith closeout-check"},
+        {"type":"command","command":"./bin/sentrith guard"},
+        {"type":"command","command":"./bin/sentrith review-hint"},
+        {"type":"command","command":"./bin/sentrith diff-budget"}
+      ]},
+      {"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith usage hook claude","timeout":5}]}
+    ],
+    "UserPromptSubmit": [{"matcher":"","hooks":[{"type":"command","command":"./bin/sentrith usage hook claude","timeout":5}]}]
+  },
+  "statusLine": {"type":"command","command":"./bin/sentrith usage claude-status","padding":1}
+}"#).unwrap();
+
+        let changed = reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap();
+        assert!(changed);
+
+        let reduced = read_text(&live);
+        let parsed = json_parse(&reduced).unwrap();
+        assert!(parsed.get("hooks").unwrap().get("SessionStart").is_none(), "preflight's only event is dropped entirely");
+        assert!(reduced.contains("usage hook claude"), "capture hooks must survive");
+        assert!(!reduced.contains("closeout-check"));
+        assert!(!reduced.contains("\"guard\""));
+        assert!(reduced.contains("statusLine"), "statusLine is a terminal display, not agent context; left alone");
+
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert!(backup.exists());
+        let original = read_text(&backup);
+        assert!(original.contains("preflight"), "the original is preserved verbatim for restore");
+    }
+
+    #[test]
+    fn baseline_hook_reduction_round_trips_back_to_the_original() {
+        let stash = temp_path("stash-roundtrip");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("hooks.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook codex"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".codex/hooks.json", &live, &stash).unwrap());
+        assert_ne!(read_text(&live), original, "the live file is reduced while active");
+
+        assert!(
+            restore_hook_settings_backup(".codex/hooks.json", &live, &stash).unwrap(),
+            "an actual restore reports true, distinguishing it from a no-op"
+        );
+        assert_eq!(read_text(&live), original, "stop restores the exact original, not a reconstruction");
+        assert!(
+            !stash.join("hook-settings-backup").join(".codex/hooks.json").exists(),
+            "the backup is consumed on restore"
+        );
+    }
+
+    #[test]
+    fn restore_hook_settings_backup_retries_cleanup_without_a_false_conflict() {
+        // Simulates an earlier restore attempt whose live replacement
+        // already succeeded, but whose cleanup (removing the backup or
+        // digest) failed and left them behind -- e.g. a transient sharing
+        // violation on Windows. A retry must recognize that `live` already
+        // holds the restored original and finish cleanup, not compare it
+        // against the reduced-content digest and misreport a conflict.
+        let stash = temp_path("stash-retry-cleanup");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        // The earlier attempt's live replacement already committed.
+        fs::write(&live, original).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        assert!(result.is_ok(), "a retry after live was already restored must not report a conflict: {result:?}");
+        assert_eq!(read_text(&live), original, "the already-restored content must be left as is");
+        assert!(
+            !stash.join("hook-settings-backup").join(".claude/settings.json").exists(),
+            "the leftover backup must still be cleaned up"
+        );
+        assert!(
+            !stash.parent().unwrap().join("baseline-hook-conflicts").exists(),
+            "no conflict must be filed for a file that was already correctly restored"
+        );
+    }
+
+    #[test]
+    fn restore_does_not_treat_two_unreadable_files_as_a_matching_retry() {
+        // `read_text` folds a read failure into the same empty string
+        // regardless of what the file actually contains. If both `live` and
+        // `backup` happen to be unreadable (invalid UTF-8, here, standing in
+        // for any read failure) for unrelated reasons, comparing their
+        // `read_text` output would falsely treat this as the retry-cleanup
+        // case -- "live already holds the restored content" -- and delete
+        // the backup, even though neither side was ever actually verified.
+        let stash = temp_path("stash-both-unreadable");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        // Both ends become unreadable, with genuinely different bytes.
+        let live_bytes: &[u8] = &[0x7b, 0xff, 0xfe, 0x7d];
+        fs::write(&live, live_bytes).unwrap();
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        fs::write(&backup, [0xff, 0xfe, 0x01]).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+
+        assert!(result.is_err(), "must not silently treat two unreadable files as an already-completed restore: {result:?}");
+        assert_eq!(fs::read(&live).unwrap(), live_bytes, "live must be left untouched");
+    }
+
+    #[test]
+    fn restore_leaves_the_backup_in_place_when_live_is_only_transiently_unreadable() {
+        // A read failure on `live` (invalid UTF-8 here, standing in for any
+        // transient failure such as a sharing violation) must not be folded
+        // into the divergence check and treated as a confirmed edit: that
+        // would permanently move the backup out to baseline-hook-conflicts
+        // for something that was never actually verified to differ, instead
+        // of letting a retry re-check once the failure clears.
+        let stash = temp_path("stash-live-unreadable");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        let reduced_bytes = fs::read(&live).unwrap();
+
+        // Corrupt only `live`; `backup` stays perfectly readable, so the
+        // retry-cleanup fast path correctly does not apply here either.
+        fs::write(&live, [0x7b, 0xff, 0xfe, 0x7d]).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+
+        assert!(result.is_err(), "an unreadable live must not be treated as safe to overwrite: {result:?}");
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert!(backup.exists(), "the backup must stay at its known path for a retry to find, not be moved to baseline-hook-conflicts");
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        assert!(digest.exists(), "the digest must survive too, so a retry can still tell a real conflict from this transient one");
+        assert!(
+            !stash.parent().unwrap().join("baseline-hook-conflicts").exists(),
+            "nothing was ever confirmed to be a conflict, so nothing should be filed as one"
+        );
+        assert_ne!(fs::read(&live).unwrap(), reduced_bytes, "live is left exactly as this attempt found it, still corrupted");
+    }
+
+    #[test]
+    fn restore_hook_settings_backup_recognizes_a_surviving_restore_marker() {
+        // Simulates a completed restore whose backup and digest were both
+        // already removed, leaving only the durable restore marker.
+        // `restore_hook_settings_backup` itself deliberately never removes
+        // this marker -- only `baseline_stop` does, once it confirms its own
+        // journal no longer needs it -- so repeated calls here must keep
+        // recognizing it and reporting success without erroring, not clear
+        // it out from under the caller that's supposed to own that decision.
+        let stash = temp_path("stash-leftover-marker");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        // Simulate a completed restore whose backup and digest were both
+        // removed, but whose own marker removal is not this function's job.
+        fs::write(&live, original).unwrap();
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        let marker = stash.join("hook-settings-backup").join(".claude/settings.json.restored");
+        fs::remove_file(&backup).unwrap();
+        fs::remove_file(&digest).unwrap();
+        fs::write(&marker, "").unwrap();
+
+        for _ in 0..2 {
+            assert!(
+                restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap(),
+                "the surviving restore marker is durable proof this path was already restored"
+            );
+        }
+        assert!(marker.exists(), "removing the marker is the caller's decision to make, not this function's");
+        assert_eq!(read_text(&live), original, "live must be left untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_keeps_the_marker_when_orphaned_digest_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            eprintln!("skipping restore_keeps_the_marker_when_orphaned_digest_removal_fails: running as root, where the read-only-directory simulation cannot fail");
+            return;
+        }
+
+        // If removing the leftover digest fails (a transient sharing
+        // violation, simulated here with a read-only parent directory), the
+        // marker must survive so a retry can still find it -- losing it here
+        // would leave the digest orphaned with no marker to explain it,
+        // which a later call would misclassify as unrecoverable.
+        let stash = temp_path("stash-digest-removal-fails");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        fs::write(&live, original).unwrap();
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        let marker = stash.join("hook-settings-backup").join(".claude/settings.json.restored");
+        fs::remove_file(&backup).unwrap();
+        fs::write(&marker, "").unwrap();
+
+        let backup_dir = stash.join("hook-settings-backup").join(".claude");
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "a failed digest removal must be reported, not silently ignored");
+        assert!(marker.exists(), "the marker must survive a failed digest removal so a retry can still find it");
+    }
+
+    #[test]
+    fn restore_does_not_treat_an_edit_on_top_of_the_reduced_file_as_proof_of_restoration() {
+        // The scenario a digest-comparison-based check cannot see: the
+        // backup is deleted externally, and the user then edits the still-
+        // reduced live file (e.g. adding an unrelated setting) without ever
+        // restoring the advisory hooks. The edit makes live's content differ
+        // from the exact reduced snapshot the digest describes, but that
+        // difference alone proves nothing about whether a restore actually
+        // happened -- only the durable marker (absent here) can.
+        let stash = temp_path("stash-edit-on-reduced");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        fs::remove_file(&backup).unwrap();
+
+        // An edit on top of the still-reduced file -- hooks are still
+        // stripped, just with an unrelated key added.
+        let edited_but_still_reduced = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"unrelated":true}}"#;
+        fs::write(&live, edited_but_still_reduced).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+
+        assert!(result.is_err(), "an edit that changes live without ever restoring the hooks must not be reported as success: {result:?}");
+        assert_eq!(read_text(&live), edited_but_still_reduced, "live must be left exactly as found");
+    }
+
+    #[test]
+    fn restore_does_not_treat_an_externally_deleted_backup_as_proof_of_restoration() {
+        // The backup vanishing is not, by itself, evidence that a restore
+        // ever happened: it could just as well have been deleted externally
+        // (manual cleanup, a stray `rm`) while `live` is still sitting in
+        // its reduced state and the digest was never touched. Reported as
+        // `Ok(true)` (and the digest deleted) in that state, this would let
+        // a journal-cross-checking caller conclude the path was restored --
+        // and clear the baseline -- while the advisory hooks are actually
+        // still disabled.
+        let stash = temp_path("stash-backup-deleted-externally");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        let reduced_bytes = fs::read(&live).unwrap();
+
+        // Simulate the backup being deleted externally: live is left exactly
+        // as reduce left it (still reduced), and the digest is untouched.
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        fs::remove_file(&backup).unwrap();
+        assert!(digest.exists());
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+
+        assert!(result.is_err(), "must not report success when live still matches the reduced content on record: {result:?}");
+        assert_eq!(fs::read(&live).unwrap(), reduced_bytes, "live must be left exactly as found, still reduced");
+    }
+
+    #[test]
+    fn restore_fails_closed_when_the_digest_is_unreadable() {
+        // A missing, unreadable, or malformed digest while the backup still
+        // exists is not the known-safe retry state (that's `live` already
+        // equaling `backup`, handled separately above) -- it's genuinely
+        // unexplained, and treating it as "not diverged" would silently
+        // overwrite whatever edit `live` may hold with the stale backup.
+        let stash = temp_path("stash-unreadable-digest");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        // A genuine edit made during baseline, distinct from both the
+        // original and the reduced content.
+        let edited = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"custom":true}}"#;
+        fs::write(&live, edited).unwrap();
+        // Corrupt the digest so it can't be parsed.
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        fs::write(&digest, "not-a-number").unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        assert!(result.is_err(), "an unreadable digest must be treated as diverged, not as safe to overwrite");
+        assert_eq!(read_text(&live), edited, "the edit must survive when the digest can't be verified");
+    }
+
+    #[test]
+    fn restore_hook_settings_backup_is_a_noop_when_the_path_was_never_reduced() {
+        // `baseline_stop` now scans every candidate path unconditionally
+        // (rather than trusting a manifest of what was actually reduced), so
+        // restoring a path with no backup at all must stay a safe, silent
+        // no-op rather than an error.
+        let stash = temp_path("stash-restore-noop");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(
+            !restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap(),
+            "no backup exists for this path, so restore must report false, not error"
+        );
+        assert_eq!(read_text(&live), original, "a path that was never reduced must be left untouched");
+    }
+
+    #[test]
+    fn baseline_hook_reduction_is_a_noop_when_nothing_matches() {
+        let stash = temp_path("stash-noop");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("no-workflow-checks.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(!reduce_hook_settings_for_baseline("x", &live, &stash).unwrap());
+        assert_eq!(read_text(&live), original, "nothing to strip means the file is left untouched");
+
+        let missing = temp_path("does-not-exist.json");
+        assert!(!reduce_hook_settings_for_baseline("y", &missing, &stash).unwrap());
+
+        let empty = temp_path("empty.json");
+        fs::write(&empty, "").unwrap();
+        assert!(!reduce_hook_settings_for_baseline("z", &empty, &stash).unwrap());
+    }
+
+    #[test]
+    fn baseline_hook_reduction_leaves_a_preexisting_empty_hook_array_alone() {
+        // A group or event whose array was already empty before stripping
+        // ran (e.g. `{"hooks":{"Stop":[]}}`, degenerate but not invalid)
+        // must not be pruned just because it's empty: nothing about it
+        // actually matched the predicate, so this must stay a no-op rather
+        // than reporting a "reduction" that only ever removed a pre-existing
+        // empty entry.
+        let stash = temp_path("stash-preexisting-empty");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("preexisting-empty.json");
+        let original = r#"{"hooks":{"Stop":[]},"other":1}"#;
+        fs::write(&live, original).unwrap();
+
+        assert!(
+            !reduce_hook_settings_for_baseline("q", &live, &stash).unwrap(),
+            "a pre-existing empty hooks array must not be reported as a match"
+        );
+        assert_eq!(read_text(&live), original, "nothing actually matched, so the file must be left untouched");
+    }
+
+    #[test]
+    fn baseline_hook_reduction_reports_malformed_json_without_writing() {
+        let stash = temp_path("stash-malformed");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("broken.json");
+        fs::write(&live, "{not valid json").unwrap();
+
+        let result = reduce_hook_settings_for_baseline("w", &live, &stash);
+        assert!(result.is_err());
+        assert_eq!(read_text(&live), "{not valid json", "a malformed file is left exactly as found");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reduce_leaves_no_orphaned_digest_when_the_swap_never_commits() {
+        if running_as_root() {
+            eprintln!("skipping reduce_leaves_no_orphaned_digest_when_the_swap_never_commits: running as root, where the read-only-directory simulation cannot fail");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        // Reproduces the real-world trigger directly: a digest written
+        // *before* the live replacement, left orphaned when that
+        // replacement fails for any reason (a sharing violation on Windows
+        // needs no special setup to occur -- another process merely having
+        // the settings file open is enough), used to be indistinguishable
+        // from a genuinely completed-and-uncleaned restore. `live` here was
+        // never touched by this call at all, yet the stale digest alone
+        // would previously read as unrecoverable data loss forever after.
+        let stash = temp_path("stash-swap-never-commits");
+        fs::create_dir_all(&stash).unwrap();
+        let live_dir = temp_path("live-dir");
+        fs::create_dir_all(&live_dir).unwrap();
+        let live = live_dir.join("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        // Removes write access to live's own directory, which the swap (and
+        // the temp file it stages through) both need -- simulating any
+        // failure between "the digest used to be written" and "the swap
+        // actually commits", not specifically a sharing violation, since
+        // that needs a second process this test can't spin up portably.
+        fs::set_permissions(&live_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash);
+        fs::set_permissions(&live_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "the simulated failure must actually prevent the swap: {result:?}");
+        assert_eq!(read_text(&live), original, "live must be completely untouched");
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        assert!(!digest.exists(), "no digest must be left behind when the swap itself never committed");
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert!(!backup.exists(), "no backup should exist either, since nothing was ever reduced");
+    }
+
+    #[test]
+    fn reduce_rolls_live_back_when_the_digest_write_fails_after_the_swap_commits() {
+        // The swap into `live` and the digest write are two separate steps;
+        // if the swap commits but the digest write then fails, `live` would
+        // be left reduced with no digest to prove it.
+        // `restore_hook_settings_backup` reads a missing digest as unknown
+        // and fails closed, misreading this as a user edit made during
+        // baseline and relocating `backup` -- the only copy of the true
+        // original -- into `baseline-hook-conflicts` without ever touching
+        // `live`. This function must instead roll `live` back to the
+        // original itself when the digest write fails, so a caller that
+        // sees `Err` here can rely on `live` being unchanged either way,
+        // the same guarantee every earlier failure in this function already
+        // gave for free.
+        let stash = temp_path("stash-digest-write-fails");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings-digest-write-fails.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+
+        // Pre-create the digest path as a directory. `reduce_hook_settings_for_baseline`
+        // writes its backup to a sibling path inside the same directory, so
+        // the swap itself still commits normally -- only the final
+        // `fs::write` to the digest path fails, deterministically and
+        // portably on both platforms, with no root-bypass or second-process
+        // concerns the way a permission-based simulation would have.
+        let digest_path = stash.join("hook-settings-backup").join("w.reduced-digest");
+        fs::create_dir_all(&digest_path).unwrap();
+
+        let result = reduce_hook_settings_for_baseline("w", &live, &stash);
+
+        assert!(result.is_err(), "a failed digest write must still surface as Err");
+        assert_eq!(
+            read_text(&live),
+            original,
+            "live must be rolled back to the original when the digest write fails"
+        );
+        let backup = stash.join("hook-settings-backup").join("w");
+        assert!(backup.exists(), "the backup this call already created is left for a retry to see");
+    }
+
+    #[test]
+    fn reduce_rolls_a_read_only_live_back_when_the_digest_write_fails() {
+        // Codex found that the rollback above used to call `fs::copy`
+        // directly onto `live`, which fails outright once `live` is
+        // read-only (Unix mode `0400`, or the Windows read-only attribute)
+        // -- exactly the state a rolled-back settings file is often already
+        // in, since preserving that original restriction is the whole point
+        // of this file's replacement helpers. The rollback now goes through
+        // `restore_file_content`, the same atomic swap the normal restore
+        // path already used for this exact reason.
+        let stash = temp_path("stash-digest-write-fails-readonly");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings-digest-write-fails-readonly.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+        let mut permissions = fs::metadata(&live).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&live, permissions).unwrap();
+
+        let digest_path = stash.join("hook-settings-backup").join("w.reduced-digest");
+        fs::create_dir_all(&digest_path).unwrap();
+
+        let result = reduce_hook_settings_for_baseline("w", &live, &stash);
+        let still_readonly = fs::metadata(&live).unwrap().permissions().readonly();
+        // Undo the read-only bit before any assertion can panic and skip it,
+        // so a failing run still leaves the temp directory cleanable.
+        let mut permissions = fs::metadata(&live).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&live, permissions).unwrap();
+
+        assert!(result.is_err(), "a failed digest write must still surface as Err");
+        assert_eq!(
+            read_text(&live),
+            original,
+            "a read-only live must still be rolled back to the original when the digest write fails"
+        );
+        assert!(still_readonly, "the rollback must not leave live any less restricted than it started");
+    }
+
+    #[test]
+    fn baseline_hook_reduction_aborts_rather_than_skip_an_unreadable_settings_file() {
+        // `read_text` folds a read failure (invalid UTF-8 here) into the same
+        // empty string as a genuinely empty file, which used to make this
+        // return `Ok(false)` -- "nothing to reduce" -- for a file that still
+        // holds live Sentrith hooks. baseline_start would then report success
+        // while this path's hooks stayed active for the whole baseline,
+        // contaminating the sample. It must now return Err so the caller
+        // aborts and rolls back instead.
+        let stash = temp_path("stash-unreadable");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("invalid-utf8.json");
+        fs::write(&live, [0x7b, 0xff, 0xfe, 0x7d]).unwrap();
+
+        let result = reduce_hook_settings_for_baseline("w", &live, &stash);
+        assert!(result.is_err(), "an unreadable settings file must abort, not silently report nothing-to-reduce");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_hook_reduction_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stash = temp_path("stash-perms");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#).unwrap();
+        fs::set_permissions(&live, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        assert_eq!(
+            fs::metadata(&live).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "reducing the file must not loosen its mode"
+        );
+
+        // The backup holds the complete, unreduced original for as long as
+        // the baseline runs; a default-mode copy would expose whatever the
+        // original's permissions were restricting for that whole window.
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the backup must carry the original's restrictive mode, not the process default"
+        );
+
+        restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap();
+        assert_eq!(
+            fs::metadata(&live).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "restoring via rename must not adopt the backup's create-mode instead of the original's"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reduce_widens_the_temp_file_to_a_less_restrictive_original_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The temp file is now created at a tight 0600 up front (rather than
+        // created loose and chmod'd after) to close a permission-exposure
+        // window; this confirms that when `live` is actually less
+        // restrictive than 0600, copy_file_permissions afterward still
+        // widens the reduced file to match it instead of leaving it stuck
+        // at the tighter creation default.
+        let stash = temp_path("stash-widen-perms");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#).unwrap();
+        fs::set_permissions(&live, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        assert_eq!(
+            fs::metadata(&live).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the reduced file must end up matching the original's actual mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_hook_reduction_refuses_a_symlinked_settings_file() {
+        let stash = temp_path("stash-symlink");
+        fs::create_dir_all(&stash).unwrap();
+        let target = temp_path("settings-target.json");
+        fs::write(&target, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#).unwrap();
+        let live = temp_path("settings-link.json");
+        std::os::unix::fs::symlink(&target, &live).unwrap();
+
+        let result = reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash);
+        assert!(result.is_err(), "must refuse a symlinked settings file rather than following it");
+        assert_eq!(
+            read_text(&target),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#,
+            "the symlink target must be left untouched"
+        );
+        assert!(live.is_symlink(), "the symlink itself must not be replaced");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reduce_does_not_write_through_a_stale_symlink_at_the_temp_path() {
+        // A stale symlink left at the predictable temp path (an interrupted
+        // older run, or placed there deliberately in a shared writable
+        // repository) must never be followed: writing the reduced settings
+        // through it would leak them to wherever the symlink points, not
+        // the intended scratch location.
+        let stash = temp_path("stash-stale-tmp-symlink");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        let elsewhere = temp_path("elsewhere.txt");
+        fs::write(&elsewhere, "untouched").unwrap();
+        let tmp = sibling_temp_path(&live, "sentrith-baseline-tmp");
+        std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        assert!(!live.is_symlink(), "live must end up as a regular reduced file, not a symlink");
+        assert!(!read_text(&live).contains("\"guard\""), "live must actually be reduced");
+        assert_eq!(
+            read_text(&elsewhere),
+            "untouched",
+            "the stale symlink's target must never receive the reduced content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_temp_file_creates_at_restrictive_mode_and_refuses_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The function `hooks_install` now shares with baseline reduction:
+        // exercised directly here (rather than only indirectly, through
+        // reduce's own tests) since it's the exact entry point hooks_install
+        // depends on for the same secure-temp-file guarantee.
+        let tmp = temp_path("secure-temp.json");
+        write_secure_temp_file(&tmp, "content").unwrap();
+        assert_eq!(read_text(&tmp), "content");
+        assert_eq!(
+            fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "must be created at a restrictive mode regardless of which caller uses it"
+        );
+
+        let elsewhere = temp_path("elsewhere.json");
+        fs::write(&elsewhere, "untouched").unwrap();
+        fs::remove_file(&tmp).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
+
+        write_secure_temp_file(&tmp, "new-content").unwrap();
+        assert!(!tmp.is_symlink(), "a stale symlink at the temp path must be replaced, not followed");
+        assert_eq!(read_text(&tmp), "new-content");
+        assert_eq!(read_text(&elsewhere), "untouched", "the stale symlink's target must never receive the content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_ordinary_file_does_not_follow_a_symlink_at_the_destination() {
+        // Codex found this exact class of attack reachable at two more
+        // predictable, git-ignored paths: `.ai-usage/phase` (baseline_start)
+        // and `.sentrith-private/baseline-stash/HOOK_EDITS.txt` (both
+        // baseline_start's initial write and baseline_stop's retry-time
+        // rewrite). Both used a plain `fs::write`, which follows a symlink
+        // planted at the destination and overwrites whatever it points at.
+        let elsewhere = temp_path("write-ordinary-elsewhere.txt");
+        fs::write(&elsewhere, "untouched").unwrap();
+        let path = temp_path("write-ordinary-destination.txt");
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+        write_ordinary_file_without_following_a_symlink(&path, "new-content").unwrap();
+
+        assert!(!path.is_symlink(), "the destination must end up a regular file, not the stale symlink");
+        assert_eq!(read_text(&path), "new-content");
+        assert_eq!(read_text(&elsewhere), "untouched", "the symlink's target must never receive the new content");
+    }
+
+    #[test]
+    fn write_ordinary_file_does_not_narrow_permissions_the_way_create_secure_file_does() {
+        // Unlike write_secure_temp_file/create_secure_file, this must leave
+        // a brand-new file at ordinary (not owner-only) permissions -- the
+        // fresh-install ACL-lock regression this codebase already hit once
+        // for exactly this reason.
+        let path = temp_path("write-ordinary-fresh.txt");
+        let _ = fs::remove_file(&path);
+
+        write_ordinary_file_without_following_a_symlink(&path, "content").unwrap();
+
+        assert_eq!(read_text(&path), "content");
+        #[cfg(unix)]
+        {
+            // Codex found that asserting mode != 0o600 outright is wrong: a
+            // restrictive-but-valid umask (e.g. 077) makes an ordinary
+            // creation legitimately land on 0o600 too, which would fail this
+            // assertion even though the helper correctly used ordinary,
+            // umask-derived permissions rather than create_secure_file's
+            // fixed owner-only mode. Compare against a control file created
+            // the ordinary way under the same umask instead of requiring a
+            // specific non-0600 value.
+            use std::os::unix::fs::PermissionsExt;
+            let control = temp_path("write-ordinary-fresh-control.txt");
+            fs::write(&control, "content").unwrap();
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            let control_mode = fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, control_mode, "must match an ordinary file's umask-derived mode, not a fixed owner-only one");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_creation_does_not_follow_a_symlink_at_the_destination() {
+        // Reproduces the exact vulnerability: a `*.json.sentrith-bak` symlink
+        // pointing at an unrelated file must not have its target silently
+        // overwritten with the backup content -- exercised at the same
+        // create_secure_file + io::copy shape hooks_install now uses, since
+        // hooks_install itself is cwd-coupled and not unit-testable directly.
+        let source = temp_path("source.json");
+        fs::write(&source, "settings-content").unwrap();
+
+        let victim = temp_path("victim.txt");
+        fs::write(&victim, "victim-must-not-be-touched").unwrap();
+        let backup = temp_path("settings.json.sentrith-bak");
+        std::os::unix::fs::symlink(&victim, &backup).unwrap();
+
+        let mut dest = create_secure_file(&backup).unwrap();
+        let mut src = fs::File::open(&source).unwrap();
+        std::io::copy(&mut src, &mut dest).unwrap();
+        drop(dest);
+
+        assert_eq!(
+            read_text(&victim),
+            "victim-must-not-be-touched",
+            "the symlink target must never receive the backup content"
+        );
+        assert!(!backup.is_symlink(), "the backup path must end up as a regular file, not the stale symlink");
+        assert_eq!(read_text(&backup), "settings-content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_does_not_follow_a_symlink_at_the_restore_temp_path() {
+        // Reproduces the reported scenario directly against
+        // restore_hook_settings_backup itself, matching how it was found:
+        // link the restore temp path to an unrelated file after a baseline
+        // reduction, then run restore. Before the fix, fs::copy followed the
+        // symlink (clobbering the victim) and the subsequent rename moved
+        // that same symlink onto `live`.
+        let stash = temp_path("stash-restore-tmp-symlink");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        let victim = temp_path("victim.txt");
+        fs::write(&victim, "victim-must-not-be-touched").unwrap();
+        let restore_tmp = sibling_temp_path(&live, "sentrith-baseline-restore-tmp");
+        std::os::unix::fs::symlink(&victim, &restore_tmp).unwrap();
+
+        assert!(restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap());
+
+        assert_eq!(read_text(&victim), "victim-must-not-be-touched", "the symlink target must never receive the settings content");
+        assert!(!live.is_symlink(), "live must end up as a regular file, not the stale symlink renamed onto it");
+        assert_eq!(read_text(&live), original, "the restore must still succeed correctly despite the stale symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_does_not_follow_a_symlink_at_the_marker_path() {
+        // There's a real window, for the whole duration of an active
+        // baseline, for something to plant a symlink at the marker's
+        // predictable path (<rel_path>.restored) before restore ever runs.
+        // fs::write would follow it and truncate whatever it points at;
+        // create_secure_file must not.
+        let stash = temp_path("stash-marker-symlink");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        let victim = temp_path("victim.txt");
+        fs::write(&victim, "victim-must-not-be-touched").unwrap();
+        let marker = stash.join("hook-settings-backup").join(".claude/settings.json.restored");
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+
+        assert!(restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap());
+
+        assert_eq!(read_text(&victim), "victim-must-not-be-touched", "the symlink target must never be written to");
+        assert_eq!(read_text(&live), original, "the restore must still succeed correctly despite the stale symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_backup_substituted_with_a_symlink_to_live() {
+        // Codex reproduced this by linking the backup to live itself after
+        // an active baseline had already reduced it: the retry-cleanup
+        // equality check reads through the symlink, sees live_content ==
+        // backup_content trivially (it's reading live against itself), and
+        // concludes restoration already happened -- deleting the digest and
+        // the (symlinked) backup while live is still sitting reduced, with
+        // baseline_stop reporting success.
+        let stash = temp_path("stash-backup-symlinked-to-live");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings-backup-symlinked-to-live.json");
+        let original = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#;
+        fs::write(&live, original).unwrap();
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        let reduced_content = read_text(&live);
+
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        fs::remove_file(&backup).unwrap();
+        std::os::unix::fs::symlink(&live, &backup).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+
+        assert!(
+            matches!(result, Err(RestoreFailure::Unrecoverable(_))),
+            "a substituted symlink backup must not be trusted as proof of restoration: {result:?}"
+        );
+        assert_eq!(read_text(&live), reduced_content, "live must be left exactly as found, not silently treated as already restored");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_no_follow_refuses_a_symlink_instead_of_reading_its_target() {
+        // The primitive behind the check-then-use fix: validating a path
+        // with symlink_metadata and *then* opening it by name leaves a
+        // window for substitution in between. This opens and validates the
+        // same handle, so a symlink fails at open rather than silently
+        // yielding the target's bytes.
+        let target = temp_path("no-follow-target.txt");
+        fs::write(&target, "target-content-must-not-be-read").unwrap();
+        let link = temp_path("no-follow-link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            open_regular_file_no_follow(&link).is_err(),
+            "a symlink must not open, let alone yield its target's content"
+        );
+
+        // The same helper must still open an ordinary file normally.
+        let plain = temp_path("no-follow-plain.txt");
+        fs::write(&plain, "plain-content").unwrap();
+        let mut file = open_regular_file_no_follow(&plain).unwrap();
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut file, &mut content).unwrap();
+        assert_eq!(content, "plain-content");
+
+        // ...and reject a directory, which a plain open would accept on Unix.
+        let dir = temp_path("no-follow-dir");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(open_regular_file_no_follow(&dir).is_err(), "a directory is not a regular file");
+    }
+
+    #[test]
+    fn baseline_hook_reduction_snapshot_does_not_store_full_settings_content() {
+        let stash = temp_path("stash-digest");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        let digest_path = stash
+            .join("hook-settings-backup")
+            .join(".claude/settings.json.reduced-digest");
+        let digest_text = read_text(&digest_path);
+        assert!(
+            digest_text.trim().parse::<u64>().is_ok(),
+            "the on-disk snapshot must be a digest, not settings content: got {digest_text:?}"
+        );
+        assert!(
+            !digest_text.contains("sentrith") && !digest_text.contains("hooks"),
+            "the digest must not leak the reduced settings content"
+        );
+    }
+
+    #[test]
+    fn baseline_stop_refuses_to_discard_an_edit_made_during_baseline() {
+        let stash = temp_path("stash-conflict");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        // Simulate a legitimate edit made while baseline was active.
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"custom":true}}"#).unwrap();
+        let edited = read_text(&live);
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        assert!(result.is_err(), "must refuse rather than silently discard the edit");
+        assert_eq!(read_text(&live), edited, "the edit made during baseline must survive");
+
+        // The conflict must not block the stash from being cleaned up: its
+        // backup is moved out entirely, not left sitting in the stash.
+        let backup_dir = stash.join("hook-settings-backup").join(".claude");
+        assert!(
+            !backup_dir.exists() || fs::read_dir(&backup_dir).unwrap().next().is_none(),
+            "the backup and its snapshot must be moved out of the stash on conflict"
+        );
+        let conflict = stash
+            .parent()
+            .unwrap()
+            .join("baseline-hook-conflicts")
+            .join(".claude/settings.json");
+        assert!(conflict.exists(), "the pre-baseline original must be preserved at the conflict path");
+    }
+
+    #[test]
+    fn baseline_hook_conflict_never_overwrites_an_earlier_unresolved_conflict() {
+        let stash = temp_path("stash-conflict-unique");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        // An earlier baseline already left an unresolved conflict at the
+        // fixed path this rel_path maps to; nothing blocks starting a new
+        // baseline while it sits there unmerged.
+        let conflict_root = stash.parent().unwrap();
+        let earlier_conflict = conflict_root.join("baseline-hook-conflicts").join(".claude/settings.json");
+        fs::create_dir_all(earlier_conflict.parent().unwrap()).unwrap();
+        fs::write(&earlier_conflict, "EARLIER-UNRESOLVED-ORIGINAL").unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"custom":true}}"#).unwrap();
+
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        assert!(result.is_err(), "must refuse rather than silently discard the edit");
+
+        assert_eq!(
+            read_text(&earlier_conflict),
+            "EARLIER-UNRESOLVED-ORIGINAL",
+            "an earlier unresolved conflict must never be silently replaced"
+        );
+        let new_conflict = conflict_root.join("baseline-hook-conflicts").join(".claude/settings.json.conflict-1");
+        assert!(new_conflict.exists(), "the new conflict must be preserved at a distinct path");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflict_preservation_failure_keeps_the_digest_for_a_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            eprintln!("skipping conflict_preservation_failure_keeps_the_digest_for_a_retry: running as root, where the read-only-directory simulation cannot fail");
+            return;
+        }
+
+        // If moving the diverged backup out to baseline-hook-conflicts fails
+        // (simulated here with a read-only conflict root, standing in for a
+        // sharing violation or an unwritable directory), the digest must
+        // survive: without it, a retry's divergence check reads a missing
+        // digest as "not diverged" and silently overwrites the edit with the
+        // stale backup -- exactly the loss this whole mechanism exists to
+        // prevent.
+        let stash = temp_path("stash-conflict-preserve-fail");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"},{"type":"command","command":"./bin/sentrith usage hook claude"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith usage hook claude"}]}],"custom":true}}"#).unwrap();
+
+        let conflict_root = stash.parent().unwrap();
+        fs::set_permissions(conflict_root, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = restore_hook_settings_backup(".claude/settings.json", &live, &stash);
+        fs::set_permissions(conflict_root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "must still refuse to overwrite the edit even when preservation fails");
+        let digest = stash.join("hook-settings-backup").join(".claude/settings.json.reduced-digest");
+        assert!(digest.exists(), "the digest must survive a failed preservation attempt so a retry can re-detect the conflict");
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        assert!(backup.exists(), "the backup must remain at its known path when preservation fails");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_removes_a_read_only_backup_file() {
+        // Simulates a backup that ended up read-only for any reason (an
+        // inherited directory ACL, a manual edit, or a future change to how
+        // it's created): empirically, a backup created from a read-only
+        // original via the current reduce path does NOT end up read-only
+        // (replace_file_preserving_security clears the destination's
+        // read-only attribute before ReplaceFileW runs, so ReplaceFileW's
+        // own backup is made from the already-cleared file) -- but restore
+        // must not depend on that happening to be true today.
+        let stash = temp_path("stash-readonly-backup");
+        fs::create_dir_all(&stash).unwrap();
+        let live = temp_path("settings.json");
+        fs::write(&live, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./bin/sentrith guard"}]}]}}"#).unwrap();
+
+        assert!(reduce_hook_settings_for_baseline(".claude/settings.json", &live, &stash).unwrap());
+
+        let backup = stash.join("hook-settings-backup").join(".claude/settings.json");
+        let mut perms = fs::metadata(&backup).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&backup, perms).unwrap();
+
+        assert!(restore_hook_settings_backup(".claude/settings.json", &live, &stash).unwrap());
+        assert!(!backup.exists(), "a read-only backup must still be removed after a successful restore, not left behind");
+    }
+
+    fn row(session: &str, sha: &str, success: &str, phase: &str) -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        m.insert("session_id".into(), session.into());
+        m.insert("head_sha".into(), sha.into());
+        m.insert("success".into(), success.into());
+        m.insert("phase".into(), phase.into());
+        m
+    }
+
+    #[test]
+    fn first_commit_after_unborn_head_is_counted() {
+        assert!(commit_reached(UNBORN_HEAD, "abc123"));
+        assert!(!commit_reached("", "abc123"));
+        assert!(!commit_reached("abc123", "abc123"));
+    }
+
+    #[test]
+    fn tasks_split_on_head_sha_transitions() {
+        let owned = vec![
+            row("s1", "", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
+            row("s1", "bbb", "yes", "standard"),
+            row("s1", "", "unknown", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let tasks = group_tasks(&rows);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].len(), 3, "commit-closing turn ends the first task");
+        assert_eq!(tasks[1].len(), 1);
+    }
+
+    #[test]
+    fn task_grouping_keeps_agents_with_the_same_session_separate() {
+        let mut codex = turn("unknown", "", "unknown", "10");
+        codex.insert("agent".into(), "codex".into());
+        let mut claude = turn("unknown", "commit", "yes", "20");
+        claude.insert("agent".into(), "claude".into());
+        let owned = vec![codex, claude];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+
+        let tasks = group_tasks(&rows);
+        assert_eq!(tasks.len(), 2);
+        assert!(
+            tasks.iter().all(|task| task.len() == 1),
+            "rows from different agents must never become one task"
+        );
+    }
+    #[test]
+    fn success_rate_excludes_unknown_from_denominator() {
+        let owned = vec![
+            row("", "", "yes", "standard"),
+            row("", "", "no", "standard"),
+            row("", "", "unknown", "standard"),
+            row("", "", "", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        assert_eq!(decided_success_rate(&group_tasks(&rows)), Some(50.0));
+
+        let undecided: Vec<&BTreeMap<String, String>> = owned[2..].iter().collect();
+        assert_eq!(decided_success_rate(&group_tasks(&undecided)), None);
+    }
+
+    fn turn(session: &str, sha: &str, success: &str, input: &str) -> BTreeMap<String, String> {
+        let mut m = row(session, sha, success, "standard");
+        m.insert("input_tokens".into(), input.into());
+        m.insert("credits".into(), "3".into());
+        m
+    }
+
+    #[test]
+    fn model_filter_groups_before_filtering() {
+        let mut first = turn("s1", "", "unknown", "10");
+        first.insert("model".into(), "model-a".into());
+        let mut second = turn("s1", "sha", "yes", "20");
+        second.insert("model".into(), "model-b".into());
+        let owned = vec![first, second];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+
+        let tasks = group_tasks(&rows);
+        assert_eq!(tasks.len(), 1, "the model change is still one task");
+        assert!(
+            filter_tasks_by_model(tasks, Some("model-a")).is_empty(),
+            "mixed-model tasks must not be attributed to either model"
+        );
+    }
+
+    #[test]
+    fn published_stats_are_per_task_not_per_turn() {
+        // Three turns of one session, closed by a commit: one task worth
+        // 30 input tokens, not three tasks of 10.
+        let owned = vec![
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "bbb", "yes", "10"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let stats = publish_stats(&rows);
+
+        assert_eq!(stats.tasks, 1, "turns before the commit are one task");
+        assert_eq!(stats.successes, 1);
+        assert_eq!(stats.input_avg, Some(30.0), "input is summed across the task");
+        assert_eq!(stats.success_rate, Some(100.0));
+        assert_eq!(stats.credits_per_success, Some(9.0), "total credits / successful task");
+    }
+
+    #[test]
+    fn manual_single_row_records_are_unchanged_by_task_grouping() {
+        // Manual records carry no session id, so each stays its own task and
+        // averages keep their previous meaning.
+        let owned = vec![
+            turn("", "", "yes", "10"),
+            turn("", "", "no", "20"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let stats = publish_stats(&rows);
+
+        assert_eq!(stats.tasks, 2);
+        assert_eq!(stats.input_avg, Some(15.0));
+        assert_eq!(stats.success_rate, Some(50.0));
+    }
+
+    #[test]
+    fn first_captured_turn_can_close_its_own_task() {
+        // A session whose very first captured turn commits has no previous SHA
+        // to transition from. Without the decided-outcome rule its task would
+        // merge into the next one and its `yes` would be overwritten.
+        let owned = vec![
+            row("s1", "bbb", "yes", "standard"),
+            row("s1", "ccc", "no", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let tasks = group_tasks(&rows);
+
+        assert_eq!(tasks.len(), 2, "each committed turn closes its own task");
+        assert_eq!(task_success(&tasks[0]), "yes");
+        assert_eq!(task_success(&tasks[1]), "no");
+        assert_eq!(decided_success_rate(&tasks), Some(50.0));
+    }
+
+    #[test]
+    fn undecided_turns_stay_with_the_task_they_precede() {
+        let owned = vec![
+            row("s1", "", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
+            row("s1", "bbb", "yes", "standard"),
+            row("s1", "", "unknown", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let tasks = group_tasks(&rows);
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].len(), 3);
+        assert_eq!(task_success(&tasks[0]), "yes");
+        assert_eq!(task_success(&tasks[1]), "unknown");
+    }
+
+    #[test]
+    fn a_commit_closes_its_task_even_without_a_test_run() {
+        // A first turn that commits without running tests records
+        // `success=unknown`, so the outcome carries no signal. The recorded
+        // commit must still end the task, or its usage merges into the next one.
+        let owned = vec![
+            row("s1", "aaa", "unknown", "standard"),
+            row("s1", "", "unknown", "standard"),
+            row("s1", "bbb", "yes", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let tasks = group_tasks(&rows);
+
+        assert_eq!(tasks.len(), 2, "the unverified first commit is its own task");
+        assert_eq!(tasks[0].len(), 1);
+        assert_eq!(task_success(&tasks[0]), "unknown");
+        assert_eq!(tasks[1].len(), 2);
+        assert_eq!(task_success(&tasks[1]), "yes");
+    }
+
+    #[test]
+    fn churn_window_excludes_commits_before_the_measured_commit() {
+        // `sha..HEAD` selects by ancestry, not time: a side-branch commit
+        // merged in later can still carry a timestamp earlier than `t0`. Only
+        // the upper bound would have wrongly counted it as later rework.
+        let t0 = 1_000_000.0;
+        let days = 14.0;
+
+        assert!(
+            !within_churn_window(t0 - 3600.0, t0, days),
+            "a commit authored before t0 must not count as rework of it"
+        );
+        assert!(within_churn_window(t0, t0, days), "t0 itself is in-window");
+        assert!(within_churn_window(t0 + 3600.0, t0, days));
+        assert!(within_churn_window(t0 + days * 86400.0, t0, days), "the upper bound is inclusive");
+        assert!(!within_churn_window(t0 + days * 86400.0 + 1.0, t0, days));
+    }
+
+    #[test]
+    fn every_recorded_commit_is_eligible_for_churn() {
+        // A session with exactly one commit must not be skipped: each recorded
+        // head_sha is by construction a commit observed during that turn.
+        let owned = vec![
+            row("s1", "aaa", "unknown", "standard"),
+            row("s2", "bbb", "yes", "standard"),
+            row("s2", "bbb", "unknown", "standard"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        let shas: Vec<String> = {
+            let mut seen = BTreeSet::new();
+            rows.iter()
+                .filter_map(|r| r.get("head_sha"))
+                .filter(|s| !s.is_empty())
+                .filter(|s| seen.insert((*s).clone()))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(shas, vec!["aaa".to_string(), "bbb".to_string()]);
+    }
+
+    #[test]
+    fn usage_per_success_counts_tasks_not_successful_turns() {
+        // Two working turns and a third that commits: capture only resolves a
+        // `yes` on the turn where HEAD moved, so this is one successful task.
+        let owned = vec![
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "", "unknown", "10"),
+            turn("s1", "bbb", "yes", "10"),
+        ];
+        let rows: Vec<&BTreeMap<String, String>> = owned.iter().collect();
+        // 9 credits total over 1 successful task, not 3 credits over 3 rows.
+        assert_eq!(metric_per_success(&rows, "credits"), Some(9.0));
+    }
+
+    #[test]
+    fn numstat_z_collects_paths_including_binary() {
+        // `-z`-delimited entries; a binary file reports `-\t-\t<path>` instead
+        // of numeric counts, but the counts are never used by either caller
+        // of this parser, so a binary path is just as real a churn entry as
+        // a text one and must not be silently dropped.
+        let text = "3\t1\tsrc/a.rs\00\t0\tsrc/b.rs\0-\t-\tbin/blob\0";
+        let paths: Vec<String> = parse_numstat_z(text)
+            .into_iter()
+            .filter_map(|item| match item {
+                NumstatZItem::Path(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert!(paths.contains(&"src/a.rs".to_string()));
+        assert!(paths.contains(&"src/b.rs".to_string()));
+        assert!(paths.contains(&"bin/blob".to_string()), "binary rows must still count as a touched path");
+    }
+
+    #[test]
+    fn numstat_z_records_a_rename_with_both_names() {
+        // Byte layout verified against a real repo: `git show --numstat -z`
+        // for a rename is `added\tdeleted\t` + an empty NUL-terminated field
+        // (the rename marker), then the old path, then the new path. Both
+        // names are kept on the item; which one(s) a caller uses depends on
+        // whether it is building the measured commit's file set (new only)
+        // or scanning later history for touches (both).
+        let text = "0\t0\t\0old.txt\0new.txt\0";
+        let items = parse_numstat_z(text);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            NumstatZItem::Rename { old, new } if old == "old.txt" && new == "new.txt"
+        ));
+    }
+
+    #[test]
+    fn numstat_z_reads_commit_headers_across_the_artifact_newline() {
+        // `git log -z --format="COMMIT %ct"` NUL-terminates each header, then
+        // inserts a bare `\n` before the numstat block when one follows; that
+        // newline is a formatting artifact, not part of the next path.
+        let text = "COMMIT 100\0\n0\t0\tplain.txt\0COMMIT 90\0\n1\t0\tother.txt\0";
+        let items = parse_numstat_z(text);
+        assert_eq!(items.len(), 4);
+        assert!(matches!(items[0], NumstatZItem::Commit(t) if t == 100.0));
+        assert!(matches!(&items[1], NumstatZItem::Path(p) if p == "plain.txt"));
+        assert!(matches!(items[2], NumstatZItem::Commit(t) if t == 90.0));
+        assert!(matches!(&items[3], NumstatZItem::Path(p) if p == "other.txt"));
+    }
+
+    /// Mirrors how `churn_for_commit` itself flattens `parse_numstat_z`
+    /// output, so these tests exercise the exact asymmetry the fix relies on
+    /// rather than a simplified stand-in for it.
+    fn measured_files(text: &str) -> BTreeSet<String> {
+        parse_numstat_z(text)
+            .into_iter()
+            .filter_map(|item| match item {
+                NumstatZItem::Path(p) => Some(p),
+                NumstatZItem::Rename { new, .. } => Some(new),
+                NumstatZItem::Commit(_) => None,
+            })
+            .collect()
+    }
+
+    fn touched_paths(text: &str) -> BTreeSet<String> {
+        let mut touched = BTreeSet::new();
+        for item in parse_numstat_z(text) {
+            match item {
+                NumstatZItem::Path(p) => {
+                    touched.insert(p);
+                }
+                NumstatZItem::Rename { old, new } => {
+                    touched.insert(old);
+                    touched.insert(new);
+                }
+                NumstatZItem::Commit(_) => {}
+            }
+        }
+        touched
+    }
+
+    #[test]
+    fn churn_matches_a_renamed_file_by_its_destination_path() {
+        // The bug this fixes: a rename with a common-prefix path renders as
+        // `old.txt => new.txt` under plain (non-`-z`) `--numstat`, which
+        // line-based tab-splitting stored as one literal, unmatchable path,
+        // so a later edit of the file under its new name never intersected
+        // it and churn was always undercounted across a rename.
+        let files = measured_files("0\t0\t\0old.txt\0new.txt\0");
+        let touched = touched_paths("COMMIT 200\01\t0\tnew.txt\0");
+        assert_eq!(files.intersection(&touched).count(), 1, "new.txt must match on both sides of the rename");
+    }
+
+    #[test]
+    fn churn_matches_a_file_later_renamed_by_its_original_name() {
+        // The opposite direction: the measured commit is a plain edit (no
+        // rename), and a later commit renames the file. The old name must
+        // still be recognized as touched, or churn stays 0% across a rename
+        // that happens after measurement instead of within the measured
+        // commit itself.
+        let files = measured_files("2\t1\ta.txt\0");
+        let touched = touched_paths("COMMIT 200\00\t0\t\0a.txt\0b.txt\0");
+        assert_eq!(files.intersection(&touched).count(), 1, "a.txt must match its own later rename");
+
+        // The measured file set itself must not double-count a rename: only
+        // the destination is a "file" from the measured commit's own
+        // perspective, so a rename there keeps the denominator at 1.
+        let rename_as_measured = measured_files("0\t0\t\0old.txt\0new.txt\0");
+        assert_eq!(rename_as_measured.len(), 1);
+    }
+
+    #[test]
+    fn baseline_cleanup_removes_empty_parent_directories() {
+        let marker = temp_path("phase");
+        fs::write(&marker, "baseline\n").unwrap();
+        let stash = temp_path("stash");
+        fs::create_dir_all(stash.join(".github")).unwrap();
+        fs::create_dir_all(stash.join(".claude")).unwrap();
+        let manifest = stash.join("STASHED.txt");
+        fs::write(
+            &manifest,
+            ".github/copilot-instructions.md\n.claude/skills\n",
+        )
+        .unwrap();
+
+        let entries = vec![
+            ".github/copilot-instructions.md".to_string(),
+            ".claude/skills".to_string(),
+        ];
+        finish_baseline_stop_cleanup(&stash, &manifest, &marker, &entries, &[]).unwrap();
+
+        assert!(
+            !stash.exists(),
+            "empty parent directories must not block cleanup"
+        );
+        assert!(
+            !marker.exists(),
+            "successful cleanup returns to standard phase"
+        );
+    }
+
+    #[test]
+    fn baseline_cleanup_keeps_the_manifest_when_the_stash_cannot_be_removed() {
+        // This used to assert the opposite for the manifest (`!manifest.exists()`):
+        // cleanup removed both manifests first and only then discovered
+        // `remove_dir` could not succeed. That left a stash with contents and
+        // nothing explaining them, which `inspect_stash` reads as
+        // `Unattributable` and refuses to touch -- turning a retryable
+        // failure into one that permanently blocks `baseline stop` with the
+        // phase marker still reading `baseline`. The manifest must now
+        // survive so the leftovers stay attributable and a retry can work.
+        let marker = temp_path("phase");
+        fs::write(&marker, "baseline\n").unwrap();
+        let stash = temp_path("stash");
+        fs::create_dir(&stash).unwrap();
+        let manifest = stash.join("STASHED.txt");
+        fs::write(&manifest, "AGENTS.md\n").unwrap();
+        fs::write(stash.join("unexpected"), "keep me").unwrap();
+
+        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[], &[]).unwrap_err();
+        assert!(error.contains("unexpected"), "the error must name what is blocking cleanup: {error}");
+        assert!(marker.exists(), "the phase marker must remain active");
+        assert!(stash.exists(), "the stash must remain recoverable");
+        assert!(manifest.exists(), "the manifest must survive so the leftovers stay attributable");
+        assert_eq!(read_text(&stash.join("unexpected")), "keep me", "nothing unexplained may be deleted");
+
+        // The retry, once the leftover is resolved, must then succeed.
+        fs::remove_file(stash.join("unexpected")).unwrap();
+        finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[], &[]).unwrap();
+        assert!(!stash.exists(), "the retry must complete cleanup");
+        assert!(!marker.exists(), "the retry must return to standard phase");
+    }
+
+    #[test]
+    fn baseline_cleanup_keeps_active_state_when_marker_removal_fails() {
+        let marker = temp_path("phase-dir");
+        fs::create_dir(&marker).unwrap();
+        let stash = temp_path("stash");
+        fs::create_dir(&stash).unwrap();
+        let manifest = stash.join("STASHED.txt");
+        fs::write(&manifest, "AGENTS.md\n").unwrap();
+
+        let error = finish_baseline_stop_cleanup(&stash, &manifest, &marker, &[], &[]).unwrap_err();
+        assert!(error.contains("phase marker"));
+        assert!(marker.is_dir());
+        assert!(stash.exists(), "an empty stash keeps baseline_active true");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_real_directory_tree_refuses_a_symlinked_ancestor() {
+        let root = relative_usage_test_path("real-directory-tree-root");
+        let outside = temp_path("real-directory-tree-outside");
+        create_real_directory_tree(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let private = root.join(".sentrith-private");
+        std::os::unix::fs::symlink(&outside, &private).unwrap();
+
+        let error = create_real_directory_tree(&private.join("baseline-stash")).unwrap_err();
+
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(private.is_symlink(), "the rejected ancestor must remain untouched");
+        assert!(
+            !outside.join("baseline-stash").exists(),
+            "the helper must not create anything through the symlink"
+        );
+
+        fs::remove_file(&private).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn hook_restore_artifacts_keep_start_rollback_stash_recoverable() {
+        let stash = temp_path("stash-with-hook-recovery");
+        let backup_dir = stash.join("hook-settings-backup/.claude");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let rel = ".claude/settings.json";
+        let artifact_paths = [
+            backup_dir.join("settings.json"),
+            backup_dir.join("settings.json.reduced-digest"),
+            backup_dir.join("settings.json.restored"),
+        ];
+
+        for artifact in artifact_paths {
+            fs::write(&artifact, "recovery material").unwrap();
+            assert!(
+                hook_restore_artifacts_exist(rel, &stash),
+                "{} must prevent baseline-start rollback from deleting the stash",
+                artifact.display()
+            );
+            fs::remove_file(artifact).unwrap();
+        }
+        assert!(
+            !hook_restore_artifacts_exist(rel, &stash),
+            "a conflict already preserved outside the stash has no in-stash recovery material"
+        );
+    }
+
+    #[test]
+    fn rollback_moved_paths_reports_a_recreated_destination_as_failed() {
+        // If something has already recreated `dst` since it was stashed
+        // (e.g. another process, or a prior partial rollback), moving the
+        // stashed copy over it would clobber whatever that is. Silently
+        // skipping it -- without recording a failure -- would let the
+        // caller believe rollback fully succeeded and delete the stash,
+        // discarding the stashed copy with no record it was ever there.
+        let root = temp_path("root");
+        fs::create_dir_all(&root).unwrap();
+        let stash = temp_path("stash-for-rollback");
+        fs::create_dir_all(&stash).unwrap();
+
+        fs::write(stash.join("AGENTS.md"), "stashed-contract-content").unwrap();
+        // Something else has already recreated the live path.
+        fs::write(root.join("AGENTS.md"), "recreated-by-something-else").unwrap();
+
+        let failed = rollback_moved_paths(&["AGENTS.md".to_string()], &stash, &root);
+
+        assert_eq!(failed.len(), 1, "the recreated destination must be reported as a failure: {failed:?}");
+        assert!(failed[0].contains("AGENTS.md"));
+        assert!(stash.join("AGENTS.md").exists(), "the stashed copy must survive rather than being silently dropped");
+        assert_eq!(read_text(&root.join("AGENTS.md")), "recreated-by-something-else", "the recreated file must not be clobbered");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_moved_paths_restores_a_relative_symlink_left_dangling_by_the_move() {
+        // Codex found that a contract path which is a valid relative
+        // symlink at the repo root (e.g. AGENTS.md -> ../shared/AGENTS.md)
+        // keeps that same relative target string when moved into the
+        // (deeper) stash, and commonly becomes dangling from its new
+        // location even though the symlink entry itself is intact.
+        // `src.exists()` follows the link to check whether the target
+        // resolves, so it read a perfectly restorable symlink as "nothing
+        // here" and silently skipped it.
+        let root = temp_path("root-dangling-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let stash = temp_path("stash-dangling-symlink");
+        fs::create_dir_all(&stash).unwrap();
+
+        // The real target this symlink is meant to resolve to, one level up
+        // from the repo root -- reachable via `../shared/AGENTS.md` from
+        // the root, but not from `stash/AGENTS.md`, which is what makes the
+        // moved symlink dangle.
+        let shared_dir = root.parent().unwrap().join(format!(
+            "shared-{}",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&shared_dir).unwrap();
+        fs::write(shared_dir.join("AGENTS.md"), "shared-contract-content").unwrap();
+        let relative_target = PathBuf::from("..")
+            .join(shared_dir.file_name().unwrap())
+            .join("AGENTS.md");
+
+        // Simulate the post-stash state directly: a relative symlink
+        // already sitting in the stash, pointing at a target that does not
+        // resolve from there (dangling), exactly as baseline_start's own
+        // move would have left it.
+        std::os::unix::fs::symlink(&relative_target, stash.join("AGENTS.md")).unwrap();
+        assert!(!stash.join("AGENTS.md").exists(), "sanity check: the symlink must actually be dangling from the stash");
+
+        let failed = rollback_moved_paths(&["AGENTS.md".to_string()], &stash, &root);
+
+        assert!(failed.is_empty(), "a dangling-but-restorable symlink must not be reported as a failure: {failed:?}");
+        assert!(root.join("AGENTS.md").is_symlink(), "the symlink must be moved back to the working tree");
+        assert!(!stash.join("AGENTS.md").exists() && !stash.join("AGENTS.md").is_symlink(), "nothing must be left behind in the stash");
+        assert_eq!(
+            read_text(&root.join("AGENTS.md")),
+            "shared-contract-content",
+            "restored to its original location, the same relative target must resolve again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_reports_a_conflict_for_a_dangling_symlink_recreated_at_the_destination() {
+        // Codex found the mirror of the dangling-source bug: `dst.exists()`
+        // also follows the link, so a *dangling* symlink recreated at the
+        // contract path while baseline was active reads as "nothing there"
+        // and the rename silently deletes it, instead of reporting the
+        // conflict this check exists to report.
+        let root = temp_path("root-dangling-dst");
+        fs::create_dir_all(&root).unwrap();
+        let stash = temp_path("stash-dangling-dst");
+        fs::create_dir_all(&stash).unwrap();
+        fs::write(stash.join("AGENTS.md"), "stashed-contract-content").unwrap();
+
+        // Recreated at the destination, pointing at something that does not
+        // exist -- a dangling entry, but an entry the user put there.
+        std::os::unix::fs::symlink("does-not-exist-anywhere", root.join("AGENTS.md")).unwrap();
+        assert!(!root.join("AGENTS.md").exists(), "sanity check: the destination symlink must be dangling");
+
+        let failed = rollback_moved_paths(&["AGENTS.md".to_string()], &stash, &root);
+
+        assert_eq!(failed.len(), 1, "a recreated dangling symlink must be reported as a conflict: {failed:?}");
+        assert!(root.join("AGENTS.md").is_symlink(), "the user's symlink must not be silently deleted");
+        assert!(stash.join("AGENTS.md").exists(), "the stashed copy must survive rather than being moved over it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_stop_and_start_rollback_share_one_restore_implementation() {
+        // These two loops were near-copies until a symlink fix landed in one
+        // and not the other (Codex found the un-fixed half a round later).
+        // They now share `restore_one_stashed_path`; this exercises that
+        // shared function directly for both of the symlink-aware checks, so
+        // a future divergence has to break a test rather than only being
+        // caught by review.
+        let root = temp_path("root-shared-restore");
+        fs::create_dir_all(&root).unwrap();
+        let stash = temp_path("stash-shared-restore");
+        fs::create_dir_all(&stash).unwrap();
+
+        // A dangling source entry must still be restored...
+        std::os::unix::fs::symlink("../elsewhere/AGENTS.md", stash.join("AGENTS.md")).unwrap();
+        assert_eq!(
+            restore_one_stashed_path("AGENTS.md", &stash, &root),
+            Ok(true),
+            "a dangling stashed symlink is still an entry that must be moved back"
+        );
+        assert!(root.join("AGENTS.md").is_symlink());
+
+        // ...and a dangling destination entry must still block.
+        fs::write(stash.join("CLAUDE.md"), "stashed").unwrap();
+        std::os::unix::fs::symlink("also-does-not-exist", root.join("CLAUDE.md")).unwrap();
+        assert!(
+            restore_one_stashed_path("CLAUDE.md", &stash, &root).is_err(),
+            "a dangling destination entry must be reported, not silently overwritten"
+        );
+        assert!(root.join("CLAUDE.md").is_symlink(), "the destination entry must survive");
+
+        // Nothing at all in the stash is not an error, just nothing to do.
+        assert_eq!(restore_one_stashed_path("docs/ai/PROJECT.md", &stash, &root), Ok(false));
+    }
+
+    #[test]
+    fn sibling_temp_path_never_collapses_two_sources_onto_one_temp_path() {
+        // `Path::with_extension` (what this used to be) *replaces* the
+        // existing extension, mapping both `settings.json.reduced-digest`
+        // and `settings.json.restored` onto the same
+        // `settings.json.sentrith-write-tmp` -- two files staged in the same
+        // directory would silently share a staging area.
+        let digest = sibling_temp_path(Path::new("d/settings.json.reduced-digest"), "sentrith-write-tmp");
+        let marker = sibling_temp_path(Path::new("d/settings.json.restored"), "sentrith-write-tmp");
+        let backup = sibling_temp_path(Path::new("d/settings.json"), "sentrith-write-tmp");
+        assert_ne!(digest, marker);
+        assert_ne!(digest, backup);
+        assert_ne!(marker, backup);
+        // And an extensionless path still gets a suffix rather than losing anything.
+        assert_eq!(
+            sibling_temp_path(Path::new(".ai-usage/phase"), "sentrith-write-tmp"),
+            PathBuf::from(".ai-usage/phase.sentrith-write-tmp")
+        );
+    }
+
+    #[test]
+    fn stash_without_a_manifest_is_never_treated_as_deletable() {
+        // An interrupted start can leave files with no manifest. They may be
+        // the only copy of a contract file, so `stop` must refuse rather than
+        // remove the directory.
+        let stash = temp_path("stash");
+        fs::create_dir_all(&stash).unwrap();
+        fs::write(stash.join("AGENTS.md"), "contract").unwrap();
+
+        match inspect_stash(&stash).unwrap() {
+            StashState::Unattributable(found) => assert_eq!(found, vec!["AGENTS.md"]),
+            _ => panic!("a stash with contents and no manifest must be unattributable"),
+        }
+
+        // With a manifest, the same directory is restorable.
+        fs::write(stash.join("STASHED.txt"), "AGENTS.md\n\n").unwrap();
+        match inspect_stash(&stash).unwrap() {
+            StashState::Listed(paths) => assert_eq!(paths, vec!["AGENTS.md"]),
+            _ => panic!("a manifest must be honored"),
+        }
+
+        // A genuinely empty stash is safe to drop.
+        let empty = temp_path("empty-stash");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(inspect_stash(&empty).unwrap(), StashState::Empty));
+    }
+
+    #[test]
+    fn success_resolution_requires_commit_and_verification() {
+        let session = format!("t{}", std::process::id());
+        let dir = live_dir();
+        let _ = fs::create_dir_all(&dir);
+
+        // No commit yet: undecidable even though tests passed.
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, Some(true), false, "head-a"),
+            "unknown"
+        );
+        // Commit arrives in a later turn; the earlier pass is carried forward.
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, None, true, "head-a"),
+            "yes"
+        );
+        // State is cleared after the commit closes the task.
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, None, true, "head-b"),
+            "unknown"
+        );
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, Some(false), true, "head-b"),
+            "no"
+        );
+        let _ = fs::remove_file(verif_path("testagent", &session));
+    }
+
+    #[test]
+    fn committed_turn_uses_current_verification_when_state_cannot_be_written() {
+        let session = format!("write-fail-{}", std::process::id());
+        let vpath = verif_path("testagent", &session);
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_dir_all(&vpath);
+        fs::create_dir_all(&vpath).unwrap();
+
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, Some(true), true, "head-a"),
+            "yes"
+        );
+        let _ = fs::remove_dir_all(&vpath);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_state_refuses_symlink_without_touching_target() {
+        let session = format!("symlink-{}", std::process::id());
+        let vpath = verif_path("testagent", &session);
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_dir_all(&vpath);
+        fs::create_dir_all(vpath.parent().unwrap()).unwrap();
+
+        let victim = temp_path("verification-victim.txt");
+        fs::write(&victim, "victim-content").unwrap();
+        std::os::unix::fs::symlink(&victim, &vpath).unwrap();
+
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, Some(true), false, "head-a"),
+            "unknown"
+        );
+        assert_eq!(read_text(&victim), "victim-content");
+        assert!(vpath.is_symlink(), "the rejected symlink must remain untouched");
+
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_file(&victim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn carried_verification_state_refuses_symlink_without_trusting_target() {
+        let session = format!("carried-symlink-{}", std::process::id());
+        let vpath = verif_path("testagent", &session);
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_dir_all(&vpath);
+        fs::create_dir_all(vpath.parent().unwrap()).unwrap();
+
+        let victim = temp_path("carried-verification-victim.txt");
+        fs::write(&victim, "pass").unwrap();
+        std::os::unix::fs::symlink(&victim, &vpath).unwrap();
+
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, None, true, "head-a"),
+            "unknown"
+        );
+        assert_eq!(read_text(&victim), "pass");
+
+        let _ = fs::remove_file(&vpath);
+        let _ = fs::remove_file(&victim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kv_state_neither_writes_nor_reads_through_a_symlink() {
+        let state = relative_usage_test_path("kv-state-symlink");
+        let victim = temp_path("kv-state-victim");
+        create_real_directory_tree(state.parent().unwrap()).unwrap();
+        fs::write(&victim, "secret\tvalue\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &state).unwrap();
+
+        assert!(
+            read_kv(&state).is_empty(),
+            "a substituted state file must not be trusted as hook evidence"
+        );
+
+        let result = write_kv(&state, &[("task", "new-value".to_string())]);
+
+        assert!(result.is_err(), "a substituted state path must be refused");
+        assert_eq!(read_text(&victim), "secret\tvalue\n");
+        assert!(state.is_symlink(), "the rejected state entry must remain untouched");
+
+        fs::remove_file(&state).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kv_state_refuses_a_symlinked_parent_directory() {
+        let root = relative_usage_test_path("kv-state-parent-root");
+        let outside = temp_path("kv-state-parent-outside");
+        create_real_directory_tree(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let live = root.join("live");
+        std::os::unix::fs::symlink(&outside, &live).unwrap();
+
+        let result = write_kv(&live.join("agent-session.task"), &[("task", "x".to_string())]);
+
+        assert!(result.is_err(), "a symlinked live-state ancestor must be refused");
+        assert!(
+            !outside.join("agent-session.task").exists(),
+            "nothing may be written through the symlinked ancestor"
+        );
+
+        fs::remove_file(&live).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn kv_state_round_trip_preserves_value_whitespace() {
+        let state = relative_usage_test_path("kv-state-whitespace");
+        write_kv(&state, &[("task", " leading and trailing ".to_string())]).unwrap();
+
+        assert_eq!(
+            read_kv(&state).get("task").map(String::as_str),
+            Some(" leading and trailing ")
+        );
+
+        fs::remove_file(&state).unwrap();
+    }
+
+    #[test]
+    fn state_paths_refuse_parent_directory_traversal() {
+        let root = relative_usage_test_path("state-parent-traversal");
+        create_real_directory_tree(&root.join("child")).unwrap();
+        let victim = root.join("victim");
+        fs::write(&victim, "must-survive").unwrap();
+        let traversing = root.join("child/../victim");
+
+        assert!(read_regular_file_no_follow_raw(&traversing).is_none());
+        assert!(write_verification_state(&traversing, "replacement").is_err());
+        assert_eq!(read_text(&victim), "must-survive");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_state_cleanup_refuses_a_symlinked_parent_directory() {
+        let root = relative_usage_test_path("state-cleanup-parent-root");
+        let outside = temp_path("state-cleanup-parent-outside");
+        create_real_directory_tree(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let live = root.join("live");
+        std::os::unix::fs::symlink(&outside, &live).unwrap();
+        let victim = outside.join("agent-session.task");
+        fs::write(&victim, "must-survive").unwrap();
+
+        remove_live_state_file(&live.join("agent-session.task"));
+
+        assert_eq!(read_text(&victim), "must-survive");
+        fs::remove_file(&live).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stale_verification_state_is_not_reused_by_a_later_head() {
+        let session = format!("stale-head-{}", std::process::id());
+        let vpath = verif_path("testagent", &session);
+        let _ = fs::remove_file(&vpath);
+        fs::create_dir_all(vpath.parent().unwrap()).unwrap();
+        write_verification_state(
+            &vpath,
+            &verification_state_content(true, "previous-head"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            update_and_resolve_success("testagent", &session, None, true, "later-head"),
+            "unknown"
+        );
+        let _ = fs::remove_file(&vpath);
     }
 }

@@ -11,8 +11,11 @@ Read:
 - `docs/development/DEVELOPMENT_METHOD.md`
 - `docs/ai/PROJECT.md`
 - `docs/ai/STATE.md`
+- `docs/ai/PROFILE.md`
 
 Then perform the requested engineering task in one continuous workflow.
+
+Read a `docs/profiles/` document only when the task matches a trigger recorded in `PROFILE.md`, and apply the union when several match.
 
 ## 1. Classify internally
 
@@ -105,6 +108,10 @@ Do not spawn a reviewer model solely for this classification.
 ## 6. Verify
 
 Run the narrowest meaningful verification first.
+
+Include the verification dimensions of any profile whose trigger the change matched.
+
+Apply a profile technique only when its gate condition is met.
 
 Do not claim checks passed unless actually run.
 

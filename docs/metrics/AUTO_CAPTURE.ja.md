@@ -13,7 +13,7 @@ Sentrithでは `sentrith` がAgentからusageを自動取得するadapterを持�
 | Agent | 対話利用 | 非対話利用 | 自動取得 |
 |---|---|---|---|
 | Codex | Hooks + transcript | `codex exec --json` | Token usage |
-| Claude Code | statusLine + Hooks | 同じ仕組み | Estimated USD cost / duration |
+| Claude Code | Hooks + transcript(costはstatusLine) | 同じ仕組み | Tokens / model / estimated USD cost / success |
 | Copilot CLI | stable machine APIなし | `copilot -p` wrapper | AI Credits best-effort |
 
 ---
@@ -103,14 +103,26 @@ statusLine
 
 ```text
 UserPromptSubmit
-→ start snapshot
+→ transcriptの現在行数 / HEAD / start snapshotを記録
 
 Stop
-→ end snapshot
-→ 差分をusage.csvへ保存
+→ transcriptの当該turn分だけを解析(token / model)
+→ turn内のtest実行結果を判定
+→ HEAD差分でcommit到達を判定
+→ usage.csvへ1行保存
 ```
 
 します。
+
+### tokenはtranscript、costはstatusLine
+
+tokenはturn windowのtranscriptから直接合計します(同一message idは1回だけ数えます)。
+
+statusLineのsnapshotはturn終了に対して遅れることがあるため、costとdurationのfallbackとしてのみ使います。
+
+transcriptが読めない場合はstatusLineのcost差分だけを記録し、`source` 列が `claude-statusline-hooks` になります。
+
+transcript formatはvendorの安定契約ではありません。解析失敗時は例外にせず縮退します。
 
 ### 有効化
 
@@ -129,9 +141,13 @@ Stop
 
 取得:
 
-- session estimated USD cost delta
-- duration
-- model/session id
+- input / cached input / output tokens(transcript由来)
+- model / session id
+- session estimated USD cost delta、duration(statusLine由来)
+- success(commit到達 + test結果、判定不能なら `unknown`)
+- head_sha / verification
+
+successの定義は `MEASUREMENT_ARCHITECTURE.ja.md` を参照してください。
 
 注意:
 
@@ -151,7 +167,7 @@ copilot -p "..."
 の通常出力にはusage情報が含まれ、
 `-s` を付けるとusage情報を省略します。
 
-Sentrith Sentrith pre-release prototype:
+Sentrithでは:
 
 ```bash
 sentrith usage run copilot \

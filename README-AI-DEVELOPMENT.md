@@ -201,7 +201,7 @@ clear intent
 ```
 
 
-## Sentrith pre-release prototype simplified usage
+## Simplified usage
 
 The user no longer needs to remember the workflow chain.
 
@@ -227,7 +227,7 @@ Optional deterministic hooks:
 `docs/automation/HOOKS.ja.md`
 
 
-## Sentrith pre-release prototype additions
+## Additions
 
 - explicit credit/context budget policy
 - dependency supply-chain gate

@@ -23,9 +23,9 @@ Sentrithという名前で公開する前に、内部プロトタイプとして
 10. IDE / Desktop / CLIを横断するProvider Usage + Task Ledgerへ一般化
 11. 匿名Community Benchmark contribution
 
-## Sentrith v1.0.0 — First public release
+## Sentrith 0.x — 公開系列の開始
 
-最初の公開リリース。
+最初の公開系列。Contractとusage CSV schemaが安定と判断できるまで 0.x を維持する。
 
 中心メッセージ:
 
@@ -40,5 +40,5 @@ Sentrithという名前で公開する前に、内部プロトタイプとして
 - **Guard** — safety/evidence/review gates
 - **Measure** — real usage measurement and community benchmarking
 
-公開version historyは **Sentrith v1.0.0から開始**する。
+公開version historyは **Sentrith 0.x から開始**する。
 pre-release prototypeの内部snapshot番号は公開versionとして扱わない。

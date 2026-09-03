@@ -35,7 +35,14 @@ sentrith usage record ...
 Compare measured data:
 
 ```bash
+sentrith hooks install
+sentrith usage status
+sentrith usage baseline start
+sentrith usage baseline stop
+
 sentrith usage report --compare
+sentrith usage report --tasks
+sentrith usage report --churn --days 14
 ```
 
 Run machine-readable CLI adapters where supported:
