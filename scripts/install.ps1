@@ -46,12 +46,36 @@ $SeedPaths = @(
   "docs/ai/KNOWN_ISSUES.md"
 )
 
+
+function Ensure-SentrithParent {
+  param([string]$Path)
+  $RelativeParent = Split-Path -Path $Path -Parent
+  if ([string]::IsNullOrEmpty($RelativeParent)) { return }
+
+  $Current = $TargetPath
+  foreach ($Segment in $RelativeParent.Split([char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries)) {
+    if ($Segment -eq '.') { continue }
+    if ($Segment -eq '..') {
+      throw "Refusing parent-directory traversal in contract path: $Path"
+    }
+    $Current = Join-Path $Current $Segment
+    $Existing = Get-Item -Force -LiteralPath $Current -ErrorAction SilentlyContinue
+    if ($null -eq $Existing) {
+      New-Item -ItemType Directory -Path $Current | Out-Null
+      $Existing = Get-Item -Force -LiteralPath $Current
+    }
+    if (($Existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $Existing.PSIsContainer) {
+      throw "Refusing symlinked, junctioned, or non-directory destination ancestor: $Current"
+    }
+  }
+}
+
 function Copy-SentrithPath {
   param([string]$Path)
   $Src = Join-Path $Source $Path
   $Dst = Join-Path $TargetPath $Path
   if (-not (Test-Path $Src)) { return }
-  New-Item -ItemType Directory -Force -Path (Split-Path $Dst -Parent) | Out-Null
+  Ensure-SentrithParent $Path
   if ((Get-Item $Src).PSIsContainer) {
     # A junction or directory symlink at the destination (dotfile managers,
     # a shared checkout) is refused rather than replaced -- matching the

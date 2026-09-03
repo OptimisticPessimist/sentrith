@@ -1661,6 +1661,12 @@ fn ancestors_are_real_directories(root: &Path, leaf: &Path) -> Result<(), String
         return Ok(());
     };
     for component in parent_of_leaf.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!(
+                "refusing to inspect {} through a parent-directory component",
+                leaf.display()
+            ));
+        }
         current.push(component);
         let meta = fs::symlink_metadata(&current)
             .map_err(|e| format!("failed to inspect {}: {e}", current.display()))?;
@@ -4656,17 +4662,19 @@ fn task_path(agent: &str, session: &str) -> PathBuf {
 }
 
 fn write_kv(path: &Path, pairs: &[(&str, String)]) -> Result<(), String> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    if let Some(parent) = path.parent() {
+        create_real_directory_tree(parent)?;
+    }
     let mut s = String::new();
     for (k,v) in pairs {
-        s.push_str(k); s.push('\t'); s.push_str(&v.replace('\n'," ")); s.push('\n');
+        s.push_str(k); s.push('\t'); s.push_str(&v.replace('\n', " ")); s.push('\n');
     }
-    fs::write(path, s).map_err(|e| e.to_string())
+    write_verification_state(path, &s)
 }
 
 fn read_kv(path: &Path) -> BTreeMap<String,String> {
     let mut m = BTreeMap::new();
-    if let Ok(s) = fs::read_to_string(path) {
+    if let Some(s) = read_regular_file_no_follow_raw(path) {
         for line in s.lines() {
             if let Some((k,v)) = line.split_once('\t') { m.insert(k.to_string(),v.to_string()); }
         }
@@ -4703,7 +4711,7 @@ fn verif_path(agent: &str, session: &str) -> PathBuf {
 /// dereferencing a link that races into that path.
 fn write_verification_state(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        create_real_directory_tree(parent)?;
     }
     let destination_exists = match fs::symlink_metadata(path) {
         Ok(meta) if !meta.is_file() => {
@@ -4733,12 +4741,17 @@ fn write_verification_state(path: &Path, content: &str) -> Result<(), String> {
 /// Read a small state file through the no-follow, regular-file boundary used
 /// for attacker-plantable paths. A missing, unreadable, or substituted entry
 /// is unavailable evidence, never content a caller may trust.
-fn read_regular_file_no_follow(path: &Path) -> Option<String> {
+fn read_regular_file_no_follow_raw(path: &Path) -> Option<String> {
+    ancestors_are_real_directories(Path::new(""), path).ok()?;
     use std::io::Read;
     let mut file = open_regular_file_no_follow(path).ok()?;
     let mut content = String::new();
     file.read_to_string(&mut content).ok()?;
-    Some(content.trim().to_string())
+    Some(content)
+}
+
+fn read_regular_file_no_follow(path: &Path) -> Option<String> {
+    read_regular_file_no_follow_raw(path).map(|content| content.trim().to_string())
 }
 
 fn verification_state_content(pass: bool, task_head: &str) -> String {
@@ -8435,6 +8448,69 @@ mod tests {
 
         let _ = fs::remove_file(&vpath);
         let _ = fs::remove_file(&victim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kv_state_neither_writes_nor_reads_through_a_symlink() {
+        let state = temp_path("kv-state-symlink");
+        let victim = temp_path("kv-state-victim");
+        fs::write(&victim, "secret\tvalue\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &state).unwrap();
+
+        assert!(
+            read_kv(&state).is_empty(),
+            "a substituted state file must not be trusted as hook evidence"
+        );
+
+        let result = write_kv(&state, &[("task", "new-value".to_string())]);
+
+        assert!(result.is_err(), "a substituted state path must be refused");
+        assert_eq!(read_text(&victim), "secret\tvalue\n");
+        assert!(state.is_symlink(), "the rejected state entry must remain untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kv_state_refuses_a_symlinked_parent_directory() {
+        let root = temp_path("kv-state-parent-root");
+        let outside = temp_path("kv-state-parent-outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let live = root.join("live");
+        std::os::unix::fs::symlink(&outside, &live).unwrap();
+
+        let result = write_kv(&live.join("agent-session.task"), &[("task", "x".to_string())]);
+
+        assert!(result.is_err(), "a symlinked live-state ancestor must be refused");
+        assert!(
+            !outside.join("agent-session.task").exists(),
+            "nothing may be written through the symlinked ancestor"
+        );
+    }
+
+    #[test]
+    fn kv_state_round_trip_preserves_value_whitespace() {
+        let state = temp_path("kv-state-whitespace");
+        write_kv(&state, &[("task", " leading and trailing ".to_string())]).unwrap();
+
+        assert_eq!(
+            read_kv(&state).get("task").map(String::as_str),
+            Some(" leading and trailing ")
+        );
+    }
+
+    #[test]
+    fn state_paths_refuse_parent_directory_traversal() {
+        let root = temp_path("state-parent-traversal");
+        fs::create_dir_all(root.join("child")).unwrap();
+        let victim = root.join("victim");
+        fs::write(&victim, "must-survive").unwrap();
+        let traversing = root.join("child/../victim");
+
+        assert!(read_regular_file_no_follow_raw(&traversing).is_none());
+        assert!(write_verification_state(&traversing, "replacement").is_err());
+        assert_eq!(read_text(&victim), "must-survive");
     }
 
     #[test]

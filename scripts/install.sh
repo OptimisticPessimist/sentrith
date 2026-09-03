@@ -60,11 +60,49 @@ docs/ai/DECISIONS.md
 docs/ai/KNOWN_ISSUES.md
 EOF
 
+
+ensure_sentrith_parent() {
+  relative_parent=$(dirname "$1")
+  [ "$relative_parent" = "." ] && return 0
+  current=$TARGET_DIR
+  remaining=$relative_parent
+  while [ -n "$remaining" ]; do
+    case "$remaining" in
+      */*) component=${remaining%%/*}; remaining=${remaining#*/} ;;
+      *) component=$remaining; remaining="" ;;
+    esac
+    case "$component" in
+      ""|".") continue ;;
+      "..")
+        echo "Refusing parent-directory traversal in contract path: $1" >&2
+        return 2
+        ;;
+    esac
+    current="$current/$component"
+    if [ -L "$current" ]; then
+      echo "Refusing symlinked destination ancestor: $current" >&2
+      return 2
+    fi
+    if [ -e "$current" ]; then
+      if [ ! -d "$current" ]; then
+        echo "Refusing non-directory destination ancestor: $current" >&2
+        return 2
+      fi
+    else
+      mkdir "$current"
+      if [ -L "$current" ] || [ ! -d "$current" ]; then
+        echo "Destination ancestor is not a real directory: $current" >&2
+        return 2
+      fi
+    fi
+  done
+}
+
 copy_path() {
   src="$SOURCE_DIR/$1"
   dst="$TARGET_DIR/$1"
   [ -e "$src" ] || return 0
-  mkdir -p "$(dirname "$dst")"
+  ensure_sentrith_parent "$1"
   if [ -d "$src" ]; then
     # A symlinked contract directory (dotfile managers, a shared checkout)
     # is refused rather than replaced, matching what the file branch below
