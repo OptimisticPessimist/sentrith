@@ -2,9 +2,14 @@
 name = "sentrith"
 version = "0.2.0"
 edition = "2021"
-description = "Zero-runtime-dependency local guard and usage CLI for Sentrith"
+description = "Local guard, usage, and decision routing CLI for Sentrith"
 license = "MIT"
 publish = false
+
+[dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.6"
 
 [[bin]]
 name = "sentrith"

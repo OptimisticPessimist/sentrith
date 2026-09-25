@@ -1,150 +1,36 @@
 # Project Knowledge
 
-> Stable, verified facts about this repository.
-> This is not a chronological log.
-
 ## Project summary
 
-- Name:
-- Purpose:
-- Primary users:
-- Runtime/deployment target:
+Sentrith is a vendor-neutral AI development workflow template plus a local Rust CLI. The current CLI provides deterministic repository checks, hook integration, and usage measurement. A local decision router is being added incrementally; Suggest routing records local metadata but does not execute an agent. Primary target is local developer work on Windows, with CI builds on supported platforms.
 
-## Technology stack
+## Technology and layout
 
-| Area | Technology | Version / source |
-|---|---|---|
-| Language | Unknown | |
-| Framework | Unknown | |
-| Package manager | Unknown | |
-| Runtime | Unknown | |
-| Database | Unknown | |
-| Test framework | Unknown | |
-| CI/CD | Unknown | |
-
-## Repository map
-
-| Path | Responsibility |
+| Area | Current fact |
 |---|---|
-| `src/` | Unknown |
-| `tests/` | Unknown |
+| CLI | Rust 2021 single binary, `tools/sentrith/src/main.rs` |
+| Dependencies | existing guard/usage code uses the standard library; router uses `serde`, `toml`, and `rusqlite` with bundled SQLite, locked in `Cargo.lock` |
+| Build/test | Cargo, inline unit tests in `main.rs` and `routing.rs` |
+| CI | `.github/workflows/sentrith-ci.yml` and release workflows |
+| Existing usage storage | ignored `.ai-usage/` CSV and task files |
+| Router storage | ignored `.sentrith/config.toml` and `.sentrith/sentrith.db` (schema 1); compressed object store not implemented |
 
-Replace placeholders with the actual structure.
+`tools/sentrith/src/routing.rs` owns the initial policy and rule-based route slice. `docs/architecture/LOCAL_ROUTER.md` records verified integration facts and proposed boundaries. `docs/ROADMAP.md` records implementation phases. `tools/sentrith/DECISIONS.md` records security-sensitive file-write decisions for existing settings and backup paths.
 
-## Entry points
-
-- Application:
-- CLI:
-- Worker/background jobs:
-- Tests:
-
-## Development commands
-
-### Install
+## Commands
 
 ```sh
-# TODO
+cargo test --manifest-path tools/sentrith/Cargo.toml
+cargo build --manifest-path tools/sentrith/Cargo.toml
+cargo run --manifest-path tools/sentrith/Cargo.toml -- route "fix bug"
+cargo run --manifest-path tools/sentrith/Cargo.toml -- config check
+cargo run --manifest-path tools/sentrith/Cargo.toml -- db migrate
 ```
 
-### Run
+`cargo fmt --manifest-path tools/sentrith/Cargo.toml --check` currently reports pre-existing formatting differences in `main.rs`; format only touched modules until that unrelated diff is handled separately. Existing commands include `preflight`, `guard`, `closeout-check`, `review-hint`, `diff-budget`, `hooks`, and `usage`.
 
-```sh
-# TODO
-```
+## Boundaries and conventions
 
-### Test
+Preserve existing CLI commands and `.ai-usage/` records. Router policy filters execution profiles before any Decision Engine; provider-specific CLI behavior belongs in adapters. Current `route` is local, rule-based, stores metadata in SQLite, and does not execute an agent. Do not infer subscription quota from CLI presence. No API-key billing fallback is authorized. Treat task text as data, not shell code.
 
-```sh
-# TODO
-```
-
-### Lint
-
-```sh
-# TODO
-```
-
-### Format
-
-```sh
-# TODO
-```
-
-### Type check
-
-```sh
-# TODO
-```
-
-### Build
-
-```sh
-# TODO
-```
-
-## Configuration
-
-- Environment files:
-- Required environment variables:
-- Secrets mechanism:
-- Local development configuration:
-
-Never store secret values here.
-
-## Data and persistence
-
-- Database/storage:
-- Schema location:
-- Migration mechanism:
-- Cache:
-- Durable file storage:
-
-## External systems
-
-| System | Purpose | Integration location |
-|---|---|---|
-| None documented yet | | |
-
-## Architectural boundaries
-
-Document the dependency direction and subsystem ownership that actually exist.
-
-Example only:
-
-```text
-UI / API
-   ↓
-Application
-   ↓
-Domain
-   ↓
-Infrastructure adapters
-```
-
-Replace the example with the repository's real architecture.
-
-## Generated / do-not-edit areas
-
-- None documented yet.
-
-## High-risk areas
-
-Record areas where changes require additional verification, for example:
-
-- authentication/authorization
-- billing
-- database migrations
-- concurrency
-- serialization/public APIs
-- deployment configuration
-
-## Repository conventions
-
-Only record conventions that are evidenced by the repository.
-
-- Naming:
-- Error handling:
-- Logging:
-- Testing:
-- Dependency injection:
-- API design:
+New local `.sentrith/` data is Git-ignored. Existing settings/backup writes use hardened no-follow and permission-preserving helpers; read `tools/sentrith/DECISIONS.md` before adding similar writes.

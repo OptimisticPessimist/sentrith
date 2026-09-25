@@ -1,60 +1,24 @@
 # Engineering Profile
 
-> Which engineering profiles are enabled for this repository, and when they apply.
-> This file is loaded on ordinary tasks. Keep it short (target: <= 100 lines).
-> It is an index, not documentation. Technique explanations live in `docs/profiles/`.
-
-Status: not initialized
-
-Initialize this file once by answering the profile questions in `docs/ai/BOOTSTRAP.md`.
-Until then, agents apply Sentrith Core only (no domain profile).
+Status: initialized 2026-09-25
 
 ## Enabled profiles
 
-| Profile | Enabled | Triggers in this repository |
+| Profile | Enabled | Trigger |
 |---|---|---|
-| Web / Backend | unknown | |
-| AI / ML | unknown | |
-| Data | unknown | |
-| Game / Interactive 3D | unknown | |
+| AI / ML | yes | Decision Engine, model prompt/protocol, provider ranking, routing quality or evaluation changes under `tools/sentrith/src/` |
+| Data | no | No data pipeline or analysis dataset is part of the current product |
+| Web / Backend | no | No web service in the current CLI |
+| Game / Interactive 3D | no | No game/3D code |
 
-Replace `unknown` with `yes` or `no`.
-
-Triggers must name real paths or change kinds in this repository, for example:
-
-```text
-Web / Backend | yes | src/api/**, migrations/**, anything touching auth
-AI / ML       | yes | src/rag/**, prompts/**, eval/**
-```
-
-Profiles are additive: a change may match several, in which case apply the union
-of their verification dimensions. See `docs/profiles/README.md`.
+AI / ML verification adds a fixed representative routing set, provenance (model ID, prompt/protocol, params), baseline comparison, and failure cases when model-driven quality can change. The current rule-only `route` uses deterministic policy tests. Golden model evaluation activates with a real Decision Engine.
 
 ## Failure impact
 
-- Blast radius of a bad change:
-- Irreversible operations present:
-- Externally visible contracts present:
-
-## Enabled techniques
-
-Record only techniques that are actually in force, with the condition that
-activated them. Do not list techniques "for completeness".
-
-| Technique | Applies to | Why enabled |
-|---|---|---|
-| | | |
+- Wrong route may consume subscription capacity or choose an inappropriate agent; future Auto execution could affect workspace files.
+- Current route does not execute an agent but writes local SQLite metadata. Existing hook/settings writes have local security implications.
+- Existing CLI flags and usage records are external contracts.
 
 ## Domain verification commands
 
-Verification commands beyond the standard ones in `PROJECT.md`
-(for example eval runs, contract tests, data quality checks).
-
-```sh
-# TODO or "none"
-```
-
-## Not applicable
-
-State explicitly which profiles were considered and rejected, so future agents
-do not re-litigate the decision.
+No model evaluation command exists yet. Standard Cargo commands are in `PROJECT.md`.
