@@ -347,7 +347,8 @@ fn init_at(root: &Path) -> Result<(), String> {
     let dir = root.join(".sentrith");
     crate::create_real_directory_tree(&dir)?;
     let path = dir.join("config.toml");
-    let mut file = crate::create_secure_file(&path)?;
+    let mut file = crate::create_secure_file_exclusive(&path)
+        .map_err(|e| format!("cannot initialize {}: {e}", path.display()))?;
     file.write_all(TEMPLATE.as_bytes())
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     println!("Created {}", path.display());
@@ -431,6 +432,61 @@ pub fn status_command(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_preserves_existing_configuration() {
+        let root = crate::tests::temp_path("config-init");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        init_at(&root).unwrap();
+        let path = root.join(".sentrith/config.toml");
+        fs::write(&path, "execution_profiles = ['CLAUDE_NORMAL']\n").unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(
+            init_at(&root).is_err(),
+            "init must refuse an existing config"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_keeps_symlinks_and_their_targets_untouched() {
+        use std::os::unix::fs::symlink;
+        let root = crate::tests::temp_path("config-links");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::create_dir(root.join(".sentrith")).unwrap();
+        let target = root.join("user-config");
+        fs::write(&target, "user settings").unwrap();
+        let link = root.join(".sentrith/config.toml");
+        symlink(&target, &link).unwrap();
+        assert!(init_at(&root).is_err());
+        assert!(link.is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "user settings");
+        fs::remove_file(&target).unwrap();
+        assert!(init_at(&root).is_err());
+        assert!(link.is_symlink());
+        assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_creates_owner_only_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::tests::temp_path("config-mode");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        init_at(&root).unwrap();
+        let mode = fs::metadata(root.join(".sentrith/config.toml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn example_config_is_valid() {

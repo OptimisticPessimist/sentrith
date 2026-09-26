@@ -1,6 +1,6 @@
 //! Local routing metadata. No task prompt, source file, or tool output is stored here.
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,9 +55,15 @@ fn open(root: &Path) -> Result<Connection, String> {
     let dir = root.join(".sentrith");
     crate::create_real_directory_tree(&dir)?;
     let path = db_path(root);
-    if !inspect_regular_or_missing(&path)? {
-        // Restrict new local metadata to the owner. SQLite reopens this path.
-        drop(crate::create_secure_file(&path)?);
+    // Always create exclusively: a concurrent initializer owns the winning file.
+    match crate::create_secure_file_exclusive(&path) {
+        Ok(file) => drop(file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !inspect_regular_or_missing(&path)? {
+                return Err("routing database disappeared during initialization".into());
+            }
+        }
+        Err(e) => return Err(format!("cannot initialize {}: {e}", path.display())),
     }
     let conn = Connection::open_with_flags(
         &path,
@@ -77,7 +83,12 @@ fn version(conn: &Connection) -> Result<i64, String> {
 }
 
 fn migrate_connection(conn: &mut Connection) -> Result<i64, String> {
-    let current = version(conn)?;
+    // Acquire the writer lock before reading the version; concurrent first users
+    // must observe the winner's committed schema rather than both migrating v0.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let current = version(&tx)?;
     if current > SCHEMA_VERSION {
         return Err(format!(
             "database schema {current} is newer than supported {SCHEMA_VERSION}"
@@ -86,7 +97,6 @@ fn migrate_connection(conn: &mut Connection) -> Result<i64, String> {
     if current == SCHEMA_VERSION {
         return Ok(current);
     }
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute_batch(
         r#"
         CREATE TABLE routes (
@@ -292,7 +302,9 @@ mod tests {
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
-        path
+        // macOS exposes the system temporary directory through /var -> /private/var.
+        // Resolve the test-owned root, not application data paths checked for symlinks.
+        path.canonicalize().unwrap()
     }
 
     #[test]
@@ -341,6 +353,76 @@ mod tests {
             .windows(11)
             .any(|s| s == b"secret task"));
         explain(&root, &id).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_routes_preserve_every_record() {
+        let root = temp_root();
+        let count = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(count));
+        let workers: Vec<_> = (0..count)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    record_route(
+                        &root,
+                        DecisionRecord {
+                            task_type: "general",
+                            repository: "test",
+                            priority: "P1",
+                            profile: "CODEX_MEDIUM",
+                            provider: "codex",
+                            effort: "medium",
+                            source: "rule",
+                            task_bytes: 0,
+                            candidates: vec!["CODEX_MEDIUM"],
+                            rejected: vec![],
+                        },
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(database_status(&root).unwrap(), Some((1, count as i64)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopening_database_preserves_the_winners_inode_and_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = temp_root();
+        let mut winner = open(&root).unwrap();
+        let before = fs::metadata(db_path(&root)).unwrap();
+        let mut follower = open(&root).unwrap();
+        migrate_connection(&mut winner).unwrap();
+        assert_eq!(migrate_connection(&mut follower).unwrap(), SCHEMA_VERSION);
+        let after = fs::metadata(db_path(&root)).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+        drop((winner, follower));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_database_symlinks_without_unlinking_them() {
+        let root = temp_root();
+        fs::create_dir(root.join(".sentrith")).unwrap();
+        let target = root.join("outside");
+        fs::write(&target, "must survive").unwrap();
+        std::os::unix::fs::symlink(&target, db_path(&root)).unwrap();
+        assert!(migrate(&root).is_err());
+        assert!(db_path(&root).is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "must survive");
+        fs::remove_file(&target).unwrap();
+        assert!(migrate(&root).is_err());
+        assert!(db_path(&root).is_symlink());
+        assert!(!target.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1311,7 +1311,7 @@ fn replace_file_preserving_security(
 /// inherited) ACL long-term -- a fixed, deliberately narrow ACL is simpler
 /// and just as effective for that purpose.
 #[cfg(windows)]
-fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
+fn create_file_owner_only(path: &Path) -> std::io::Result<fs::File> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
 
@@ -1360,10 +1360,7 @@ fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut())
     } == 0
     {
-        return Err(format!(
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed with OS error {}",
-            unsafe { GetLastError() }
-        ));
+        return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
     }
 
     let sa = SecurityAttributes {
@@ -1386,7 +1383,7 @@ fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
     let create_error = unsafe { GetLastError() };
     unsafe { LocalFree(sd) };
     if handle as isize == INVALID_HANDLE_VALUE {
-        return Err(format!("CreateFileW failed for {} with OS error {create_error}", path.display()));
+        return Err(std::io::Error::from_raw_os_error(create_error as i32));
     }
     Ok(unsafe { fs::File::from_raw_handle(handle as *mut std::ffi::c_void) })
 }
@@ -1403,6 +1400,13 @@ fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
 /// before either swapping it into place or leaving it as a standing copy.
 fn create_secure_file(path: &Path) -> Result<fs::File, String> {
     let _ = fs::remove_file(path);
+    create_secure_file_exclusive(path)
+        .map_err(|e| format!("failed to prepare {}: {e}", path.display()))
+}
+
+/// Create an owner-only file without removing or replacing an existing entry.
+/// Durable configuration and database paths must use this, not the staging helper.
+fn create_secure_file_exclusive(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1411,7 +1415,6 @@ fn create_secure_file(path: &Path) -> Result<fs::File, String> {
             .create_new(true)
             .mode(0o600)
             .open(path)
-            .map_err(|e| format!("failed to prepare {}: {e}", path.display()))
     }
     #[cfg(windows)]
     {
@@ -1722,8 +1725,12 @@ fn create_real_directory_tree(path: &Path) -> Result<(), String> {
         }
 
         if !entry_exists(&current) {
-            fs::create_dir(&current)
-                .map_err(|e| format!("failed to create {}: {e}", current.display()))?;
+            match fs::create_dir(&current) {
+                Ok(()) => (),
+                // Another creator may have won. Validate its entry below.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(e) => return Err(format!("failed to create {}: {e}", current.display())),
+            }
         }
         let metadata = fs::symlink_metadata(&current)
             .map_err(|e| format!("failed to inspect {}: {e}", current.display()))?;
@@ -5878,7 +5885,7 @@ mod tests {
         assert_eq!(pct_text(Some(100.0), Some(75.0)), "-25.0%");
     }
 
-    fn temp_path(name: &str) -> PathBuf {
+    pub(crate) fn temp_path(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = env::temp_dir().join(format!(

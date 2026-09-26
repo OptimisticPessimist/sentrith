@@ -100,20 +100,43 @@ struct AllowedRoutes {
 
 fn risky_task(task: &str) -> bool {
     let text = task.to_lowercase();
-    // Conservative tripwires only; these are not a complete security scanner.
-    [
-        "drop table",
-        "delete production",
-        "delete all data",
-        "disable authentication",
-        "disable security",
-        "remove authorization",
-        "本番データを削除",
-        "認証を無効",
-        "全データ削除",
-    ]
-    .iter()
-    .any(|term| text.contains(term))
+    // Conservative tripwires, not a complete security scanner. Match whole words
+    // across intervening qualifiers and punctuation. Even negated/quoted risky
+    // requests require human review; these heuristics must not authorize execution.
+    let words: Vec<_> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let has = |terms: &[&str]| words.iter().any(|word| terms.contains(word));
+    let destructive = has(&[
+        "drop", "delete", "remove", "truncate", "wipe", "erase", "purge",
+    ]) && has(&[
+        "table",
+        "tables",
+        "database",
+        "databases",
+        "schema",
+        "production",
+        "data",
+    ]);
+    let security = (has(&["disable", "remove", "bypass", "weaken"])
+        || words.windows(2).any(|pair| pair == ["turn", "off"]))
+        && has(&["authentication", "authorization", "auth", "security"]);
+    destructive
+        || security
+        || [
+            "drop table",
+            "delete production",
+            "delete all data",
+            "disable authentication",
+            "disable security",
+            "remove authorization",
+            "本番データを削除",
+            "認証を無効",
+            "全データ削除",
+        ]
+        .iter()
+        .any(|term| text.contains(term))
 }
 
 fn policy(request: &Request, input: &PolicyInput) -> AllowedRoutes {
@@ -288,15 +311,37 @@ pub(crate) fn command_on_path(name: &str) -> bool {
     let Some(path) = env::var_os("PATH") else {
         return false;
     };
+    command_on_search_path(name, &path)
+}
+
+fn command_on_search_path(name: &str, path: &std::ffi::OsStr) -> bool {
     #[cfg(windows)]
     let names = [format!("{name}.exe"), format!("{name}.cmd")];
     #[cfg(not(windows))]
     let names = [name.to_owned(), name.to_owned()];
-    env::split_paths(&path).any(|dir| {
+    env::split_paths(path).any(|dir| {
         names
             .iter()
-            .any(|file| Path::new(&dir).join(file).is_file())
+            .any(|file| is_executable_file(&Path::new(&dir).join(file)))
     })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 pub fn route_command(args: &[String]) -> Result<(), String> {
@@ -436,12 +481,68 @@ mod tests {
     }
 
     #[test]
+    fn destructive_variants_gate_before_overrides_or_ranking() {
+        for task in [
+            "drop the users table",
+            "DROP\nTABLE users",
+            "delete the production database",
+            "delete all customer data",
+            "truncate the audit tables",
+            "disable login authentication",
+            "remove the authorization checks",
+            "turn off the security checks",
+            "bypass the auth check",
+            "本番データを削除して",
+        ] {
+            let mut req = request(task);
+            req.agent = Some("codex".into());
+            req.effort = Some("high".into());
+            let allowed = policy(&req, &input());
+            assert!(allowed.candidates.is_empty(), "{task}");
+            assert_eq!(
+                select(&RuleEngine, &req, &allowed).0,
+                Profile::HumanGate,
+                "{task}"
+            );
+        }
+        for task in [
+            "fix the authentication bug",
+            "add a dropdown to the table",
+            "remove the unused helper",
+            "review architecture",
+        ] {
+            let req = request(task);
+            assert!(!policy(&req, &input()).candidates.is_empty(), "{task}");
+        }
+    }
+
+    #[test]
     fn unavailable_cli_is_excluded() {
         let req = request("fix bug");
         let mut status = input();
         status.codex.cli_present = false;
         let allowed = policy(&req, &status);
         assert_eq!(select(&RuleEngine, &req, &allowed).0, Profile::ClaudeNormal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_discovery_requires_executable_regular_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let command = crate::tests::temp_path("codex");
+        let root = command.parent().unwrap();
+        std::fs::write(&command, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!command_on_search_path("codex", root.as_os_str()));
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(command_on_search_path("codex", root.as_os_str()));
+        symlink(&command, root.join("claude")).unwrap();
+        assert!(command_on_search_path("claude", root.as_os_str()));
+        std::fs::remove_file(&command).unwrap();
+        assert!(!command_on_search_path("claude", root.as_os_str()));
+        std::fs::create_dir(&command).unwrap();
+        assert!(!command_on_search_path("codex", root.as_os_str()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     struct InvalidEngine;
