@@ -47,4 +47,6 @@ Tempting fixes that were tested and found ineffective or harmful.
 
 ---
 
-No recurring issues have been recorded yet.
+### macOS temporary paths and no-follow directory checks
+
+Storage tests can fail with `/var is not a real directory` because macOS temporary paths traverse `/var -> /private/var`. Canonicalize the test-owned root after creating it (see `storage::tests::temp_root`); keep production data-path symlink rejection intact. The existing directory-boundary tests use repository-relative paths for the same reason.

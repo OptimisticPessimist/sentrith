@@ -7,6 +7,10 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod config;
+mod routing;
+mod storage;
+
 const USAGE_HEADER_V1: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes\n";
 const USAGE_HEADER: &str = "timestamp,agent,model,phase,task,input_tokens,cached_input_tokens,output_tokens,credits,cost_usd,tool_calls,duration_seconds,success,rework_count,source,session_id,notes,head_sha,verification\n";
 
@@ -23,6 +27,11 @@ fn main() {
         "guard" => guard_check(),
         "review-hint" => review_hint(),
         "diff-budget" => diff_budget(),
+        "route" => routing::route_command(&args[1..]),
+        "config" => config::config_command(&args[1..]),
+        "status" => config::status_command(&args[1..]),
+        "db" => storage::db_command(&args[1..]),
+        "explain" => storage::explain_command(&args[1..]),
         "hooks" => hooks_command(&args[1..]),
         "usage" => usage_command(&args[1..]),
         "version" | "--version" | "-V" => {
@@ -52,6 +61,11 @@ Commands:
   sentrith guard
   sentrith review-hint
   sentrith diff-budget
+  sentrith route [--priority p0|p1|p2|p3] [--agent codex|claude] [--effort normal|medium|high|deep] <task>
+  sentrith config init|check
+  sentrith status
+  sentrith db migrate
+  sentrith explain <task-id>
 
   sentrith hooks install [--agent claude|codex|all] [--dry-run]
   sentrith hooks status [--agent claude|codex|all]
@@ -104,6 +118,10 @@ Provider measurement:
   Raw prompts, source code, repository names, transcripts, and session IDs
   are never included in community contribution files.
 
+Route is Suggest mode and records local metadata without executing an agent.
+Its Phase 1 selection is rule-based, not APUS scoring; CLI presence does not
+prove authentication or quota.
+
 Success semantics:
   Hook-captured rows derive success from repository evidence only:
   commit reached + last recorded test outcome. Undecidable rows are `unknown`
@@ -120,7 +138,7 @@ fn repo_file(path: &str) -> PathBuf {
 //
 // Editing a user's settings file by hand is the main friction point in enabling
 // measurement, but corrupting that file is worse than the friction. This keeps
-// the zero-dependency rule while allowing a parse -> edit -> serialize cycle.
+// the existing settings-edit path self-contained while allowing a parse -> edit -> serialize cycle.
 // Object keys are stored as an ordered Vec so round-tripping preserves order,
 // and numbers stay as their original text so no precision is invented.
 // ---------------------------------------------------------------------------
@@ -1293,7 +1311,7 @@ fn replace_file_preserving_security(
 /// inherited) ACL long-term -- a fixed, deliberately narrow ACL is simpler
 /// and just as effective for that purpose.
 #[cfg(windows)]
-fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
+fn create_file_owner_only(path: &Path) -> std::io::Result<fs::File> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
 
@@ -1342,10 +1360,7 @@ fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut())
     } == 0
     {
-        return Err(format!(
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed with OS error {}",
-            unsafe { GetLastError() }
-        ));
+        return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
     }
 
     let sa = SecurityAttributes {
@@ -1368,7 +1383,7 @@ fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
     let create_error = unsafe { GetLastError() };
     unsafe { LocalFree(sd) };
     if handle as isize == INVALID_HANDLE_VALUE {
-        return Err(format!("CreateFileW failed for {} with OS error {create_error}", path.display()));
+        return Err(std::io::Error::from_raw_os_error(create_error as i32));
     }
     Ok(unsafe { fs::File::from_raw_handle(handle as *mut std::ffi::c_void) })
 }
@@ -1385,6 +1400,13 @@ fn create_file_owner_only(path: &Path) -> Result<fs::File, String> {
 /// before either swapping it into place or leaving it as a standing copy.
 fn create_secure_file(path: &Path) -> Result<fs::File, String> {
     let _ = fs::remove_file(path);
+    create_secure_file_exclusive(path)
+        .map_err(|e| format!("failed to prepare {}: {e}", path.display()))
+}
+
+/// Create an owner-only file without removing or replacing an existing entry.
+/// Durable configuration and database paths must use this, not the staging helper.
+fn create_secure_file_exclusive(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1393,7 +1415,6 @@ fn create_secure_file(path: &Path) -> Result<fs::File, String> {
             .create_new(true)
             .mode(0o600)
             .open(path)
-            .map_err(|e| format!("failed to prepare {}: {e}", path.display()))
     }
     #[cfg(windows)]
     {
@@ -1704,8 +1725,12 @@ fn create_real_directory_tree(path: &Path) -> Result<(), String> {
         }
 
         if !entry_exists(&current) {
-            fs::create_dir(&current)
-                .map_err(|e| format!("failed to create {}: {e}", current.display()))?;
+            match fs::create_dir(&current) {
+                Ok(()) => (),
+                // Another creator may have won. Validate its entry below.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(e) => return Err(format!("failed to create {}: {e}", current.display())),
+            }
         }
         let metadata = fs::symlink_metadata(&current)
             .map_err(|e| format!("failed to inspect {}: {e}", current.display()))?;
@@ -5860,7 +5885,7 @@ mod tests {
         assert_eq!(pct_text(Some(100.0), Some(75.0)), "-25.0%");
     }
 
-    fn temp_path(name: &str) -> PathBuf {
+    pub(crate) fn temp_path(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = env::temp_dir().join(format!(

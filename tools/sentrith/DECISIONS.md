@@ -85,8 +85,18 @@ backups — anything under `.claude/`, `.codex/`, `.sentrith-private/`, or
 similar) must use the existing hardened primitives rather than a raw
 `fs::write` / `fs::copy` / `fs::rename`:
 
-- `create_secure_file` to create a fresh temp file (refuses to reuse or
-  follow anything already at the path — closes the symlink-plant window).
+- `create_secure_file` for disposable staging paths only: it removes any
+  existing entry before exclusively creating a replacement.
+- `create_secure_file_exclusive` for new durable config/database paths:
+  it preserves every existing entry and returns a typed `AlreadyExists`
+  error, while retaining owner-only permissions. Database initialization
+  may reuse a validated regular winner; config initialization must refuse it.
+- Config initialization stages and syncs the complete template in an exclusively
+  created owner-only sibling, then publishes with `fs::hard_link`. This creates
+  the final name without replacing an existing entry; write/publication failures
+  only clean up the staging name. Unsupported hard links fail safely with no
+  truncating or overwriting fallback. See `config::init_at_with_writer` and its
+  failure/concurrency regressions; [standard-library contract](https://doc.rust-lang.org/std/fs/fn.hard_link.html).
 - `replace_file_preserving_security` to atomically swap it into place
   (preserves the destination's permissions/ACL/read-only attribute
   across the swap; works even when the destination is currently
@@ -99,8 +109,8 @@ similar) must use the existing hardened primitives rather than a raw
   exactly one implementation instead of two that could drift apart.
 
 Before writing a new file-replacement code path anywhere in
-`tools/sentrith/src/main.rs`, grep for these three helpers first and
-reuse one of them; do not hand-roll a fourth variant.
+`tools/sentrith/src/main.rs`, search for these helpers first and
+reuse the one matching the path's lifecycle; do not hand-roll a variant.
 
 **Rationale**
 

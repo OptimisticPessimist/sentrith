@@ -5,6 +5,7 @@ tools/sentrith/target/
 bin/sentrith
 bin/sentrith.exe
 .sentrith-private/
+.sentrith/
 
 # Transient artifacts an interrupted hooks install/baseline start-stop can
 # leave behind on an error path (never cleaned up in that case): backups and

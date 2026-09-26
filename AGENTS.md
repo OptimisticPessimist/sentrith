@@ -2,6 +2,18 @@
 
 This repository uses vendor-neutral project memory stored under `docs/ai/`.
 
+## Local router development contract
+
+The existing `tools/sentrith` binary remains the home of the proposed local decision router. Preserve its guard, hook, and usage commands and the `.ai-usage/` format. Keep policy, decision engine, provider adapters, validation, context, and storage as separate Rust modules within this crate until a crate split has concrete benefit. See `docs/architecture/LOCAL_ROUTER.md` and `docs/ROADMAP.md` for current scope and verification status.
+
+- Policy deterministically filters allowed execution profiles before model ranking. A model response may choose only from those IDs. Explicit overrides still pass hard security and billing checks.
+- Default to Suggest. Never auto-use cloud API keys, pay-as-you-go billing, or unverified provider CLI capabilities. Do not treat an agent exit code or its self-report as validated success.
+- Provider-specific CLI syntax, output parsing, error classification, cancellation, and effort mapping belong inside its adapter. Do not scatter them through policy or core routing.
+- Treat task text and model output as data. Avoid shell interpolation, enforce workspace boundaries, detect destructive operations conservatively, and never auto-approve generated shell commands.
+- Keep required active context intact. Store large recoverable context outside SQLite as content-addressed compressed objects; SQLite holds metadata and references. Follow hardened no-follow and permission-preserving file patterns documented in `tools/sentrith/DECISIONS.md`.
+- Preserve existing tests and add meaningful policy, storage, and integration regressions when those boundaries are implemented. Existing baseline: `cargo test --manifest-path tools/sentrith/Cargo.toml`; build: `cargo build --manifest-path tools/sentrith/Cargo.toml`. `cargo fmt --check` currently fails on pre-existing `main.rs` formatting; check new modules with `rustfmt --check` until that unrelated file is formatted separately. Follow existing naming/error conventions.
+- Definition of Done: observable acceptance criteria met, relevant checks actually run, final diff inspected, no unintended file changes, and `docs/ai/TASK_CLOSEOUT.md` applied. Record unverified external behavior as `UNKNOWN / NEEDS VERIFICATION`.
+
 ## Source of truth
 
 Treat the current repository as authoritative.
