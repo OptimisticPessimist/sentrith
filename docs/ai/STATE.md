@@ -4,7 +4,7 @@ Last reviewed: 2026-09-26
 
 ## Current status
 
-- Windows Rust CLI tests: 107 passed, including config preservation, destructive-request variants, and concurrent first-use routing regressions. Unix-specific symlink, permission, and executable-discovery cases run in CI.
+- Windows Rust CLI tests: 110 passed, including failed/concurrent config publication, destructive-request variants, and concurrent first-use routing regressions. Unix-specific symlink, permission, and effective-user executable-access cases run in CI.
 - Phase 0 now has validated TOML config (`config init/check`), a versioned SQLite schema (`db migrate`), structured route events, and `status` alongside the assessment documents.
 - Phase 1 has a rule-based `route` command with policy containment tests and SQLite decision metadata retrievable by `explain`. APUS scoring, provider execution, context objects, and GC are not implemented.
 

@@ -9,7 +9,7 @@ Sentrith is a vendor-neutral AI development workflow template plus a local Rust 
 | Area | Current fact |
 |---|---|
 | CLI | Rust 2021 single binary, `tools/sentrith/src/main.rs` |
-| Dependencies | existing guard/usage code uses the standard library; router uses `serde`, `toml`, and `rusqlite` with bundled SQLite, locked in `Cargo.lock` |
+| Dependencies | existing guard/usage code uses the standard library; router uses `serde`, `toml`, `rusqlite` with bundled SQLite, and Unix-only `libc` for effective executable access, locked in `Cargo.lock` |
 | Build/test | Cargo, inline unit tests in `main.rs` and `routing.rs` |
 | CI | `.github/workflows/sentrith-ci.yml` and release workflows |
 | Existing usage storage | ignored `.ai-usage/` CSV and task files |

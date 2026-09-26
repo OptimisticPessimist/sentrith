@@ -39,6 +39,12 @@ structured route events in ignored `.sentrith/sentrith.db`; the original task
 text is not stored. Authentication, quota signals, and APUS model ranking are
 not implemented yet. See [`docs/ROADMAP.md`](../../docs/ROADMAP.md).
 
+`config init` publishes a complete owner-only template and refuses to overwrite
+an existing config. It requires hard-link support in `.sentrith/`; unsupported
+filesystems return an error without publishing a partial config. Interrupted
+initialization may leave a `.config-init-*.tmp` staging file; retrying uses a new
+staging name.
+
 ## Build locally
 
 Only maintainers need Rust:

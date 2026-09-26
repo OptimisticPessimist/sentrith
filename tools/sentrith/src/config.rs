@@ -344,15 +344,57 @@ pub fn current_root() -> Result<PathBuf, String> {
 }
 
 fn init_at(root: &Path) -> Result<(), String> {
+    init_at_with_writer(root, |file| {
+        file.write_all(TEMPLATE.as_bytes())?;
+        file.sync_all()
+    })
+}
+
+fn init_at_with_writer(
+    root: &Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<(), String> {
     let dir = root.join(".sentrith");
     crate::create_real_directory_tree(&dir)?;
     let path = dir.join("config.toml");
-    let mut file = crate::create_secure_file_exclusive(&path)
-        .map_err(|e| format!("cannot initialize {}: {e}", path.display()))?;
-    file.write_all(TEMPLATE.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    let (staged_path, mut file) = create_config_stage(&dir)?;
+    let written = write(&mut file);
+    // Close the Windows exclusive handle before creating/removing hard links.
+    drop(file);
+    let published = written.and_then(|()| fs::hard_link(&staged_path, &path));
+    // Only our staging entry is cleaned up. Never remove the final config, even
+    // on failure: another initializer or the user may own it by this point.
+    if let Err(e) = fs::remove_file(&staged_path) {
+        eprintln!(
+            "Warning: cannot remove config staging file {}: {e}",
+            staged_path.display()
+        );
+    }
+    published.map_err(|e| format!("cannot initialize {}: {e}", path.display()))?;
     println!("Created {}", path.display());
     Ok(())
+}
+
+fn create_config_stage(dir: &Path) -> Result<(PathBuf, fs::File), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("cannot name config staging file: {e}"))?
+        .as_nanos();
+    for _ in 0..32 {
+        let path = dir.join(format!(
+            ".config-init-{}-{now}-{}.tmp",
+            std::process::id(),
+            NEXT_STAGE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match crate::create_secure_file_exclusive(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("cannot stage config: {e}")),
+        }
+    }
+    Err("cannot allocate a unique config staging file".into())
 }
 
 pub fn config_command(args: &[String]) -> Result<(), String> {
@@ -432,6 +474,79 @@ pub fn status_command(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_init_never_publishes_partial_config_and_can_be_retried() {
+        let root = crate::tests::temp_path("config-failure");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let result = init_at_with_writer(&root, |file| {
+            file.write_all(b"mode = ")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert!(result.is_err());
+        assert!(!root.join(".sentrith/config.toml").exists());
+        init_at(&root).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".sentrith/config.toml")).unwrap(),
+            TEMPLATE
+        );
+        assert_eq!(fs::read_dir(root.join(".sentrith")).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_init_does_not_overwrite_a_concurrent_winner() {
+        let root = crate::tests::temp_path("config-publication");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.join(".sentrith/config.toml");
+        let result = init_at_with_writer(&root, |file| {
+            file.write_all(b"mode = ")?;
+            assert!(!path.exists(), "partial content must remain unpublished");
+            file.write_all(b"'suggest'\n")?;
+            file.sync_all()?;
+            // Another creator wins after staging began, before publication.
+            fs::write(&path, "# concurrent user's settings\n")
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# concurrent user's settings\n"
+        );
+        assert_eq!(fs::read_dir(root.join(".sentrith")).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_config_init_publishes_one_complete_template() {
+        let root = crate::tests::temp_path("config-concurrent");
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    init_at(&root)
+                })
+            })
+            .collect();
+        let successes = workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(
+            fs::read_to_string(root.join(".sentrith/config.toml")).unwrap(),
+            TEMPLATE
+        );
+        assert_eq!(fs::read_dir(root.join(".sentrith")).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn init_preserves_existing_configuration() {

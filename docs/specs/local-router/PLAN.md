@@ -37,6 +37,8 @@ The current request authorizes a new local router but not weakening existing hoo
 
 Routing metadata and strict TOML config need maintained parsers rather than bespoke SQL/TOML implementations. `rusqlite` 0.40.2 (MIT) uses bundled SQLite so release binaries need no system SQLite installation; this adds a native C build to each CI target. `toml` 1.1.6 and `serde` 1.0.229 are MIT/Apache-2.0. `Cargo.lock` pins their transitive tree. Existing guard/usage paths continue to use the standard library. The dependency cost is accepted for schema integrity and strict configuration validation; CI builds across the release matrix remain a follow-up verification gate.
 
+Unix executable discovery additionally uses `libc` 0.2.189 (MIT/Apache-2.0), maintained by the Rust project, for `faccessat` with `AT_EACCESS`. Rust's standard library does not expose this effective-ID/ACL check; mode-bit inference is incorrect, and hand-coded FFI constants differ across platforms. The target-specific dependency adds one locked package with no enabled transitive dependencies. Its build script selects compiler/platform cfg values, without adding a native-library build. Sources: [libc](https://github.com/rust-lang/libc) and the downloaded, checksum-locked package manifest/build script.
+
 ## Risks
 
 See `docs/architecture/LOCAL_ROUTER.md`. The main Phase 1 gate is verified APUS logprob behavior, not merely successful text generation.

@@ -91,6 +91,12 @@ similar) must use the existing hardened primitives rather than a raw
   it preserves every existing entry and returns a typed `AlreadyExists`
   error, while retaining owner-only permissions. Database initialization
   may reuse a validated regular winner; config initialization must refuse it.
+- Config initialization stages and syncs the complete template in an exclusively
+  created owner-only sibling, then publishes with `fs::hard_link`. This creates
+  the final name without replacing an existing entry; write/publication failures
+  only clean up the staging name. Unsupported hard links fail safely with no
+  truncating or overwriting fallback. See `config::init_at_with_writer` and its
+  failure/concurrency regressions; [standard-library contract](https://doc.rust-lang.org/std/fs/fn.hard_link.html).
 - `replace_file_preserving_security` to atomically swap it into place
   (preserves the destination's permissions/ACL/read-only attribute
   across the swap; works even when the destination is currently

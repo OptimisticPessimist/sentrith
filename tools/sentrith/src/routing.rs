@@ -120,7 +120,7 @@ fn risky_task(task: &str) -> bool {
         "data",
     ]);
     let security = (has(&["disable", "remove", "bypass", "weaken"])
-        || words.windows(2).any(|pair| pair == ["turn", "off"]))
+        || (has(&["turn"]) && has(&["off"])))
         && has(&["authentication", "authorization", "auth", "security"]);
     destructive
         || security
@@ -335,8 +335,14 @@ fn is_executable_file(path: &Path) -> bool {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // Ask the OS for effective-ID access, including group membership and ACLs.
+        // A mode-bit approximation can incorrectly borrow another user's rights.
+        // SAFETY: path is NUL-terminated and remains valid for this synchronous call.
+        unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
     }
     #[cfg(not(unix))]
     {
@@ -491,6 +497,9 @@ mod tests {
             "disable login authentication",
             "remove the authorization checks",
             "turn off the security checks",
+            "turn authentication off",
+            "turn the security checks off",
+            "Turn\nlogin AUTHENTICATION\toff",
             "bypass the auth check",
             "本番データを削除して",
         ] {
@@ -510,6 +519,7 @@ mod tests {
             "add a dropdown to the table",
             "remove the unused helper",
             "review architecture",
+            "turn authentication on",
         ] {
             let req = request(task);
             assert!(!policy(&req, &input()).candidates.is_empty(), "{task}");
@@ -542,6 +552,32 @@ mod tests {
         assert!(!command_on_search_path("claude", root.as_os_str()));
         std::fs::create_dir(&command).unwrap();
         assert!(!command_on_search_path("codex", root.as_os_str()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_discovery_checks_the_effective_users_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let command = crate::tests::temp_path("codex");
+        let root = command.parent().unwrap();
+        std::fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o601)).unwrap();
+        // Owners cannot borrow the execute permission granted only to others.
+        // Root has different access semantics, so use the OS launch result as oracle.
+        let can_execute = std::process::Command::new(&command).status().is_ok();
+        assert_eq!(
+            command_on_search_path("codex", root.as_os_str()),
+            can_execute
+        );
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o001)).unwrap();
+        let can_execute = std::process::Command::new(&command).status().is_ok();
+        assert_eq!(
+            command_on_search_path("codex", root.as_os_str()),
+            can_execute
+        );
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(command_on_search_path("codex", root.as_os_str()));
         std::fs::remove_dir_all(root).unwrap();
     }
 

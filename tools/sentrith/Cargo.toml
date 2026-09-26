@@ -11,6 +11,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.6"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
 [[bin]]
 name = "sentrith"
 path = "src/main.rs"
