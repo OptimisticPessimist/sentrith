@@ -57,3 +57,8 @@ Explicit shortcut:
 ```text
 /dev <task>
 ```
+
+## エージェント間コミュニケーション
+
+- 作業開始時は docs/AGENT_COMMS.md を確認すること。
+- 残すべき履歴・判断・警告は docs/AGENT_COMMS.md に日付と署名（エージェント名＋モデル名）付きで追記すること。gitのチェックポイント参照（refs/codex/*）は削除されうるので依存しない。
